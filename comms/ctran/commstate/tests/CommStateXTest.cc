@@ -430,6 +430,82 @@ TEST(CommStateXTest, nvlFabricCliqueTest) {
   }
 }
 
+TEST(CommStateXTest, nvlFabricVCliqueSizeHint) {
+  const int rank = 0;
+  const int nRanks = 8;
+  const int cudaDev = 0;
+  const int cudaArch = 90;
+  const int64_t busId = 25;
+  const uint64_t commHash = 0;
+
+  std::vector<NvlFabricTopology> nvlFabricTopologies{};
+  for (int i = 0; i < nRanks; ++i) {
+    nvlFabricTopologies.emplace_back(
+        createNvlFabricTopology(i, kNvlFabricClusterId1, 0));
+  }
+
+  std::vector<RankTopology> rankTopologies{};
+  const std::string kSu = "";
+  rankTopologies.emplace_back(
+      createRankTopology(0, kDc, kZone, kSu, kRtsw0, kHost0));
+  rankTopologies.emplace_back(
+      createRankTopology(1, kDc, kZone, kSu, kRtsw0, kHost0));
+  rankTopologies.emplace_back(
+      createRankTopology(2, kDc, kZone, kSu, kRtsw0, kHost1));
+  rankTopologies.emplace_back(
+      createRankTopology(3, kDc, kZone, kSu, kRtsw0, kHost1));
+  rankTopologies.emplace_back(
+      createRankTopology(4, kDc, kZone, kSu, kRtsw1, kHost2));
+  rankTopologies.emplace_back(
+      createRankTopology(5, kDc, kZone, kSu, kRtsw1, kHost2));
+  rankTopologies.emplace_back(
+      createRankTopology(6, kDc, kZone, kSu, kRtsw1, kHost3));
+  rankTopologies.emplace_back(
+      createRankTopology(7, kDc, kZone, kSu, kRtsw1, kHost3));
+
+  auto makeCommState = [&](int vCliqueSize = 0) {
+    return std::make_unique<CommStateX>(
+        rank,
+        nRanks,
+        cudaDev,
+        cudaArch,
+        busId,
+        commHash,
+        rankTopologies,
+        std::vector<int>{},
+        "" /* commDesc */,
+        false /* noLocal */,
+        vCliqueSize);
+  };
+
+  // vCliqueSize=4 partitions 8 ranks into 2 virtual domains of 4
+  {
+    auto cs = makeCommState(4);
+    cs->setNvlFabricTopos(nvlFabricTopologies, true);
+    EXPECT_TRUE(cs->nvlFabricCliqueEnabled());
+    EXPECT_EQ(cs->nNodes(), 2);
+    for (int i = 0; i < nRanks; ++i) {
+      EXPECT_EQ(cs->localRank(i), i % 4);
+      EXPECT_EQ(cs->nLocalRanks(i), 4);
+    }
+  }
+
+  // vCliqueSize=0 does not override (no CVARs set either)
+  {
+    auto cs = makeCommState(0);
+    cs->setNvlFabricTopos(nvlFabricTopologies, true);
+    EXPECT_FALSE(cs->nvlFabricCliqueEnabled());
+  }
+
+  // vCliqueSize=3 is invalid (8 ranks not divisible by 3)
+  {
+    auto cs = makeCommState(3);
+    EXPECT_DEATH(
+        cs->setNvlFabricTopos(nvlFabricTopologies, true),
+        "nRanks.*must be evenly divisible by effectiveVCliqueSize");
+  }
+}
+
 TEST(CommStateXTest, TopologyFailure) {
   const int rank = 0;
   const int nRanks = 8;
@@ -615,6 +691,65 @@ TEST(CommStateXTest, nvlFabricWithNoLocal) {
   EXPECT_TRUE(commState->nvlFabricEnabled());
 
   // But topology getters should respect noLocal: each rank is its own node
+  for (int i = 0; i < nRanks; ++i) {
+    EXPECT_EQ(commState->nLocalRanks(i), 1);
+    EXPECT_EQ(commState->localRank(i), 0);
+    EXPECT_EQ(commState->node(i), i);
+  }
+  EXPECT_EQ(commState->nNodes(), nRanks);
+}
+
+TEST(CommStateXTest, nvlFabricWithNoLocalCvar) {
+  const int rank = 0;
+  const int nRanks = 8;
+  const int cudaDev = 0;
+  const int cudaArch = 90;
+  const int64_t busId = 25;
+  const uint64_t commHash = 0;
+
+  // Set the CVAR to nolocal but do NOT set the noLocal_ hint bool
+  EnvRAII noLocalCvar(
+      NCCL_COMM_STATE_DEBUG_TOPO, NCCL_COMM_STATE_DEBUG_TOPO::nolocal);
+
+  auto commState = std::make_unique<CommStateX>(
+      rank,
+      nRanks,
+      cudaDev,
+      cudaArch,
+      busId,
+      commHash,
+      std::vector<RankTopology>{},
+      std::vector<int>{},
+      "" /* commDesc */,
+      false /* noLocal - hint is NOT set, only CVAR */);
+
+  // initRankTopologyNolocal sets host-based nLocalRanks=1 for all ranks
+  commState->initRankTopologyNolocal();
+
+  // Set up NVL fabric with 2 clusters of 4 ranks each (e.g. GB200 2-GPU trays)
+  std::vector<NvlFabricTopology> nvlFabricTopologies{};
+  nvlFabricTopologies.emplace_back(
+      createNvlFabricTopology(0, kNvlFabricClusterId1, kNvlFabricCliqueId1));
+  nvlFabricTopologies.emplace_back(
+      createNvlFabricTopology(1, kNvlFabricClusterId1, kNvlFabricCliqueId1));
+  nvlFabricTopologies.emplace_back(
+      createNvlFabricTopology(2, kNvlFabricClusterId1, kNvlFabricCliqueId1));
+  nvlFabricTopologies.emplace_back(
+      createNvlFabricTopology(3, kNvlFabricClusterId1, kNvlFabricCliqueId1));
+  nvlFabricTopologies.emplace_back(
+      createNvlFabricTopology(4, kNvlFabricClusterId2, kNvlFabricCliqueId1));
+  nvlFabricTopologies.emplace_back(
+      createNvlFabricTopology(5, kNvlFabricClusterId2, kNvlFabricCliqueId1));
+  nvlFabricTopologies.emplace_back(
+      createNvlFabricTopology(6, kNvlFabricClusterId2, kNvlFabricCliqueId1));
+  nvlFabricTopologies.emplace_back(
+      createNvlFabricTopology(7, kNvlFabricClusterId2, kNvlFabricCliqueId1));
+  commState->setNvlFabricTopos(nvlFabricTopologies, true);
+
+  // NVL fabric should still be enabled (for transport)
+  EXPECT_TRUE(commState->nvlFabricEnabled());
+
+  // The CVAR should be respected: each rank is its own node with nLocalRanks=1
   for (int i = 0; i < nRanks; ++i) {
     EXPECT_EQ(commState->nLocalRanks(i), 1);
     EXPECT_EQ(commState->localRank(i), 0);

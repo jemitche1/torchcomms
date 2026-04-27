@@ -457,7 +457,7 @@ void CtranTestFixtureBase::TearDown() {
 
 void CtranTestFixtureBase::setupEnvironment() {
   setenv("NCCL_CTRAN_ENABLE", "1", 1);
-  setenv("NCCL_DEBUG", "INFO", 1);
+  setenv("NCCL_DEBUG", "INFO", 0);
 
   FB_CUDACHECKIGNORE(cudaSetDevice(cudaDev));
 
@@ -723,6 +723,7 @@ bool CtranTestHelpers::isBackendValid(
 void CtranTestHelpers::verifyGpeLeak(ICtran* ctran) {
   ASSERT_EQ(ctran->gpe->numInUseKernelElems(), 0);
   ASSERT_EQ(ctran->gpe->numInUseKernelFlags(), 0);
+  ASSERT_EQ(ctran->gpe->numInUseGpeKernelSyncs(), 0);
 }
 
 void CtranTestHelpers::resetBackendsUsed(ICtran* ctran) {
@@ -752,11 +753,7 @@ void CtranTestHelpers::verifyBackendsUsed(
       // collective
       if (nLocalRanks > 1 &&
           isBackendValid(excludedBackends, CtranMapperBackend::NVL)) {
-        if (NCCL_CTRAN_NVL_SENDRECV_COPY_ENGINE_ENABLE) {
-          ASSERT_GT(ctran->mapper->iCopyCount, 0);
-        } else {
-          ASSERT_GT(ctran->mapper->iPutCount[CtranMapperBackend::NVL], 0);
-        }
+        ASSERT_GT(ctran->mapper->iPutCount[CtranMapperBackend::NVL], 0);
       } else {
         ASSERT_EQ(ctran->mapper->iPutCount[CtranMapperBackend::NVL], 0);
       }

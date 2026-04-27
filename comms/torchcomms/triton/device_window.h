@@ -63,22 +63,20 @@ typedef void* TorchCommsBufferHandle;
 // =============================================================================
 
 // Block-scope put: all block threads cooperate on the transfer.
-// src buffer specified by its components (base_ptr, size, nccl_win) rather
-// than a pointer to a RegisteredBuffer struct. This avoids GPU memory
-// allocation conflicts with NCCLX's cuMemMap-based memory management.
+// src buffer specified by a device pointer to a RegisteredBuffer struct,
+// allocated in device memory by the host-side register_local_buffer() call.
+// The struct is allocated via cudaMalloc (separate VA space from NCCLX's
+// cuMemMap) and freed on deregister_local_buffer().
 // Returns: 0 on success, negative on error
 __device__ int torchcomms_put_block(
     TorchCommsWindowHandle win,
     unsigned long long dst_offset,
-    void* src_base_ptr,
-    unsigned long long src_size,
-    void* src_nccl_win,
+    void* src_buf_ptr,
     unsigned long long src_offset,
     int dst_rank,
     unsigned long long bytes,
     int signal_id,
-    int counter_id,
-    unsigned int src_lkey);
+    int counter_id);
 
 // Block-scope self-copy: local memory copy using all block threads.
 // Used for self-send (peer == my_rank) in alltoallv.
@@ -108,7 +106,7 @@ __device__ int torchcomms_self_copy_block(
 __device__ int torchcomms_put_block_direct(
     TorchCommsWindowHandle win,
     unsigned long long dst_offset,
-    void* src_nccl_win,
+    TorchCommsBufferHandle src_registered_buf,
     unsigned long long src_offset,
     int dst_rank,
     unsigned long long bytes);
@@ -120,7 +118,7 @@ __device__ int torchcomms_put_block_direct(
 __device__ int torchcomms_put_warp_chunked_direct(
     TorchCommsWindowHandle win,
     unsigned long long dst_offset,
-    void* src_nccl_win,
+    TorchCommsBufferHandle src_registered_buf,
     unsigned long long src_offset,
     int dst_rank,
     unsigned long long total_bytes,
@@ -145,6 +143,30 @@ __device__ int torchcomms_flush_block(TorchCommsWindowHandle win);
 __device__ int torchcomms_barrier_block(
     TorchCommsWindowHandle win,
     int barrier_id);
+
+// =============================================================================
+// Block-scope Wait Operations
+//
+// ALL threads in the calling block must call these together (convergently).
+// Thread 0 polls the signal/counter; remaining threads synchronize via
+// __syncthreads__ (CoopScope::BLOCK). Reduces spin-poll traffic from N
+// independent acquire loads (thread-scope) to 1 poll + __syncthreads__.
+// =============================================================================
+
+// Block-scope wait for signal from a specific peer (>=).
+// Returns: 0 on success, negative on error
+__device__ int torchcomms_wait_signal_from_block(
+    TorchCommsWindowHandle win,
+    int peer,
+    int signal_id,
+    unsigned long long expected_value);
+
+// Block-scope wait for local counter (>=).
+// Returns: 0 on success, negative on error
+__device__ int torchcomms_wait_counter_block(
+    TorchCommsWindowHandle win,
+    int counter_id,
+    unsigned long long expected_value);
 
 // =============================================================================
 // Signal Operations (Remote Notification)
@@ -242,6 +264,15 @@ __device__ unsigned long long torchcomms_size(TorchCommsWindowHandle win);
 __device__ void* torchcomms_get_nvlink_address(
     TorchCommsWindowHandle win,
     int peer);
+
+// Get the NVLS multicast (multimem) device pointer for this window.
+// Returns the multicast address for hardware-fused all-reduce
+// (multimem.ld_reduce) and broadcast (multimem.st) across all
+// LSA-connected peers.
+// Returns nullptr (0) if multimem is not supported (requires sm_90+, NVLS).
+__device__ void* torchcomms_get_multimem_address(
+    TorchCommsWindowHandle win,
+    unsigned long long offset);
 
 #ifdef __cplusplus
 }

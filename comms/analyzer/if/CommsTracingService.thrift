@@ -208,9 +208,9 @@ struct CudaError {
 // NOTE: Keep in sync with commDump.cc
 // The field names must exactly match the json keys.
 // The values themselves are serialized json.
-@thrift.ReserveIds{ids = [19, 20, 21]}
+@thrift.ReserveIds{ids = [1, 19, 20, 21]}
 struct NCCLCommRawEntry {
-  1: string CT_currentColl;
+  25: string CT_currentColls;
   2: string CT_pastColls;
   3: string CT_pendingColls;
   4: string PT_activeColls;
@@ -234,9 +234,42 @@ struct NCCLCommRawEntry {
   24: string NetworkPerfMonitor;
 }
 
-@thrift.ReserveIds{ids = [19, 20, 21]}
+struct TopoTreeNodeInfo {
+  1: i64 parentNode;
+  2: list<i64> childrenNodes;
+  3: i64 rank;
+}
+
+struct CommsTopologyInfo {
+  1: i64 nChannels;
+  2: list<TopoTreeNodeInfo> treeInfos;
+  3: optional list<list<i64>> rings;
+  4: string commDesc;
+  5: i64 globalRank;
+  6: i64 localRank;
+}
+
+enum TopologySource {
+  LIVE = 0,
+  SCUBA = 1,
+}
+
+struct GetTopologyRequest {
+  1: TopologySource source = TopologySource.LIVE;
+  2: optional string commDesc;
+  3: optional string mastJobName;
+  4: optional i64 jobVersion;
+  5: optional i64 jobAttempt;
+  6: optional string scubaTable;
+}
+
+struct GetTopologyResponse {
+  1: list<CommsTopologyInfo> topologies;
+}
+
+@thrift.ReserveIds{ids = [1, 19, 20, 21]}
 struct NCCLParsedEntry {
-  1: optional CT_Coll_struct CT_currentColl;
+  25: list<CT_Coll_struct> CT_currentColls;
   2: list<CT_Coll_struct> CT_pastColls;
   3: list<CT_Coll_struct> CT_pendingColls;
   4: list<PT_Coll_struct> PT_activeColls;
@@ -300,4 +333,5 @@ struct GetCommsResponse {
 // hung collectives and other issues.
 service CommsTracingService {
   GetCommsResponse getComms(1: GetCommsRequest request);
+  GetTopologyResponse getTopology(1: GetTopologyRequest request);
 }

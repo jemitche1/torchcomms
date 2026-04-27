@@ -10,21 +10,28 @@
 #include <cstddef>
 #include "checks.h"
 #include "comms/ncclx/meta/tests/NcclCommUtils.h"
+
+#include "comms/ctran/tests/VerifyAlgoStatsUtil.h"
+#include "comms/ncclx/meta/tests/NcclxBaseTest.h"
 #include "comms/testinfra/AlgoTestUtils.h"
-#include "comms/testinfra/TestUtils.h"
-#include "comms/testinfra/TestsDistUtils.h"
 #include "comms/utils/cvars/nccl_cvars.h"
 #include "meta/hints/GlobalHints.h"
 
 static bool VERBOSE = true;
 using testinfra::AlgoRAII;
 
-class SendRecvTest : public NcclxBaseTest {
+class SendRecvTest : public NcclxBaseTestFixture {
  public:
   SendRecvTest() = default;
   void SetUp() override {
     setenv("NCCL_CTRAN_ENABLE", "1", 1);
-    NcclxBaseTest::SetUp();
+    NcclxBaseTestFixture::SetUp();
+    ctranAlgoStats_.enable();
+#ifdef NCCL_COMM_STATE_DEBUG_TOPO_NOLOCAL
+    ASSERT_EQ(
+        ncclx::setGlobalHint(std::string(ncclx::HintKeys::kCommNoLocal), "1"),
+        ncclSuccess);
+#endif
     this->comm = ncclx::test::createNcclComm(
         globalRank, numRanks, localRank, bootstrap_.get());
 
@@ -35,7 +42,10 @@ class SendRecvTest : public NcclxBaseTest {
   void TearDown() override {
     NCCLCHECK_TEST(ncclCommDestroy(this->comm));
     CUDACHECK_TEST(cudaStreamDestroy(this->stream));
-    NcclxBaseTest::TearDown();
+#ifdef NCCL_COMM_STATE_DEBUG_TOPO_NOLOCAL
+    ncclx::resetGlobalHint(std::string(ncclx::HintKeys::kCommNoLocal));
+#endif
+    NcclxBaseTestFixture::TearDown();
   }
 
   void prepareBufs(const size_t count, bool registFlag = false) {
@@ -241,6 +251,7 @@ class SendRecvTest : public NcclxBaseTest {
   ncclComm_t comm;
   cudaStream_t stream;
   bool expectCtranAlgo_{false};
+  ctran::test::VerifyAlgoStatsHelper ctranAlgoStats_;
 
   int* sendBuf{nullptr};
   int* recvBuf{nullptr};
@@ -299,6 +310,52 @@ TEST_F(SendRecvTestParam, GroupedSendRecvWithHintOverride) {
   ASSERT_TRUE(ncclx::resetGlobalHint("algo_sendrecv"));
   expectCtranAlgo_ = false;
   runGroupedSendRecv();
+}
+
+// Cudagraph-aware SendRecv: capture grouped send/recv in a CUDA graph,
+// replay, and verify correctness. Uses ctgraph algo which pre-registers
+// buffers during capture.
+TEST_F(SendRecvTest, CtgraphGroupedSendRecv) {
+  if (comm->nRanks < 2) {
+    GTEST_SKIP() << "Need at least 2 ranks";
+  }
+
+  AlgoRAII algoEnv(NCCL_SENDRECV_ALGO, NCCL_SENDRECV_ALGO::ctgraph);
+
+  constexpr int count = 1048576;
+  constexpr int commCount = 1024;
+  prepareBufs(count, true);
+
+  const int sendPeer = (comm->rank + 1) % comm->nRanks;
+  const int recvPeer = (comm->rank + comm->nRanks - 1) % comm->nRanks;
+  // Capture
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  CUDACHECK_TEST(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+  ncclGroupStart();
+  NCCLCHECK_TEST(ncclSend(sendBuf, commCount, ncclInt, sendPeer, comm, stream));
+  NCCLCHECK_TEST(ncclRecv(recvBuf, commCount, ncclInt, recvPeer, comm, stream));
+  ncclGroupEnd();
+  CUDACHECK_TEST(cudaStreamEndCapture(stream, &graph));
+  CUDACHECK_TEST(cudaGraphInstantiate(&exec, graph, 0));
+
+  // Replay
+  CUDACHECK_TEST(cudaGraphLaunch(exec, stream));
+  CUDACHECK_TEST(cudaStreamSynchronize(stream));
+
+  checkResults(recvPeer, commCount);
+
+  if (comm->noLocal_) {
+    // nolocal: IB backend → ctgraph routes to ctran
+    ctranAlgoStats_.verify(comm->ctranComm_.get(), "SendRecv", "Ctran");
+  } else {
+    // default: NVL peers → ctgraph falls back to baseline
+    ctranAlgoStats_.verifyNot(comm->ctranComm_.get(), "SendRecv", "Ctran");
+  }
+
+  CUDACHECK_TEST(cudaGraphExecDestroy(exec));
+  CUDACHECK_TEST(cudaGraphDestroy(graph));
+  releaseBufs(true);
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -1,5 +1,6 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 #include <memory>
+#include <optional>
 
 #include "comms/ctran/Ctran.h"
 #include "comms/ctran/CtranComm.h"
@@ -21,7 +22,10 @@
 #include "comms/pipes/MultiPeerTransport.h"
 #endif // defined(ENABLE_PIPES)
 
-Ctran::Ctran(CtranComm* comm) : comm_(comm) {
+Ctran::Ctran(
+    CtranComm* comm,
+    std::unique_ptr<ctran::IProfilerReporter> reporter)
+    : comm_(comm) {
   ctran::logging::initCtranLogging();
 
   mapper = std::make_unique<CtranMapper>(comm_);
@@ -29,8 +33,8 @@ Ctran::Ctran(CtranComm* comm) : comm_(comm) {
 
   algo = std::make_unique<CtranAlgo>(comm, this);
 
-  if (NCCL_CTRAN_TRANSPORT_PROFILER) {
-    profiler = std::make_unique<ctran::Profiler>(comm);
+  if (comm->config_.enableProfiler) {
+    profiler = std::make_unique<ctran::Profiler>(comm, std::move(reporter));
   }
 }
 
@@ -108,17 +112,32 @@ comms::pipes::Transport* CtranComm::getMultiPeerTransportsPtr() const {
 }
 #endif // defined(ENABLE_PIPES)
 
-commResult_t ctranInit(CtranComm* comm) {
+std::optional<meta::comms::colltrace::AlgoStatDump> CtranComm::dumpAlgoStats()
+    const {
+  if (!algoStats_) {
+    return std::nullopt;
+  }
+  return algoStats_->dump();
+}
+
+commResult_t ctranInit(
+    CtranComm* comm,
+    std::unique_ptr<ctran::IProfilerReporter> reporter) {
   NcclScubaEvent initEvent(&comm->logMetaData_);
   initEvent.lapAndRecord("CtranInit START");
   try {
-    comm->ctran_ = std::make_shared<Ctran>(comm);
+    comm->ctran_ = std::make_shared<Ctran>(comm, std::move(reporter));
   } catch (std::exception& e) {
     CLOGF(ERR, "Ctran initialization failed: {}", e.what());
     return commInternalError;
   }
 
   auto res = ctranInitializePipes(comm);
+  if (res != commSuccess) {
+    return res;
+  }
+
+  res = ctranConfigCommAlgoOverride(comm);
   if (res != commSuccess) {
     return res;
   }
@@ -147,9 +166,18 @@ CtranComm::CtranComm(std::shared_ptr<Abort> abort, ctranConfig commConfig)
   }
   // Default points to internal opCount
   opCount_ = &ctranOpCount_;
+
+  for (const auto& opt : NCCL_COLLTRACE) {
+    if (opt == "algostat") {
+      algoStats_ = std::make_unique<meta::comms::colltrace::AlgoStats>();
+      break;
+    }
+  }
 }
 
 void CtranComm::destroy() {
+  cudagraphDeferredCleanup.runAll();
+
   // All smart pointers are automatically de-initialized, but we want to
   // ensure they do so in a specific order. Therefore, we manually handle
   // their de-initialization here.
@@ -188,7 +216,11 @@ commResult_t ctranFinalize(CtranComm* comm) {
 
 namespace ctran {
 
-commResult_t globalRegisterWithPtr(void* buff, size_t size, bool forceReg) {
+commResult_t globalRegisterWithPtr(
+    void* buff,
+    size_t size,
+    bool forceReg,
+    bool ncclManaged) {
   if (NCCL_CTRAN_REGISTER == NCCL_CTRAN_REGISTER::none) {
     // ctran registration is disabled, no-op
     return commSuccess;
@@ -200,10 +232,11 @@ commResult_t globalRegisterWithPtr(void* buff, size_t size, bool forceReg) {
     return commInternalError;
   }
 
-  return regCache->globalRegister(buff, size, forceReg);
+  return regCache->globalRegister(buff, size, forceReg, ncclManaged);
 }
 
-commResult_t globalDeregisterWithPtr(void* buff, size_t size) {
+commResult_t
+globalDeregisterWithPtr(void* buff, size_t size, bool skipRemRelease) {
   if (NCCL_CTRAN_REGISTER == NCCL_CTRAN_REGISTER::none) {
     // ctran registration is disabled, no-op
     return commSuccess;
@@ -215,7 +248,7 @@ commResult_t globalDeregisterWithPtr(void* buff, size_t size) {
     return commInternalError;
   }
 
-  return regCache->globalDeregister(buff, size);
+  return regCache->globalDeregister(buff, size, skipRemRelease);
 }
 
 commResult_t registerAll() {

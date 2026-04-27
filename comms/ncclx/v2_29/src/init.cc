@@ -7,6 +7,7 @@
 
 #include "nccl.h"
 #include "meta/NcclxConfig.h" // @manual
+#include "meta/NcclxPerCommConfig.h" // @manual
 #include "channel.h"
 #include "nvmlwrap.h"
 #include "gdrwrap.h"
@@ -882,6 +883,16 @@ static ncclResult_t computeBuffSizes(struct ncclComm* comm) {
 
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
     comm->buffSizes[p] = envs[p] != -2 ? envs[p] : defaults[p];
+  }
+
+  // [NCCLX-PerCommConfig] Validate and apply per-comm overrides
+  NCCLCHECK(ncclxValidatePerCommConfig(comm->config));
+  if (comm->config.ncclxConfig) {
+    auto& configBuffSize = NCCLX_CONFIG_FIELD(comm->config, ncclBuffSize);
+    if (configBuffSize.has_value()) {
+      comm->buffSizes[NCCL_PROTO_SIMPLE] = configBuffSize.value();
+      INFO(NCCL_INIT, "Per-comm SIMPLE buffSize overridden to %d", configBuffSize.value());
+    }
   }
 
   if (comm->nNodes > 1) {
@@ -1915,7 +1926,6 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     comm->ctranComm_->colltraceNew_ = comm->newCollTrace;
     NCCLCHECKGOTO(metaCommToNccl(ctranInit(comm->ctranComm_.get())), res, fail);
   }
-  NCCLCHECKGOTO(metaCommToNccl(ctranConfigCommAlgoOverride(comm->ctranComm_.get())), res, fail);
   // --------------------- done
 
   ncclx::comms_monitor::CommsMonitor::registerComm(comm);
@@ -2201,17 +2211,6 @@ static ncclResult_t copyCommConfig(ncclComm_t childComm, ncclComm_t parent) {
   return ncclSuccess;
 }
 
-// C-style wrapper around the ncclx::Config parsing constructor.
-// Most NCCL code is C-based, so this function translates C++
-// exceptions into ncclResult_t error codes for the C callers.
-ncclResult_t ncclxParseCommConfig(ncclConfig_t* config) {
-  try {
-    config->ncclxConfig = new ncclx::Config(config);
-    return ncclSuccess;
-  } catch (const std::exception&) {
-    return ncclInvalidArgument;
-  }
-}
 
 static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
   ncclResult_t ret = ncclSuccess;

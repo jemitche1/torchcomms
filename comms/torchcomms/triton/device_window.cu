@@ -76,22 +76,14 @@ __device__ int torchcomms_self_copy_block(
 __device__ int torchcomms_put_block(
     void* win_ptr,
     unsigned long long dst_offset,
-    void* src_base_ptr,
-    unsigned long long src_size,
-    void* src_nccl_win,
+    void* src_buf_ptr,
     unsigned long long src_offset,
     int dst_rank,
     unsigned long long bytes,
     int signal_id,
-    int counter_id,
-    unsigned int src_lkey) {
+    int counter_id) {
   auto* win = reinterpret_cast<DeviceWindow*>(win_ptr);
-
-  RegisteredBuffer src_buf;
-  src_buf.base_ptr = src_base_ptr;
-  src_buf.size = static_cast<size_t>(src_size);
-  src_buf.backend_window = src_nccl_win;
-  src_buf.lkey = static_cast<uint32_t>(src_lkey);
+  const auto& src_buf = *reinterpret_cast<const RegisteredBuffer*>(src_buf_ptr);
 
   return win->put(
       static_cast<size_t>(dst_offset),
@@ -122,11 +114,36 @@ __device__ int torchcomms_flush_block(void* win_ptr) {
 }
 
 __device__ int torchcomms_barrier_block(void* win_ptr, int barrier_id) {
-  if (threadIdx.x != 0) {
-    return 0;
-  }
   auto* win = reinterpret_cast<DeviceWindow*>(win_ptr);
-  return win->barrier(barrier_id, CoopScope::THREAD);
+  return win->barrier(barrier_id, CoopScope::BLOCK);
+}
+
+// =============================================================================
+// Block-scope Wait Operations
+//
+// Thread 0 polls the signal/counter; remaining threads synchronize via
+// __syncthreads__ (CoopScope::BLOCK → make_thread_group → group.sync()).
+// Reduces spin-poll traffic from N acquire loads per poll cycle
+// (thread-scope, N = blockDim.x) to 1 acquire load + 1 __syncthreads__.
+// =============================================================================
+
+__device__ int torchcomms_wait_signal_from_block(
+    void* win_ptr,
+    int peer,
+    int signal_id,
+    unsigned long long expected_value) {
+  auto* win = reinterpret_cast<DeviceWindow*>(win_ptr);
+  return win->wait_signal_from(
+      peer, signal_id, CmpOp::GE, expected_value, CoopScope::BLOCK);
+}
+
+__device__ int torchcomms_wait_counter_block(
+    void* win_ptr,
+    int counter_id,
+    unsigned long long expected_value) {
+  auto* win = reinterpret_cast<DeviceWindow*>(win_ptr);
+  return win->wait_counter(
+      counter_id, CmpOp::GE, expected_value, CoopScope::BLOCK);
 }
 
 // =============================================================================
@@ -231,6 +248,18 @@ __device__ unsigned long long torchcomms_size(void* win_ptr) {
 __device__ void* torchcomms_get_nvlink_address(void* win_ptr, int peer) {
   auto* win = reinterpret_cast<DeviceWindow*>(win_ptr);
   return win->get_nvlink_address(peer);
+}
+
+// =============================================================================
+// Multimem Address Query
+// Thread-scope (idempotent)
+// =============================================================================
+
+__device__ void* torchcomms_get_multimem_address(
+    void* win_ptr,
+    unsigned long long offset) {
+  auto* win = reinterpret_cast<DeviceWindow*>(win_ptr);
+  return win->get_multimem_address(static_cast<size_t>(offset));
 }
 
 } // extern "C"

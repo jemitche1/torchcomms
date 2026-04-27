@@ -9,6 +9,7 @@ import unittest
 import torch
 from torchcomms.tests.integration.py.TorchCommTestHelpers import (
     get_dtype_name,
+    is_full_sweep,
     TorchCommTestWrapper,
 )
 
@@ -17,8 +18,8 @@ class AllGatherSingleTest(unittest.TestCase):
     """Test class for all_gather_single operations in TorchComm."""
 
     # Class variables for test parameters
-    counts = [0, 4, 1024, 1024 * 1024]
-    dtypes = [torch.float, torch.int, torch.int8]
+    counts = [0, 4, 1024, 1024 * 1024] if is_full_sweep() else [4, 1024 * 1024]
+    dtypes = [torch.float, torch.int, torch.int8] if is_full_sweep() else [torch.float]
     num_replays = 4
 
     def get_wrapper(self):
@@ -291,7 +292,3 @@ class AllGatherSingleTest(unittest.TestCase):
         for count, dtype in itertools.product(self.counts, self.dtypes):
             with self.subTest(count=count, dtype=dtype):
                 self._graph_all_gather_single_input_deleted(count, dtype)
-
-
-if __name__ == "__main__":
-    unittest.main()

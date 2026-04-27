@@ -3,6 +3,7 @@
 #pragma once
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h> // @manual=third-party//cuda:cuda-lazy
@@ -119,6 +120,12 @@ class TorchCommWindowNCCLX : public TorchCommWindow {
   // Deregister a previously registered local buffer. NON-COLLECTIVE.
   void deregister_local_buffer(RegisteredBuffer& buf) override;
 
+  // Device-handle variants: allocate a device-side copy of RegisteredBuffer
+  // and return an opaque int64_t handle for Triton put_block() calls.
+  // NOT thread-safe — concurrent calls require external synchronization.
+  int64_t register_local_buffer_handle(const at::Tensor& tensor) override;
+  void deregister_local_buffer_handle(int64_t handle) override;
+
   // Get a device-side window handle for GPU-initiated operations.
   // Returns a pointer to the cached device window. The window is lazily
   // created on first call and cached.
@@ -157,6 +164,21 @@ class TorchCommWindowNCCLX : public TorchCommWindow {
   //
   // Returns: Device pointer as void*, or nullptr if not NVLink-accessible.
   void* get_nvlink_address(int peer, size_t offset = 0);
+
+  // Get the LSA multimem (NVLS multicast) address for this window.
+  // Returns the device pointer that can be used with multimem.ld_reduce
+  // (hardware-fused all-reduce) and multimem.st (broadcast) PTX instructions
+  // across all LSA-connected peers.
+  //
+  // Prerequisites: Must call tensor_register() first so that nccl_orig_win_
+  // is initialized. Requires lsaMultimem=true in ncclDevCommRequirements and
+  // sm_90+ (Hopper+) hardware with NVLS support.
+  //
+  // Args:
+  //   offset: Byte offset within the window (default 0).
+  //
+  // Returns: Multimem device pointer as void*, or nullptr if not supported.
+  void* get_multimem_address(size_t offset = 0);
 #endif
 #endif
 
@@ -191,6 +213,11 @@ class TorchCommWindowNCCLX : public TorchCommWindow {
   torchcomms::device::DeviceWindowPtr<Backend> device_window_;
 
   std::vector<RegisteredBuffer> registered_local_buffers_;
+
+  // Maps device pointer (from register_local_buffer_handle) to host-side
+  // RegisteredBuffer for cleanup. The device copy is read-only, so no
+  // D2H copy is needed on deregister — we use the cached host copy.
+  std::unordered_map<int64_t, RegisteredBuffer> device_buffer_handles_;
 
   // No ctran_win_ member needed — Pipes device windows are created
   // on-demand via nccl_api_->winCreateDeviceWin() in get_device_window().

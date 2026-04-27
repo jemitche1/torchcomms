@@ -140,6 +140,12 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
       int root,
       bool async_op,
       const GatherOptions& options = {});
+  c10::intrusive_ptr<TorchWork> gather_single(
+      at::Tensor& output,
+      const at::Tensor& input,
+      int root,
+      bool async_op,
+      const GatherSingleOptions& options = {});
 
   // Communicator Management
   std::shared_ptr<TorchComm> split(
@@ -212,8 +218,6 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
   c10::intrusive_ptr<TorchWork> reconfigure(const ReconfigureOptions& opts);
 
   // Hook types (defined in TorchCommHooks.hpp; aliased for backward compat)
-  using PreHookArgs = ::torch::comms::PreHookArgs;
-  using PostHookArgs = ::torch::comms::PostHookArgs;
   using PreHook = ::torch::comms::PreHook;
   using PostHook = ::torch::comms::PostHook;
   using AbortHook = ::torch::comms::AbortHook;
@@ -249,8 +253,8 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
       std::shared_ptr<TorchCommBackend> impl,
       std::vector<int> ranks);
 
-  void preHook(PreHookArgs&& args);
-  void postHook(PostHookArgs&& args);
+  void preHook(OpName name, size_t op_id, PreHookArgs&& args);
+  void postHook(size_t op_id, PostHookArgs&& args);
 
   // Rank validation helper
   void validateRank(int rank, const char* param_name) const;
