@@ -7,7 +7,7 @@ Currently, `is_torch_compile_supported_and_enabled()` is driven by:
 - a minimum PyTorch version of `2.12`
 - or `TORCHCOMMS_COMPILE_IGNORE_PYTORCH_VERSION_REQUIREMENT=1` as an override.
 
-but it does not validate if the runtime provides the compiler with the neccessary features required by torchcomms. This RFC proposes to replace environment variables as the source of truth for compile enablement with a capability check, while retaining them as a user option.
+but it does not validate if the runtime provides the compiler with the neccessary features required by torchcomms. This RFC proposes to replace environment variables as the source of truth for compile enablement with a capability check while retaining them as a user option.
 
 
 
