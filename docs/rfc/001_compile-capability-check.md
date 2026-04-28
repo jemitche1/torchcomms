@@ -1,4 +1,4 @@
-# RFC: Enabling Compiler Feature Checks for `Torchcomms`
+# RFC: Enabling Compiler Feature Checks for Torchcomms
 
 ## Summary
 
