@@ -25,7 +25,7 @@ But the compile path depends on a number of compiler related features:
 
 - inductor integration by `register_torchcomms_lowerings()` in `inductor_lowering.py`
 
-Because of this discrepancy, the current compile support could be “enabled” without checking if the runtime actually has the features the torchcomms compile path uses.
+Because of this discrepancy, the current compile support could be “enabled” without checking if the runtime actually has features the torchcomms compile path uses.
 
 
 ## Proposal
