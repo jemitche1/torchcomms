@@ -36,7 +36,7 @@ Because of this discrepancy, the current compile support could be “enabled” 
 ```python
 
 class CompileSupport:
-    user_opt_in: bool
+    user_opt: bool
     version_ok: bool
     supports_fake: bool
     supports_autograd: bool
