@@ -16,7 +16,13 @@
 
 #include "comms/common/bootstrap/IBootstrap.h"
 #include "comms/ctran/ibverbx/Ibvcore.h"
+#include "comms/prims/memory/DeviceSpan.cuh"
 #include "comms/prims/transport/ibgda/IbgdaBuffer.h"
+#include "comms/prims/transport/rdma/DataDirectMode.h"
+
+namespace meta::comms {
+class DeviceBuffer;
+} // namespace meta::comms
 
 namespace comms::prims {
 
@@ -69,14 +75,19 @@ struct MultipeerIbTransportConfig {
   // slot-index API. Independent of send/recv's private counter buffers.
   int numCounterSlots{0};
 
+  // Maximum number of physical block groups that may own IB QP resources.
+  // Device-side IB QP selection uses ThreadGroup::block_id and requires
+  // block_id < maxGroups.
+  int maxGroups{64};
+
   // Send/recv configuration. When set, the transport allocates a private
   // pipelined staging ring plus private signal/counter state for send()/recv().
   // When nullopt (default), only the raw put/signal APIs are available.
   struct SendRecvConfig {
     // Maximum number of block-groups that may participate in one send()/recv()
     // call. Sizes the private signal/counter/step arrays and caps
-    // active_blocks.
-    int maxGroups{128};
+    // active_blocks. A value of 0 inherits the top-level maxGroups.
+    int maxGroups{0};
 
     // Number of logical slots in the send/recv staging ring. Total staging
     // bytes per peer per direction: pipelineDepth * dataBufferSize.
@@ -92,10 +103,36 @@ struct MultipeerIbTransportConfig {
   uint32_t qpDepth{1024};
 #endif
 
-  // Number of QP sets per (peer, NIC). Total QPs to a peer =
-  // numQpsPerPeerPerNic * numNics. Multiple QPs let different GPU blocks use
-  // independent QPs.
-  int numQpsPerPeerPerNic{1};
+  // Number of main QPs owned by one physical block on each NIC. IBGDA executes
+  // on the selected QP directly; IBRC enqueues to the selected QP's CPU-proxy
+  // command queue.
+  int qpsPerBlockPerNic{1};
+
+  int numQpsPerPeerPerNic() const {
+    return maxGroups * qpsPerBlockPerNic;
+  }
+
+  // mlx5 Data-Direct: register MRs through the NIC's data-direct (BAR1) PCIe
+  // path for ~2x NIC<->HBM RDMA-write BW on GB300 (NCCL's NCCL_IB_DATA_DIRECT).
+  // The single shared comms::prims::DataDirectMode (see DataDirectMode.h) — the
+  // same enum NIC discovery uses — so this field both selects the discovery
+  // mode and gates the registration path. Disabled disables discovery's DD
+  // probing too; Only/Both take effect only on a DD-capable NIC (a no-op
+  // otherwise). The caller should tunnel NCCL_IB_DATA_DIRECT (0/1/2) into this
+  // field.
+  DataDirectMode enableDataDirect{DataDirectMode::Only};
+
+  // PCIe Relaxed Ordering on eligible (bulk data) MRs so NIC<->HBM DMA TLPs
+  // pipeline instead of strict-ordering to ~half rate (NCCL's
+  // NCCL_IB_PCI_RELAXED_ORDERING). Only applied to MRs the caller marks
+  // relaxed-ordering-eligible (data, not signal/counter). The caller should
+  // tunnel NCCL_IB_PCI_RELAXED_ORDERING into this field.
+  enum class PciRelaxedOrderingMode {
+    Disabled, // strict ordering on every MR
+    Enabled, // relaxed ordering on eligible MRs
+    Auto, // relaxed ordering on eligible MRs when supported (NCCL default)
+  };
+  PciRelaxedOrderingMode enablePciRelaxedOrdering{PciRelaxedOrderingMode::Auto};
 
   // InfiniBand Verbs Timeout for QP ACK timeout (4.096us * 2^timeout). Valid
   // 1-31; 0 or >=32 is infinite. Default 20 (similar to NCCL_IB_TIMEOUT).
@@ -125,6 +162,31 @@ struct MultipeerIbTransportConfig {
   // Timeout (ms) for the bilateral exchange in materializePeer().
   uint32_t materializePeerTimeoutMs{30000};
 };
+
+// Whether Data-Direct MR registration applies for a NIC: Data-Direct is
+// requested via config (not Disabled) and the NIC is DD-capable.
+// registerBuffer() selects the Data-Direct registration path exactly when this
+// holds (and the mlx5dv symbol is available). Exposed as a free function so the
+// config -> registration tunnel can be unit-tested without a NIC.
+inline bool dataDirectActiveForNic(
+    const MultipeerIbTransportConfig& config,
+    bool nicIsDataDirect) {
+  return config.enableDataDirect != DataDirectMode::Disabled && nicIsDataDirect;
+}
+
+// Whether PCIe Relaxed Ordering applies for a NIC: requested via config (not
+// Disabled) and the NIC accepts the IBV_ACCESS_RELAXED_ORDERING access flag
+// (probed during openNics). registerBuffer() sets the flag exactly when this
+// holds, so on a NIC whose driver rejects it both Auto and Enabled fall back to
+// strict ordering instead of failing registration. Free function so the
+// config -> registration gating is unit-testable without a NIC.
+inline bool relaxedOrderingActiveForNic(
+    const MultipeerIbTransportConfig& config,
+    bool nicRelaxedOrderingCapable) {
+  return config.enablePciRelaxedOrdering !=
+      MultipeerIbTransportConfig::PciRelaxedOrderingMode::Disabled &&
+      nicRelaxedOrderingCapable;
+}
 
 /**
  * Transport connection information for RDMA QP setup.
@@ -156,10 +218,13 @@ struct IbTransportExchInfo {
  */
 constexpr int kMaxRanksForAllGather = 128;
 
-/**
- * Maximum number of QP sets per (peer, NIC) for multi-QP support.
- */
-constexpr int kMaxQpsPerPeerPerNic = 128;
+// Eager allGather QPN exchange uses a compact fixed-size wire format. Larger
+// block-owned QP shapes must use lazy peer materialization.
+constexpr int kMaxEagerExchangeQpsPerPeerPerNic = 128;
+
+constexpr int kMaxIbGroups = 64;
+constexpr int kMaxIbQpsPerBlockPerNic = 128;
+constexpr int kMaxIbQpsPerPeerPerNic = kMaxIbGroups * kMaxIbQpsPerBlockPerNic;
 
 /**
  * Transport exchange info for allGather-based exchange.
@@ -178,7 +243,8 @@ struct IbTransportExchInfoAll {
     uint16_t lid{0};
     // QPN this rank uses on this NIC to connect to (target_rank, q).
     // qpnForRank[myRank][*] is unused (set to 0).
-    uint32_t qpnForRank[kMaxRanksForAllGather][kMaxQpsPerPeerPerNic]{};
+    uint32_t qpnForRank[kMaxRanksForAllGather]
+                       [kMaxEagerExchangeQpsPerPeerPerNic]{};
   };
   NicWireInfo nicInfo[kMaxNicsPerGpu]{};
 
@@ -192,6 +258,10 @@ struct IbTransportExchInfoAll {
 
   // Number of QPs per (peer, NIC) used by this rank.
   int numQpsPerPeerPerNic{1};
+
+  // Block-owned QP shape.
+  int maxGroups{64};
+  int qpsPerBlockPerNic{1};
 };
 
 // Bootstrap tags for the two-phase bilateral exchange in lazy materialization.
@@ -204,13 +274,15 @@ struct PeerQpPayload {
   struct NicQpInfo {
     uint8_t gid[16]{};
     uint16_t lid{0};
-    uint32_t qpns[kMaxQpsPerPeerPerNic]{};
+    uint32_t qpns[kMaxIbQpsPerPeerPerNic]{};
   };
   NicQpInfo nicInfo[kMaxNicsPerGpu]{};
   int gidIndex{0};
   int mtu{0};
   int numNics{0};
   int numQpsPerPeerPerNic{0};
+  int maxGroups{0};
+  int qpsPerBlockPerNic{0};
 };
 
 struct PeerBufferPayload {
@@ -220,9 +292,31 @@ struct PeerBufferPayload {
   IbgdaBufferExchInfo slotDiscard;
 };
 
+// Which memory a NIC completion counter lives in. Shared by the slot counter
+// (#16) and the send/recv NIC_DONE counter:
+//   Device     - GPU device memory, allocated and registered by the transport.
+//                The NIC bumps it via a loopback RDMA atomic (IBGDA).
+//   HostPinned - host-mapped (cudaHostAllocMapped) memory, allocated by the
+//                transport; the CPU progress thread writes it and the device
+//                reads via the mapped pointer (IBRC). Never MR-registered.
 enum class IbCounterStorage {
   Device,
   HostPinned,
+};
+
+// Per-peer send/recv staging-ring views. Eager mode owns the bulk allocations
+// and slices these; the device side reads them via sendRecvStateForPeer().
+struct IbSendRecvPeerBuffers {
+  IbgdaLocalBuffer sendStaging;
+  IbgdaLocalBuffer recvStaging;
+  IbgdaLocalBuffer signal;
+  IbgdaLocalBuffer counter;
+  IbgdaLocalBuffer counterCompletion;
+  // DeviceSpan has a const data_ member (no copy-assign), so wrap in optional
+  // and emplace() the per-peer slice.
+  std::optional<DeviceSpan<IbSendRecvState::ProgressSlot>> state;
+  IbgdaRemoteBuffer remoteRecvStaging;
+  IbgdaRemoteBuffer remoteSignal;
 };
 
 /**
@@ -276,7 +370,12 @@ class MultiPeerIbTransportBase {
    *
    * @return IbgdaLocalBuffer carrying one lkey per NIC.
    */
-  IbgdaLocalBuffer registerBuffer(void* ptr, std::size_t size);
+  // @param relaxedOrdering eligible for PCIe Relaxed Ordering (gated by
+  //   config.enablePciRelaxedOrdering). Only bulk data (staging) MRs pass true;
+  //   signal/counter MRs stay strict. Data-Direct is applied automatically on
+  //   DD-capable NICs regardless of this flag.
+  IbgdaLocalBuffer
+  registerBuffer(void* ptr, std::size_t size, bool relaxedOrdering = false);
 
   /** deregisterBuffer - Decrement refcount; deregister all per-NIC MRs at 0. */
   void deregisterBuffer(void* ptr);
@@ -302,8 +401,10 @@ class MultiPeerIbTransportBase {
       MultipeerIbTransportConfig config);
 
   // Non-virtual protected dtor: the base is never owned/deleted polymorphically
-  // (the dispatcher holds the concrete backend type).
-  ~MultiPeerIbTransportBase() = default;
+  // (the dispatcher holds the concrete backend type). Defined out-of-line in
+  // the .cc so the unique_ptr<DeviceBuffer> members destruct against a complete
+  // type.
+  ~MultiPeerIbTransportBase();
 
   MultiPeerIbTransportBase(const MultiPeerIbTransportBase&) = delete;
   MultiPeerIbTransportBase& operator=(const MultiPeerIbTransportBase&) = delete;
@@ -354,6 +455,52 @@ class MultiPeerIbTransportBase {
       std::size_t bytes,
       int tag);
 
+  // ---- shared send/recv staging-ring lifecycle (eager mode) ----
+  // Backend-agnostic host send/recv buffer management, shared by IBGDA (Device
+  // counter, NIC loopback atomic) and IBRC (Host counter, CPU proxy). Staging
+  // = pipelineDepth * dataBufferSize per direction; signal/state are sized off
+  // maxGroups. Per-peer staging + signal are device-registered; recvStaging +
+  // signal are collectively exchanged so peers can RDMA into our ring.
+  bool sendRecvBuffersEnabled() const {
+    return config_.sendRecv.has_value();
+  }
+  IbSendRecvState sendRecvStateForPeer(int peerIndex) const;
+  // Allocate + register the per-peer staging/signal/state bulks and slice them.
+  // counterStorage selects the NIC_DONE counter: Device (transport-allocated,
+  // registered) or HostPinned (transport-allocated host-mapped, never
+  // registered).
+  void allocateSendRecvBuffersEager(IbCounterStorage counterStorage);
+  // COLLECTIVE. allGather recvStaging + signal so each peer holds our remote
+  // views. Must be called after allocateSendRecvBuffersEager().
+  void exchangeSendRecvBuffersEager();
+  void cleanupSendRecvBuffers() noexcept;
+
+  // ---- per-peer (lazy) send/recv: shared by IBGDA + IBRC ----
+  // Allocate + register ONE peer's send/recv rings on demand (lazy connect) and
+  // fill the outbound payload's recvStaging/srSignal exch info. counterStorage
+  // selects the NIC_DONE counter: Device (a registered slice of the contiguous
+  // per-peer buffer; NIC loopback atomic — IBGDA) or HostPinned (a separate
+  // host-mapped allocation written by the CPU proxy — IBRC). The per-peer
+  // buffer is dedicated to this peer pair, so no numPeers slicing is needed.
+  void allocateSendRecvBufferForPeer(
+      int peerIndex,
+      PeerBufferPayload& payload,
+      IbCounterStorage counterStorage);
+  // Apply a peer's payload: remote recvStaging/signal views are used whole.
+  void applyRemoteSendRecvBuffer(
+      int peerIndex,
+      const PeerBufferPayload& remotePayload);
+  // Per-peer teardown: deregister + free this peer's lazy allocation and reset
+  // its views. Safe on an unmaterialized peer.
+  void cleanupSendRecvBufferForPeer(int peerIndex) noexcept;
+
+  const MultipeerIbTransportConfig::SendRecvConfig& sendRecvConfig() const;
+  void validateSendRecvConfig() const;
+  std::size_t sendRecvStagingBytesPerPeer() const;
+  std::size_t sendRecvSignalBytesPerPeer() const;
+  std::size_t sendRecvCounterBytesPerPeer() const;
+  std::size_t sendRecvStateBytesPerPeer() const;
+
   void allocateSignalCounterResources(
       IbCounterStorage counterStorage,
       bool allocateDiscardSignal);
@@ -381,6 +528,12 @@ class MultiPeerIbTransportBase {
     std::array<ibverbx::ibv_mr*, kMaxNicsPerGpu> mrs{};
     std::size_t allocSize{0};
     int refs{0};
+    // Effective PCIe Relaxed Ordering the MRs were registered with (the
+    // caller's request resolved against config). Part of the cache key: a
+    // containment hit must resolve to the same value, else the access-flag
+    // (ordering) semantics would silently differ from what the caller asked
+    // for.
+    bool relaxedOrdering{false};
   };
 
   const int myRank_{-1};
@@ -407,12 +560,44 @@ class MultiPeerIbTransportBase {
     ibverbx::ibv_pd* ibvPd{nullptr};
     ibverbx::ibv_gid localGid{};
     int linkLayer{0}; // ibverbx::IBV_LINK_LAYER_* (IB vs Ethernet/RoCE)
+    // This NIC exposes a Data-Direct (`_dma`) variant, so data MRs can register
+    // through the PCIe (BAR1) path. Copied from the discovery NicCandidate.
+    bool isDataDirect{false};
+    // This NIC's driver accepts IBV_ACCESS_RELAXED_ORDERING (probed once during
+    // openNics). registerBuffer() applies Relaxed Ordering only when every NIC
+    // is capable, so an unsupporting NIC falls back to strict ordering instead
+    // of failing every data-MR registration.
+    bool relaxedOrderingCapable{false};
   };
   std::vector<NicResources> nics_;
+
+  // True iff every opened NIC accepts IBV_ACCESS_RELAXED_ORDERING (AND of
+  // nics_[n].relaxedOrderingCapable, computed once in openNics). The MR cache
+  // keys on a single effective-ordering bool per allocation, so Relaxed
+  // Ordering must be uniform across NICs; gating on this aggregate keeps it so.
+  bool relaxedOrderingCapable_{false};
 
   // Maps allocation base address -> cached MR covering the full allocation.
   // Ordered map enables O(log n) containment lookup via upper_bound.
   std::map<uintptr_t, CachedMr> registeredBuffers_;
+
+  // Shared send/recv staging-ring state (eager mode). Owns the bulk
+  // allocations; sendRecvPeerBuffers_ slices them per peer.
+  std::vector<IbSendRecvPeerBuffers> sendRecvPeerBuffers_;
+  std::unique_ptr<meta::comms::DeviceBuffer> sendRecvSendStagingBulk_;
+  std::unique_ptr<meta::comms::DeviceBuffer> sendRecvRecvStagingBulk_;
+  // Signal + device-counter control regions packed into one granularity-aligned
+  // allocation (both Data-Direct-registered; share one aligned MR).
+  // Host-counter configs put only the signal region here. See
+  // allocateSendRecvBuffersEager.
+  std::unique_ptr<meta::comms::DeviceBuffer> sendRecvControlBulk_;
+  // Device-local progress state (never RDMA-registered / shared): separate,
+  // natural size, no alignment needed.
+  std::unique_ptr<meta::comms::DeviceBuffer> sendRecvStateBulk_;
+  IbgdaLocalBuffer sendRecvRecvStagingBulkReg_;
+  IbgdaLocalBuffer sendRecvSignalBulkReg_;
+  IbgdaLocalBuffer sendRecvCounterBulkReg_;
+  IbCounterStorage sendRecvCounterStorage_{IbCounterStorage::Device};
 
   // Lazy materialization state machine.
   std::vector<int> pendingPeers_;
@@ -493,9 +678,19 @@ class MultiPeerIbTransportBase {
   DeviceSlotAllocation slotSignalAllocation_;
   CounterSlotAllocation slotCounterAllocation_;
   DeviceSlotAllocation slotDiscardSignalAllocation_;
+  // Host-mapped send/recv NIC_DONE counter (counterStorage == Host). Owns the
+  // host-pinned allocation; sliced per peer into IbSendRecvPeerBuffers.counter.
+  CounterSlotAllocation sendRecvHostCounterAllocation_;
   std::vector<DeviceSlotAllocation> lazySlotSignalAllocations_;
   std::vector<CounterSlotAllocation> lazySlotCounterAllocations_;
   std::vector<DeviceSlotAllocation> lazySlotDiscardSignalAllocations_;
+  // Lazy per-peer send/recv allocations: one contiguous device buffer per
+  // materialized peer (sendStaging|recvStaging|signal|state, plus the counter
+  // when device-resident). Empty in eager mode. Shared by IBGDA (Device
+  // counter) and IBRC, which additionally allocates a per-peer host-mapped
+  // NIC_DONE counter below.
+  std::vector<std::unique_ptr<meta::comms::DeviceBuffer>> lazyPeerBufs_;
+  std::vector<CounterSlotAllocation> lazySendRecvHostCounters_;
 };
 
 /**

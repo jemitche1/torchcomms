@@ -199,17 +199,21 @@ void ctran::RegCache::init() {
       case NCCL_CTRAN_BACKENDS::tcpdm:
         globalBackends_[CommBackend::TCPDM] = true;
         break;
+      case NCCL_CTRAN_BACKENDS::external:
+        globalBackends_[CommBackend::EXTERNAL] = true;
+        break;
     }
   }
   CLOGF_SUBSYS(
       INFO,
       INIT,
       "CTRAN-REGCACHE: Global backends initialized from NCCL_CTRAN_BACKENDS: "
-      "IB={} NVL={} SOCKET={} TCPDM={}",
+      "IB={} NVL={} SOCKET={} TCPDM={} EXTERNAL={}",
       static_cast<bool>(globalBackends_[CommBackend::IB]),
       static_cast<bool>(globalBackends_[CommBackend::NVL]),
       static_cast<bool>(globalBackends_[CommBackend::SOCKET]),
-      static_cast<bool>(globalBackends_[CommBackend::TCPDM]));
+      static_cast<bool>(globalBackends_[CommBackend::TCPDM]),
+      static_cast<bool>(globalBackends_[CommBackend::EXTERNAL]));
 
   // Acquire a reference to CtranIbSingleton to establish dependency ordering,
   // but only when IB backend is configured. By holding this shared_ptr, we
@@ -264,7 +268,7 @@ commResult_t ctran::RegCache::destroy() {
           regElem->buf,
           regElem->len,
           regElem->isDynamic_);
-      FB_COMMCHECKIGNORE(regElem->doDeregister());
+      FB_COMMCHECKIGNORE(regElem->doDeregister(externalDeregMemFn_));
       it = regHdlToElemMap.erase(it);
     }
 
@@ -304,6 +308,9 @@ commResult_t ctran::RegCache::destroy() {
     profiler.rlock()->reportSnapshot();
   }
 
+  externalRegMemFn_ = nullptr;
+  externalDeregMemFn_ = nullptr;
+
   return commSuccess;
 }
 
@@ -312,7 +319,8 @@ commResult_t ctran::RegCache::globalRegister(
     size_t len,
     bool forceReg,
     bool ncclManaged,
-    int deviceId) {
+    int deviceId,
+    std::optional<std::vector<bool>> backends) {
   if (buf == nullptr || len == 0) {
     return commSuccess;
   }
@@ -355,7 +363,7 @@ commResult_t ctran::RegCache::globalRegister(
         cudaDev,
         "eagerGlobalRegister",
         globalLogData,
-        globalBackends_,
+        backends ? backends.value() : globalBackends_,
         didRegister,
         &regHdl,
         ncclManaged));
@@ -407,6 +415,7 @@ commResult_t ctran::RegCache::globalDeregister(
   // Free each segment
   size_t totalSegmentsFreed = 0;
   size_t totalRegElemsFreed = 0;
+  std::optional<DevMemType> firstFreedType;
   for (auto segHdl : segHdls) {
     bool freed = false;
     bool ncclManaged = false;
@@ -415,6 +424,9 @@ commResult_t ctran::RegCache::globalDeregister(
 
     if (freed) {
       totalSegmentsFreed++;
+    }
+    if (!firstFreedType.has_value() && !regElemsFreed.empty()) {
+      firstFreedType = regElemsFreed.front()->getType();
     }
     totalRegElemsFreed += regElemsFreed.size();
   }
@@ -432,7 +444,10 @@ commResult_t ctran::RegCache::globalDeregister(
         totalSegmentsFreed,
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - timerBegin)
-            .count());
+            .count(),
+        firstFreedType.has_value()
+            ? std::optional<std::string>(devMemTypeStr(firstFreedType.value()))
+            : std::nullopt);
   }
 
   return commSuccess;
@@ -557,6 +572,25 @@ void ctran::RegCache::waitAsyncRegComplete() {
   }
 }
 
+void ctran::RegCache::registerExternalRegMemFn(
+    regcache::ExternalRegMemFn regMem,
+    regcache::ExternalDeregMemFn deregMem) {
+  if (regMem && deregMem) {
+    externalRegMemFn_ = std::move(regMem);
+    externalDeregMemFn_ = std::move(deregMem);
+  } else {
+    XLOGF(
+        WARN,
+        "RegCache: registerExternalRegMemFn called with null callback(s), "
+        "both regMem and deregMem are required — ignoring");
+  }
+}
+
+void ctran::RegCache::resetExternalRegMemFn() {
+  externalRegMemFn_ = nullptr;
+  externalDeregMemFn_ = nullptr;
+}
+
 ctran::regcache::RegElem* ctran::RegCache::searchRegElem(
     const void* ptr,
     const size_t len) {
@@ -635,6 +669,46 @@ void* ctran::RegCache::searchIbRegHandle(
     return nullptr;
   }
   return regHdl->ibRegElem;
+}
+
+void* ctran::RegCache::searchExternalRegHandle(
+    const void* ptr,
+    size_t len,
+    int deviceId) {
+  int cudaDev = 0;
+  if (deviceId != -1) {
+    cudaDev = deviceId;
+  } else {
+    // Same as globalRegister, auto-detect cudaDev from buffer pointer.
+    commResult_t devResult = getCudaDevFromPtr(ptr, cudaDev);
+    if (devResult != commSuccess) {
+      // Fall back to current CUDA device for CPU memory
+      FB_CUDACHECK_RETURN(cudaGetDevice(&cudaDev), nullptr);
+    }
+  }
+
+  ctran::regcache::RegElem* regHdl = nullptr;
+  bool didRegister = false;
+  CommLogData logMetaData{};
+  logMetaData.commDesc = "global";
+
+  std::vector<bool> backends(CommBackend::NUM_BACKENDS);
+  backends[CommBackend::EXTERNAL] = true;
+  auto res = regRangeCached(
+      ptr,
+      len,
+      cudaDev,
+      "searchExternalRegHandle",
+      logMetaData,
+      backends,
+      didRegister,
+      &regHdl);
+
+  if (res != commSuccess || regHdl == nullptr ||
+      regHdl->externalRegElem == nullptr) {
+    return nullptr;
+  }
+  return regHdl->externalRegElem;
 }
 
 std::vector<void*> ctran::RegCache::getSegments() const {
@@ -850,7 +924,7 @@ commResult_t ctran::RegCache::registerSegmentsTogether(
       ptr, len, cudaDev, segments, ncclManaged);
 
   // Backend registration
-  FB_COMMCHECK(newRegElem->doRegister(backends));
+  FB_COMMCHECK(newRegElem->doRegister(backends, externalRegMemFn_));
 
   auto regHdlPtr = newRegElem.get();
 
@@ -899,6 +973,7 @@ commResult_t ctran::RegCache::regRangeCached(
   size_t lenToReg = 0;
   void* ptrToReg = nullptr;
   size_t numSegmentsToReg = 0;
+  std::optional<DevMemType> regMemType;
 
   {
     // Global lock:
@@ -947,6 +1022,7 @@ commResult_t ctran::RegCache::regRangeCached(
       // range.
       ptrToReg = const_cast<void*>(segments.at(0)->range.buf);
       numSegmentsToReg = segments.size();
+      regMemType = segments.at(0)->getType();
 
       // Use helper to perform backend registration and update maps
       FB_COMMCHECK(registerSegmentsTogether(
@@ -976,7 +1052,10 @@ commResult_t ctran::RegCache::regRangeCached(
       numSegmentsToReg,
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - timerBegin)
-          .count());
+          .count(),
+      regMemType.has_value()
+          ? std::optional<std::string>(devMemTypeStr(regMemType.value()))
+          : std::nullopt);
 
   profiler.wlock()->record(ctran::regcache::EventType::kRegMemEvent, dur);
   return commSuccess;
@@ -1132,7 +1211,7 @@ commResult_t ctran::RegCache::freeSegment(
 
 commResult_t ctran::RegCache::deregElem(ctran::regcache::RegElem* regElem) {
   auto dur = CtranMapperTimer();
-  FB_COMMCHECK(regElem->doDeregister());
+  FB_COMMCHECK(regElem->doDeregister(externalDeregMemFn_));
   profiler.wlock()->record(ctran::regcache::EventType::kDeregMemEvent, dur);
   return commSuccess;
 }
@@ -1170,7 +1249,7 @@ commResult_t ctran::RegCache::regRange(
       ncclManaged);
 
   // Registration (expensive)
-  FB_COMMCHECK(newRegElem_->doRegister(backends));
+  FB_COMMCHECK(newRegElem_->doRegister(backends, externalRegMemFn_));
 
   *regElem = newRegElem_.get();
 
@@ -1189,7 +1268,8 @@ commResult_t ctran::RegCache::regRange(
         ranges.size(),
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - timerBegin)
-            .count());
+            .count(),
+        devMemTypeStr(ranges.at(0).type));
   }
 
   return commSuccess;
@@ -1337,6 +1417,7 @@ commResult_t ctran::RegCache::regAll() {
   size_t totalLenRegistered = 0;
   size_t totalSegmentsRegistered = 0;
   size_t numContiguousRegions = 0;
+  std::optional<DevMemType> regMemType;
 
   {
     // Global lock:
@@ -1376,6 +1457,7 @@ commResult_t ctran::RegCache::regAll() {
     SetCudaDevRAII setCudaDev(cudaDev);
 
     numContiguousRegions = contiguousRegions.size();
+    regMemType = contiguousRegions.front().front()->getType();
 
     // Register each contiguous region separately using the helper
     for (size_t regionIdx = 0; regionIdx < contiguousRegions.size();
@@ -1435,7 +1517,10 @@ commResult_t ctran::RegCache::regAll() {
         totalSegmentsRegistered,
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - timerBegin)
-            .count());
+            .count(),
+        regMemType.has_value()
+            ? std::optional<std::string>(devMemTypeStr(regMemType.value()))
+            : std::nullopt);
   }
 
   CLOGF_TRACE(
@@ -1536,11 +1621,28 @@ commResult_t ctran::RegCache::deregAll() {
 }
 
 commResult_t ctran::regcache::RegElem::doRegister(
-    const std::vector<bool>& backends) {
+    const std::vector<bool>& backends,
+    const ExternalRegMemFn& externalRegMemFn) {
   meta::comms::StreamCaptureModeGuard captureGuard{
       cudaStreamCaptureModeRelaxed};
 
   auto stat = stateMnger.wlock();
+
+  if (backends[CommBackend::EXTERNAL] && externalRegMemFn) {
+    try {
+      FB_COMMCHECK(externalRegMemFn(buf, len, cudaDev_, &externalRegElem));
+    } catch (const std::exception& e) {
+      CLOGF(
+          WARN,
+          "CTRAN-REGCACHE: external backend registration failed for buf {} len {}, error: {}",
+          (void*)buf,
+          len,
+          e.what());
+      return commSystemError;
+    }
+    // external registration is exclusive to other registration backends
+    goto exit;
+  }
 
   // Register to backends
   if (type_ != DevMemType::kHostUnregistered &&
@@ -1584,6 +1686,7 @@ commResult_t ctran::regcache::RegElem::doRegister(
         ctran::CtranTcpDm::regMem((void*)buf, len, cudaDev_, &tcpRegElem));
   }
 
+exit:
   stat->state = ctran::regcache::RegElemState::REGISTERED;
   CLOGF_SUBSYS(
       INFO,
@@ -1595,7 +1698,8 @@ commResult_t ctran::regcache::RegElem::doRegister(
   return commSuccess;
 }
 
-commResult_t ctran::regcache::RegElem::doDeregister() {
+commResult_t ctran::regcache::RegElem::doDeregister(
+    const ExternalDeregMemFn& externalDeregMemFn) {
   auto stat = stateMnger.wlock();
 
   FB_CHECKABORT(
@@ -1617,6 +1721,10 @@ commResult_t ctran::regcache::RegElem::doDeregister() {
   if (tcpRegElem) {
     FB_COMMCHECK(ctran::CtranTcpDm::deregMem(tcpRegElem));
     tcpRegElem = nullptr;
+  }
+  if (externalRegElem && externalDeregMemFn) {
+    FB_COMMCHECK(externalDeregMemFn(externalRegElem));
+    externalRegElem = nullptr;
   }
 
   stat->state = ctran::regcache::RegElemState::DEREGISTERED;

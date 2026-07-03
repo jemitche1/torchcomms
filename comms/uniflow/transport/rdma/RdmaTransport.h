@@ -22,7 +22,7 @@
 
 namespace uniflow {
 
-constexpr uint8_t kRdmaVersion{1};
+constexpr uint8_t kRdmaVersion{2};
 
 // Forward declarations.
 class RdmaRegistrationHandle;
@@ -42,7 +42,9 @@ class RdmaSlabPool;
  */
 struct RdmaTransportConfig {
   uint32_t numQps{1}; /* Total QPs distributed round-robin across NICs. */
-  uint8_t gidIndex{3}; /* GID table index for RoCE addressing (3 = RoCEv2). */
+  /* RoCE GID table index. -1 = auto-select a RoCEv2 entry by scanning the GID
+   * table; >= 0 forces that index (3 is the Mellanox RoCEv2 convention). */
+  int16_t gidIndex{-1};
   uint8_t timeout{14}; /* IB timeout exponent for QP retransmission. */
   uint8_t retryCnt{7}; /* Number of retries before reporting an error. */
   uint8_t trafficClass{0}; /* Traffic class for GRH (QoS / DSCP). */
@@ -679,9 +681,9 @@ class RdmaTransportFactory : public TransportFactory {
 
   EventBase* evb_{nullptr};
   uint64_t domainId_{0};
-  size_t pageSize_{0};
   std::atomic<uint64_t> dmaBufFallbackCount_{0};
   std::shared_ptr<std::vector<NicResources>> nicsHandle_;
+  std::shared_ptr<DeviceAdapter> deviceAdapter_;
   const RdmaTransportConfig config_;
   std::shared_ptr<RdmaSlabPool> slabPool_;
 };

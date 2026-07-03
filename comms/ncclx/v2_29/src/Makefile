@@ -79,6 +79,7 @@ LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/ctran-integration/*.cc)
 LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/hints/*.cc)
 LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/algoconf/*.cc)
 LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/wrapper/*.cc)
+LIBSRCFILES += $(wildcard ${SHAREDDIR}/meta/tuner/*.cc)
 
 #### Start of fbcode source files
 ## Trainer Context for getting/setting trainer steps.
@@ -98,7 +99,7 @@ LIBSRCFILES += ${BASE_DIR}/comms/utils/hrdw_ring_buffer/GpuClockCalibration.cu
 LIBSRCFILES += ${BASE_DIR}/comms/utils/colltrace/HRDWRingBufferInstantiations.cu
 ifeq ($(ENABLE_PRIMS),1)
 ## CTRAN CUDA source files
-LIBSRCFILES += ${BASE_DIR}/comms/ctran/algos/AllReduce/AllReduceTree.cu
+LIBSRCFILES += ${BASE_DIR}/comms/ctran/algos/AllReduce/AllReduceIbTree.cu
 endif
 ## CollTrace plugin source files
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/utils/colltrace/plugins/*.cc)
@@ -141,13 +142,17 @@ LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/algos/RMA/*.cc)
 
 ifeq ($(ENABLE_PRIMS),1)
 LIBSRCFILES += ${BASE_DIR}/comms/prims/platform/CudaDriverLazy.cc
+LIBSRCFILES += ${BASE_DIR}/comms/prims/memory/CuMemAllocation.cc
+LIBSRCFILES += ${BASE_DIR}/comms/prims/memory/CuMemMapping.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/memory/GpuMemHandler.cc
+LIBSRCFILES += ${BASE_DIR}/comms/prims/memory/NvlMemExchange.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/nvl/MultiPeerNvlTransport.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/MultiPeerTransport.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/trace/PipesTrace.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/MultiPeerIbTransport.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/ibgda/MultipeerIbgdaTransport.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/ibrc/MultipeerIbrcTransport.cc
+LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/ibrc/MultipeerIbrcTransportCuda.cu
 LIBSRCFILES += ${BASE_DIR}/comms/prims/topology/TopologyDiscovery.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/window/HostWindow.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/rdma/IbHcaParser.cc

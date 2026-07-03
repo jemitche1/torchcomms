@@ -25,7 +25,7 @@ function do_cmake_build() {
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DCMAKE_CXX_STANDARD=20 \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.22 \
-    -DCMAKE_CXX_FLAGS="-DFMT_HEADER_ONLY=1" \
+    -DCMAKE_CXX_FLAGS="-DFMT_HEADER_ONLY=1 ${CXXFLAGS:-}" \
     $extra_flags \
     -S "${source_dir}"
   ninja
@@ -363,7 +363,15 @@ fi
 # CUDART_CB (the CUDA host-callback calling-convention macro, empty on Linux)
 # is likewise not mapped by hipify; define it empty so callbacks like
 # drainPipesTraceCallback in comms/prims/trace/PipesTrace.cc parse correctly.
-export CXXFLAGS="-I${CONDA_INCLUDE_DIR} -I${BASE_DIR} -DSO_INCOMING_NAPI_ID=56 -DCUDART_CB= -DcudaEventWaitDefault=0x00 -DcudaEventWaitExternal=0x01 -DcudaEventRecordDefault=0x00 -DcudaEventRecordExternal=0x01"
+#
+# ${BASE_DIR} (fbsource/fbcode) must be searched for comms/* headers, but it also
+# contains fbcode's in-tree copies of OSS third-party (folly, snappy, ...). Those
+# track fbsource HEAD and diverge from the pinned OSS deps we build + link into
+# librccl (e.g. folly::IntervalRateLimiter::checkSlow gained a `long` arg),
+# producing undefined symbols at load time. Pass ${BASE_DIR} via -idirafter so it
+# is the lowest-priority include path: the conda-built OSS headers (which we link)
+# win for folly/snappy/etc., while comms/* (only in fbcode) still resolves.
+export CXXFLAGS="-I${CONDA_INCLUDE_DIR} -idirafter ${BASE_DIR} -DSO_INCOMING_NAPI_ID=56 -DCUDART_CB= -DcudaEventWaitDefault=0x00 -DcudaEventWaitExternal=0x01 -DcudaEventRecordDefault=0x00 -DcudaEventRecordExternal=0x01"
 
 # Create linker version script to hide gflags/glog symbols from librccl.so.
 # These get pulled in via static libs (libfolly.a, libthriftcpp2.a) but conflict
@@ -384,8 +392,19 @@ export LDFLAGS="${LDFLAGS:-} -Wl,--version-script=/tmp/rccl_hide_gflags.lds"
 
 mkdir -p "$BUILDDIR"
 pushd "${NCCL_HOME}"
-export ROCM_PATH=/usr/local/fbcode/platform010/lib/rocm-7.0
-export CXX=/usr/local/fbcode/platform010/lib/rocm-7.0/lib/llvm/bin/amdclang++
+export ROCM_PATH="${ROCM_PATH:-/usr/local/fbcode/platform010/lib/rocm-7.0}"
+# RCCL's CMakeLists (projects/rccl/CMakeLists.txt) requires CMAKE_CXX_COMPILER to
+# be amdclang++/clang++/hipcc. Drop the conda-activated host compiler
+# (x86_64-conda-linux-gnu-c++/-gcc) that leaks in on local builds and trips the
+# "RCCL can be built only with hipcc or amdclang++" check. Any other env-provided
+# CXX/CC -- including the remote build harness's injected ROCm toolchain -- is
+# honored exactly as before.
+case "$(basename "${CXX:-}")" in
+  *-conda-linux-gnu-c++|"") export CXX="$ROCM_PATH/lib/llvm/bin/amdclang++" ;;
+esac
+case "$(basename "${CC:-}")" in
+  *-conda-linux-gnu-cc|*-conda-linux-gnu-gcc|"") export CC="$ROCM_PATH/lib/llvm/bin/amdclang" ;;
+esac
 
 
 function build_rccl {

@@ -14,10 +14,12 @@
 
 #include <fmt/core.h>
 #include <folly/ScopeGuard.h>
+#include <folly/String.h>
 #include <glog/logging.h>
 
 #include "comms/ctran/ibverbx/Ibverbx.h"
 #include "comms/ctran/ibverbx/IbverbxSymbols.h"
+#include "comms/ctran/ibverbx/Mlx5core.h"
 #include "comms/prims/transport/rdma/NicDiscovery.h"
 // GPU DMA-BUF export for MR registration. Generic (no DOCA context): on NVIDIA
 // it is cuMemGetHandleForAddressRange via DocaHostUtils (with the CUDA driver
@@ -27,17 +29,124 @@
 #include <hip/hip_runtime.h>
 
 #include "comms/prims/transport/amd/DocaCompat.h"
+// meta::comms::DeviceBuffer (HIP shim) for the send/recv staging bulks.
+#include "comms/prims/transport/amd/HipHostCompat.h"
 #else
 #include <cuda_runtime.h>
 
 #include "comms/prims/platform/CudaDriverLazy.h"
 #include "comms/prims/platform/DocaHostUtils.h"
+// meta::comms::DeviceBuffer (CUDA RAII) for the send/recv staging bulks.
+#include "comms/utils/CudaRAII.h"
 #endif
 
 namespace comms::prims {
 
 namespace {
 constexpr int kDefaultGidIndex = 3; // Default RoCE GID index
+
+// A NIC is Data-Direct-capable iff all three hold: (1) the mlx5dv provider
+// supports the device, (2) the mlx5 Data-Direct DMA-BUF verb is usable, and
+// (3) the driver exposes a data-direct sysfs path for its context. This mirrors
+// the gate NIC discovery (augmentWithDataDirect) and NCCL
+// (ncclMlx5dvDmaBufCapable + the sysfs check) use, so the explicit gpuNicMap
+// path -- which has no discovery candidate to read capability from -- matches
+// the auto-discovery path rather than relying on the sysfs check alone. Always
+// false on AMD (no mlx5 Data-Direct).
+bool nicSupportsDataDirect(
+    [[maybe_unused]] ibverbx::ibv_device* device,
+    [[maybe_unused]] ibverbx::ibv_context* ctx,
+    [[maybe_unused]] ibverbx::ibv_pd* pd) {
+#ifdef __HIP_PLATFORM_AMD__
+  return false;
+#else
+  // Precondition: an opened device/context/PD. Guard so a future caller that
+  // probes before opening degrades to "not DD-capable" rather than
+  // dereferencing null inside the mlx5 driver. DCHECK surfaces misuse in
+  // debug/test builds; release falls back safely.
+  DCHECK(device != nullptr && ctx != nullptr && pd != nullptr)
+      << "nicSupportsDataDirect called with null device/ctx/pd";
+  if (device == nullptr || ctx == nullptr || pd == nullptr) {
+    return false;
+  }
+  const auto& symbols = ibverbx::ibvSymbols;
+
+  // (1) mlx5dv provider supports this device.
+  if (symbols.mlx5dv_internal_is_supported == nullptr ||
+      !symbols.mlx5dv_internal_is_supported(device)) {
+    return false;
+  }
+
+  // (2) The mlx5 Data-Direct DMA-BUF verb is usable. Probe with an invalid fd:
+  // the driver rejects an unsupported verb with EOPNOTSUPP/EPROTONOSUPPORT,
+  // while any other errno (e.g. EBADF) means the verb exists and would have
+  // proceeded. This is the predictor NCCL uses (ncclMlx5dvDmaBufCapable) and is
+  // the relevant one, since DD registration goes through this exact verb.
+  if (symbols.mlx5dv_internal_reg_dmabuf_mr == nullptr) {
+    return false;
+  }
+  errno = 0;
+  ibverbx::ibv_mr* probeMr = symbols.mlx5dv_internal_reg_dmabuf_mr(
+      pd,
+      /*offset=*/0,
+      /*length=*/0,
+      /*iova=*/0,
+      /*fd=*/-1,
+      /*access=*/0,
+      ibverbx::MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+  const bool dmabufUnsupported =
+      (errno == EOPNOTSUPP) || (errno == EPROTONOSUPPORT);
+  if (probeMr != nullptr) {
+    symbols.ibv_internal_dereg_mr(probeMr);
+  }
+  if (dmabufUnsupported) {
+    return false;
+  }
+
+  // (3) Data-Direct sysfs path resolves (mlx5dv contract: rc == 0 on success).
+  if (symbols.mlx5dv_internal_get_data_direct_sysfs_path == nullptr) {
+    return false;
+  }
+  char ddSysfsPath[4096];
+  return symbols.mlx5dv_internal_get_data_direct_sysfs_path(
+             ctx, ddSysfsPath, sizeof(ddSysfsPath)) == 0;
+#endif
+}
+
+// A NIC supports PCIe Relaxed Ordering iff its driver accepts
+// IBV_ACCESS_RELAXED_ORDERING on a registration. Probe once by registering a
+// tiny host buffer with the flag (the same shape NCCL uses): if the driver
+// rejects it, applying the flag to the real (GPU) data MRs would fail every
+// registration and throw, breaking transport setup. RO is a TLP attribute
+// negotiated via the access flag, independent of the buffer's memory type, so a
+// host probe is a valid proxy for flag acceptance. registerBuffer() gates the
+// flag on this so an unsupporting NIC falls back to strict ordering.
+bool nicSupportsRelaxedOrdering(ibverbx::ibv_pd* pd) {
+  // Precondition: pd is an allocated protection domain (openNics throws on a
+  // failed alloc before reaching here). Guard defensively so a future caller
+  // that probes before allocation degrades to "not RO-capable" rather than
+  // dereferencing null inside the driver.
+  DCHECK(pd != nullptr) << "nicSupportsRelaxedOrdering called with null pd";
+  if (pd == nullptr) {
+    return false;
+  }
+  const auto& symbols = ibverbx::ibvSymbols;
+  if (symbols.ibv_internal_reg_mr == nullptr ||
+      symbols.ibv_internal_dereg_mr == nullptr) {
+    return false;
+  }
+  alignas(64) char probe[64] = {};
+  ibverbx::ibv_mr* mr = symbols.ibv_internal_reg_mr(
+      pd,
+      probe,
+      sizeof(probe),
+      ibverbx::IBV_ACCESS_LOCAL_WRITE | ibverbx::IBV_ACCESS_RELAXED_ORDERING);
+  if (mr == nullptr) {
+    return false;
+  }
+  symbols.ibv_internal_dereg_mr(mr);
+  return true;
+}
 
 #ifdef __HIP_PLATFORM_AMD__
 using SlotGpuError = hipError_t;
@@ -135,6 +244,9 @@ MultiPeerIbTransportBase::MultiPeerIbTransportBase(
       nRanks_(nRanks),
       bootstrap_(std::move(bootstrap)),
       config_(std::move(config)) {
+  if (config_.sendRecv.has_value() && config_.sendRecv->maxGroups == 0) {
+    config_.sendRecv->maxGroups = config_.maxGroups;
+  }
   if (myRank_ < 0 || myRank_ >= nRanks_) {
     throw std::invalid_argument("Invalid rank");
   }
@@ -162,14 +274,16 @@ MultiPeerIbTransportBase::MultiPeerIbTransportBase(
     n = static_cast<int>(it->second.size());
     source = "config.gpuNicMap";
   } else {
-    // On AMD, the `DataDirectMode::Only` default triggers `ibv_reg_dmabuf_mr`
-    // inside `augmentWithDataDirect()`, which is not exercised on AMD's
-    // libibverbs path here. Force `Disabled` to skip the DataDirect probe.
+    // Pass the configured Data-Direct mode through so discovery's DD probing
+    // honors config.enableDataDirect (Disabled here yields no DD candidates).
+    // On AMD, force Disabled: augmentWithDataDirect()'s ibv_reg_dmabuf_mr probe
+    // is not exercised on AMD's libibverbs path.
 #ifdef __HIP_PLATFORM_AMD__
     GpuNicDiscovery discovery(
         config_.cudaDevice, config_.ibHca, DataDirectMode::Disabled);
 #else
-    GpuNicDiscovery discovery(config_.cudaDevice, config_.ibHca);
+    GpuNicDiscovery discovery(
+        config_.cudaDevice, config_.ibHca, config_.enableDataDirect);
 #endif
     auto bestNics = discovery.getBestAffinityNics();
     if (bestNics.empty()) {
@@ -196,6 +310,442 @@ MultiPeerIbTransportBase::MultiPeerIbTransportBase(
   numNics_ = n;
   VLOG(1) << "MultiPeerIbTransport: numNics_=" << numNics_
           << " (source=" << source << ")";
+}
+
+// Out-of-line so the unique_ptr<DeviceBuffer> send/recv members destruct
+// against a complete type (DeviceBuffer is only forward-declared in the
+// header).
+MultiPeerIbTransportBase::~MultiPeerIbTransportBase() = default;
+
+// ---- shared send/recv staging-ring lifecycle (eager mode) ----
+
+const MultipeerIbTransportConfig::SendRecvConfig&
+MultiPeerIbTransportBase::sendRecvConfig() const {
+  if (!config_.sendRecv.has_value()) {
+    throw std::runtime_error("MultiPeerIbTransport: send/recv not configured");
+  }
+  return *config_.sendRecv;
+}
+
+void MultiPeerIbTransportBase::validateSendRecvConfig() const {
+  const auto& sr = sendRecvConfig();
+  if (sr.pipelineDepth < 1) {
+    throw std::invalid_argument(
+        "MultiPeerIbTransport: sendRecv.pipelineDepth must be >= 1");
+  }
+  if (sr.maxGroups < 1) {
+    throw std::invalid_argument(
+        "MultiPeerIbTransport: sendRecv.maxGroups must be >= 1");
+  }
+  if (config_.dataBufferSize == 0) {
+    throw std::invalid_argument(
+        "MultiPeerIbTransport: dataBufferSize must be > 0 when sendRecv is "
+        "enabled");
+  }
+  if ((config_.dataBufferSize / static_cast<std::size_t>(sr.maxGroups)) < 16) {
+    throw std::invalid_argument(
+        fmt::format(
+            "MultiPeerIbTransport: dataBufferSize / maxGroups must be >= 16, "
+            "got {} / {} = {}",
+            config_.dataBufferSize,
+            sr.maxGroups,
+            config_.dataBufferSize / sr.maxGroups));
+  }
+}
+
+std::size_t MultiPeerIbTransportBase::sendRecvStagingBytesPerPeer() const {
+  const auto& sr = sendRecvConfig();
+  return static_cast<std::size_t>(sr.pipelineDepth) * config_.dataBufferSize;
+}
+
+std::size_t MultiPeerIbTransportBase::sendRecvSignalBytesPerPeer() const {
+  const auto& sr = sendRecvConfig();
+  return 2 * static_cast<std::size_t>(sr.maxGroups) * sizeof(uint64_t);
+}
+
+std::size_t MultiPeerIbTransportBase::sendRecvCounterBytesPerPeer() const {
+  const auto& sr = sendRecvConfig();
+  return static_cast<std::size_t>(sr.maxGroups) * sizeof(uint64_t);
+}
+
+std::size_t MultiPeerIbTransportBase::sendRecvStateBytesPerPeer() const {
+  const auto& sr = sendRecvConfig();
+  return 2 * static_cast<std::size_t>(sr.maxGroups) *
+      sizeof(IbSendRecvState::ProgressSlot);
+}
+
+IbSendRecvState MultiPeerIbTransportBase::sendRecvStateForPeer(
+    int peerIndex) const {
+  if (!config_.sendRecv.has_value() || sendRecvPeerBuffers_.empty() ||
+      peerIndex < 0 ||
+      peerIndex >= static_cast<int>(sendRecvPeerBuffers_.size())) {
+    return {};
+  }
+  const auto& pb = sendRecvPeerBuffers_[peerIndex];
+  return IbSendRecvState{
+      .sendStagingBuf = pb.sendStaging,
+      .recvStagingBuf = pb.remoteRecvStaging,
+      .sendStagingPtr = static_cast<char*>(pb.sendStaging.ptr),
+      .recvStagingPtr = static_cast<char*>(pb.recvStaging.ptr),
+      .localSignalBuf = pb.signal,
+      .remoteSignalBuf = pb.remoteSignal,
+      .localCounterBuf = pb.counter,
+      .localCounterCompletionBuf = pb.counterCompletion,
+      .state = pb.state.value_or(DeviceSpan<IbSendRecvState::ProgressSlot>()),
+      .maxGroups = config_.sendRecv->maxGroups,
+      .pipelineDepth = config_.sendRecv->pipelineDepth,
+      .dataBufferSize = config_.dataBufferSize,
+  };
+}
+
+void MultiPeerIbTransportBase::allocateSendRecvBuffersEager(
+    IbCounterStorage counterStorage) {
+  if (!config_.sendRecv.has_value()) {
+    return;
+  }
+  validateSendRecvConfig();
+
+  const int numPeers = nRanks_ - 1;
+  if (numPeers <= 0) {
+    return;
+  }
+  sendRecvCounterStorage_ = counterStorage;
+
+  const std::size_t stagingPerPeer = sendRecvStagingBytesPerPeer();
+  const std::size_t signalPerPeer = sendRecvSignalBytesPerPeer();
+  const std::size_t counterPerPeer = sendRecvCounterBytesPerPeer();
+  const std::size_t statePerPeer = sendRecvStateBytesPerPeer();
+  const auto stateSlotsPerPeer =
+      static_cast<DeviceSpan<IbSendRecvState::ProgressSlot>::size_type>(
+          2 * config_.sendRecv->maxGroups);
+
+  // Align every GPU bulk allocation to the CUDA VMM allocation granularity so
+  // that any buffer which is later mlx5 Data-Direct (BAR1) registered has a 0
+  // DMA-BUF offset: GB300 rejects a non-zero offset with EOPNOTSUPP, and small
+  // cudaMalloc bulks (signal/counter/state) otherwise land unaligned (staging
+  // is large enough to already be aligned). Done unconditionally -- not gated
+  // on enableDataDirect -- so alignment is decoupled from the DD config and
+  // cannot silently break if a buffer is DD-registered; the off-DD cost is only
+  // a few MB of rounding on the small bulks. Granularity is queried from the
+  // driver (2 MiB fallback); AMD (no Data-Direct) keeps the natural allocation
+  // size.
+  std::size_t ddAlign = 1;
+#ifndef __HIP_PLATFORM_AMD__
+  ddAlign = std::size_t{2} << 20; // fallback if the query below fails
+  if (cuda_driver_lazy_init() == 0 && pfn_cuDeviceGet != nullptr &&
+      pfn_cuMemGetAllocationGranularity != nullptr) {
+    CUdevice dev = 0;
+    if (pfn_cuDeviceGet(&dev, config_.cudaDevice) == CUDA_SUCCESS) {
+      CUmemAllocationProp prop = {};
+      prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      prop.location.id = dev;
+      std::size_t granularity = 0;
+      if (pfn_cuMemGetAllocationGranularity(
+              &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) ==
+              CUDA_SUCCESS &&
+          granularity > 0) {
+        ddAlign = granularity;
+      }
+    }
+  }
+#endif
+  auto allocateBulk = [&](std::size_t perPeer, const char* label) {
+    const std::size_t used = perPeer * numPeers;
+    const std::size_t allocBytes = ((used + ddAlign - 1) / ddAlign) * ddAlign;
+    auto buf = std::make_unique<meta::comms::DeviceBuffer>(allocBytes);
+    checkSlotGpu(
+        slotGpuMemset(buf->get(), 0, allocBytes),
+        fmt::format("MultiPeerIbTransport: zero send/recv {}", label));
+    return buf;
+  };
+
+  sendRecvPeerBuffers_.resize(numPeers);
+
+  sendRecvSendStagingBulk_ = allocateBulk(stagingPerPeer, "send staging bulk");
+  sendRecvRecvStagingBulk_ = allocateBulk(stagingPerPeer, "recv staging bulk");
+
+  // Signal and the device counter are the small RDMA-registered control
+  // buffers; pack them into ONE granularity-aligned allocation so they cost a
+  // single granularity unit and share one aligned Data-Direct MR (offset 0),
+  // instead of one aligned unit each. Region layout: [signal | (device
+  // counter)], each 16B-aligned; the whole allocation rounded to the VMM
+  // granularity so the DD export offset is 0. The device-local progress state
+  // is never RDMA-registered or shared, so it needs no alignment and is
+  // allocated separately below at its natural size.
+  const std::size_t signalTotal = signalPerPeer * numPeers;
+  const bool deviceCounter = (counterStorage == IbCounterStorage::Device);
+  const std::size_t counterTotal =
+      deviceCounter ? counterPerPeer * numPeers : 0;
+  auto alignUp = [](std::size_t x, std::size_t a) {
+    return ((x + a - 1) / a) * a;
+  };
+  const std::size_t counterOff = alignUp(signalTotal, std::size_t{16});
+  const std::size_t controlBytes = alignUp(counterOff + counterTotal, ddAlign);
+  sendRecvControlBulk_ =
+      std::make_unique<meta::comms::DeviceBuffer>(controlBytes);
+  checkSlotGpu(
+      slotGpuMemset(sendRecvControlBulk_->get(), 0, controlBytes),
+      "MultiPeerIbTransport: zero send/recv control bulk");
+  char* controlBase = static_cast<char*>(sendRecvControlBulk_->get());
+
+  // Device-local progress state: separate allocation, natural size,
+  // unregistered.
+  sendRecvStateBulk_ =
+      std::make_unique<meta::comms::DeviceBuffer>(statePerPeer * numPeers);
+  checkSlotGpu(
+      slotGpuMemset(sendRecvStateBulk_->get(), 0, statePerPeer * numPeers),
+      "MultiPeerIbTransport: zero send/recv state bulk");
+
+  // Staging is bulk data: opt into Relaxed Ordering. Signal/counter stay strict
+  // so a flag write can't be reordered ahead of the data on the shared route.
+  // (Data-Direct, when active, applies to all of these automatically.)
+  auto sendStagingBulkReg = registerBuffer(
+      sendRecvSendStagingBulk_->get(),
+      stagingPerPeer * numPeers,
+      /*relaxedOrdering=*/true);
+  sendRecvRecvStagingBulkReg_ = registerBuffer(
+      sendRecvRecvStagingBulk_->get(),
+      stagingPerPeer * numPeers,
+      /*relaxedOrdering=*/true);
+  // One registration covers the whole control allocation (registerBuffer
+  // registers the entire underlying allocation regardless of the size arg; the
+  // base is granularity-aligned so the DMA-BUF offset is 0). The signal and
+  // device-counter handles are then just views into this single MR (same lkey),
+  // so there is no second registration / refcount to balance.
+  sendRecvSignalBulkReg_ = registerBuffer(controlBase, controlBytes);
+
+  IbgdaLocalBuffer counterBulkBuf;
+  IbgdaLocalBuffer counterCompletionBulkBuf;
+  if (deviceCounter) {
+    // Device counter is a view into the control MR (same lkey). The NIC bumps
+    // it via a loopback RDMA atomic (IBGDA).
+    sendRecvCounterBulkReg_ = sendRecvSignalBulkReg_.subBuffer(counterOff);
+    counterBulkBuf = sendRecvCounterBulkReg_;
+    counterCompletionBulkBuf = sendRecvCounterBulkReg_;
+  } else {
+    // Host counter: transport-allocated host-mapped (cudaHostAllocMapped). The
+    // CPU proxy writes the host alias on CQE; the device reads via the mapped
+    // pointer (IBRC). lkeys are unused (no RDMA target), so wrap with empty
+    // keys.
+    sendRecvHostCounterAllocation_ = allocateCounterSlotAllocation(
+        IbCounterStorage::HostPinned,
+        counterPerPeer * numPeers,
+        "send/recv host counter");
+    counterBulkBuf = IbgdaLocalBuffer(
+        sendRecvHostCounterAllocation_.devicePtr, NetworkLKeys{});
+    counterCompletionBulkBuf = IbgdaLocalBuffer(
+        sendRecvHostCounterAllocation_.hostPtr, NetworkLKeys{});
+    sendRecvCounterBulkReg_ = counterBulkBuf;
+  }
+
+  for (int i = 0; i < numPeers; ++i) {
+    auto& pb = sendRecvPeerBuffers_[i];
+    pb.sendStaging = sendStagingBulkReg.subBuffer(i * stagingPerPeer);
+    pb.recvStaging = sendRecvRecvStagingBulkReg_.subBuffer(i * stagingPerPeer);
+    pb.signal = sendRecvSignalBulkReg_.subBuffer(i * signalPerPeer);
+    pb.counter = counterBulkBuf.subBuffer(i * counterPerPeer);
+    pb.counterCompletion =
+        counterCompletionBulkBuf.subBuffer(i * counterPerPeer);
+    auto* statePtr = reinterpret_cast<IbSendRecvState::ProgressSlot*>(
+        static_cast<char*>(sendRecvStateBulk_->get()) + i * statePerPeer);
+    pb.state.emplace(statePtr, stateSlotsPerPeer);
+  }
+
+  VLOG(1) << "MultiPeerIbTransport: rank " << myRank_
+          << " allocated send/recv staging for " << numPeers
+          << " peers (staging=" << stagingPerPeer << "B per peer, counter="
+          << (counterStorage == IbCounterStorage::Device ? "device" : "host")
+          << ")";
+}
+
+void MultiPeerIbTransportBase::exchangeSendRecvBuffersEager() {
+  if (!config_.sendRecv.has_value() || sendRecvPeerBuffers_.empty()) {
+    return;
+  }
+
+  const int numPeers = nRanks_ - 1;
+  const std::size_t stagingPerPeer = sendRecvStagingBytesPerPeer();
+  const std::size_t signalPerPeer = sendRecvSignalBytesPerPeer();
+
+  auto recvStagingRemotes = exchangeBuffer(sendRecvRecvStagingBulkReg_);
+  auto signalRemotes = exchangeBuffer(sendRecvSignalBulkReg_);
+
+  for (int i = 0; i < numPeers; ++i) {
+    const int peerRank = peerIndexToRank(i);
+    const int remotePeerIndex = (myRank_ < peerRank) ? myRank_ : (myRank_ - 1);
+    sendRecvPeerBuffers_[i].remoteRecvStaging =
+        recvStagingRemotes[i].subBuffer(remotePeerIndex * stagingPerPeer);
+    sendRecvPeerBuffers_[i].remoteSignal =
+        signalRemotes[i].subBuffer(remotePeerIndex * signalPerPeer);
+  }
+
+  VLOG(1) << "MultiPeerIbTransport: rank " << myRank_
+          << " exchanged send/recv staging with " << numPeers << " peers";
+}
+
+void MultiPeerIbTransportBase::cleanupSendRecvBuffers() noexcept {
+  auto deregisterNoexcept = [&](void* ptr) noexcept {
+    if (ptr == nullptr) {
+      return;
+    }
+    try {
+      deregisterBuffer(ptr);
+    } catch (const std::exception& ex) {
+      LOG(ERROR) << "MultiPeerIbTransport: failed to deregister send/recv "
+                    "buffer: "
+                 << ex.what();
+    }
+  };
+
+  deregisterNoexcept(
+      sendRecvSendStagingBulk_ ? sendRecvSendStagingBulk_->get() : nullptr);
+  deregisterNoexcept(
+      sendRecvRecvStagingBulk_ ? sendRecvRecvStagingBulk_->get() : nullptr);
+  // The control bulk was registered exactly once (signal + device-counter are
+  // views into that single MR); state was never registered.
+  deregisterNoexcept(
+      sendRecvControlBulk_ ? sendRecvControlBulk_->get() : nullptr);
+
+  sendRecvSendStagingBulk_.reset();
+  sendRecvRecvStagingBulk_.reset();
+  sendRecvControlBulk_.reset();
+  sendRecvStateBulk_.reset();
+  freeCounterSlotAllocation(sendRecvHostCounterAllocation_);
+  sendRecvRecvStagingBulkReg_ = IbgdaLocalBuffer{};
+  sendRecvSignalBulkReg_ = IbgdaLocalBuffer{};
+  sendRecvCounterBulkReg_ = IbgdaLocalBuffer{};
+  // Lazy per-peer allocations (empty in eager mode).
+  for (auto& buf : lazyPeerBufs_) {
+    deregisterNoexcept(buf ? buf->get() : nullptr);
+    buf.reset();
+  }
+  lazyPeerBufs_.clear();
+  for (auto& counter : lazySendRecvHostCounters_) {
+    freeCounterSlotAllocation(counter);
+  }
+  lazySendRecvHostCounters_.clear();
+  sendRecvCounterStorage_ = IbCounterStorage::Device;
+  sendRecvPeerBuffers_.clear();
+}
+
+void MultiPeerIbTransportBase::allocateSendRecvBufferForPeer(
+    int peerIndex,
+    PeerBufferPayload& payload,
+    IbCounterStorage counterStorage) {
+  if (!config_.sendRecv.has_value()) {
+    return;
+  }
+  validateSendRecvConfig();
+  const int numPeers = nRanks_ - 1;
+  if (peerIndex < 0 || peerIndex >= numPeers) {
+    throw std::invalid_argument(
+        fmt::format(
+            "allocateSendRecvBufferForPeer: invalid peerIndex={}", peerIndex));
+  }
+  sendRecvPeerBuffers_.resize(numPeers);
+  lazyPeerBufs_.resize(numPeers);
+  lazySendRecvHostCounters_.resize(numPeers);
+  sendRecvCounterStorage_ = counterStorage;
+
+  const std::size_t stagingPerPeer = sendRecvStagingBytesPerPeer();
+  const std::size_t signalPerPeer = sendRecvSignalBytesPerPeer();
+  const std::size_t counterPerPeer = sendRecvCounterBytesPerPeer();
+  const std::size_t statePerPeer = sendRecvStateBytesPerPeer();
+  const auto stateSlots =
+      static_cast<DeviceSpan<IbSendRecvState::ProgressSlot>::size_type>(
+          2 * config_.sendRecv->maxGroups);
+  const bool deviceCounter = (counterStorage == IbCounterStorage::Device);
+
+  // One contiguous device buffer: sendStaging | recvStaging | signal | state,
+  // plus the counter when it is device-resident. A HostPinned counter is
+  // allocated separately (host-mapped, never RDMA-registered).
+  std::size_t total = 2 * stagingPerPeer + signalPerPeer + statePerPeer;
+  if (deviceCounter) {
+    total += counterPerPeer;
+  }
+  auto buf = std::make_unique<meta::comms::DeviceBuffer>(total);
+  checkSlotGpu(
+      slotGpuMemset(buf->get(), 0, total),
+      "MultiPeerIbTransport: zero per-peer send/recv buffer");
+  auto reg = registerBuffer(buf->get(), total);
+
+  char* p = static_cast<char*>(buf->get());
+  std::size_t off = 0;
+  auto& pb = sendRecvPeerBuffers_[peerIndex];
+  pb.sendStaging = IbgdaLocalBuffer(p + off, reg.lkey_per_device);
+  off += stagingPerPeer;
+  void* recvStagingPtr = p + off;
+  pb.recvStaging = IbgdaLocalBuffer(recvStagingPtr, reg.lkey_per_device);
+  off += stagingPerPeer;
+  void* signalPtr = p + off;
+  pb.signal = IbgdaLocalBuffer(signalPtr, reg.lkey_per_device);
+  off += signalPerPeer;
+  auto* statePtr = reinterpret_cast<IbSendRecvState::ProgressSlot*>(p + off);
+  off += statePerPeer;
+  pb.state.emplace(statePtr, stateSlots);
+  if (deviceCounter) {
+    pb.counter = IbgdaLocalBuffer(p + off, reg.lkey_per_device);
+    pb.counterCompletion = pb.counter;
+  } else {
+    auto alloc = allocateCounterSlotAllocation(
+        IbCounterStorage::HostPinned,
+        counterPerPeer,
+        "lazy send/recv host counter");
+    pb.counter = IbgdaLocalBuffer(alloc.devicePtr, NetworkLKeys{});
+    pb.counterCompletion = IbgdaLocalBuffer(alloc.hostPtr, NetworkLKeys{});
+    lazySendRecvHostCounters_[peerIndex] = std::move(alloc);
+  }
+
+  // The peer RDMA-writes into our recvStaging ring and signal inbox; publish
+  // their addr + per-NIC rkeys (whole per-peer regions, no slicing).
+  payload.recvStaging = registeredSlotMemoryExchInfo(recvStagingPtr);
+  payload.srSignal = registeredSlotMemoryExchInfo(signalPtr);
+  lazyPeerBufs_[peerIndex] = std::move(buf);
+}
+
+void MultiPeerIbTransportBase::applyRemoteSendRecvBuffer(
+    int peerIndex,
+    const PeerBufferPayload& remotePayload) {
+  if (!config_.sendRecv.has_value() || peerIndex < 0 ||
+      peerIndex >= static_cast<int>(sendRecvPeerBuffers_.size())) {
+    return;
+  }
+  auto& pb = sendRecvPeerBuffers_[peerIndex];
+  pb.remoteRecvStaging = remotePayload.recvStaging.toRemoteBuffer();
+  pb.remoteSignal = remotePayload.srSignal.toRemoteBuffer();
+}
+
+void MultiPeerIbTransportBase::cleanupSendRecvBufferForPeer(
+    int peerIndex) noexcept {
+  if (peerIndex < 0 ||
+      peerIndex >= static_cast<int>(sendRecvPeerBuffers_.size())) {
+    return;
+  }
+  if (peerIndex < static_cast<int>(lazyPeerBufs_.size()) &&
+      lazyPeerBufs_[peerIndex]) {
+    try {
+      deregisterBuffer(lazyPeerBufs_[peerIndex]->get());
+    } catch (const std::exception& ex) {
+      LOG(ERROR) << "MultiPeerIbTransport: failed to deregister per-peer "
+                    "send/recv buffer: "
+                 << ex.what();
+    }
+    lazyPeerBufs_[peerIndex].reset();
+  }
+  if (peerIndex < static_cast<int>(lazySendRecvHostCounters_.size())) {
+    freeCounterSlotAllocation(lazySendRecvHostCounters_[peerIndex]);
+  }
+  // Reset the per-peer views field-wise (IbSendRecvPeerBuffers is not
+  // copy-assignable due to its optional<DeviceSpan> state member).
+  auto& pb = sendRecvPeerBuffers_[peerIndex];
+  pb.sendStaging = IbgdaLocalBuffer{};
+  pb.recvStaging = IbgdaLocalBuffer{};
+  pb.signal = IbgdaLocalBuffer{};
+  pb.counter = IbgdaLocalBuffer{};
+  pb.remoteRecvStaging = IbgdaRemoteBuffer{};
+  pb.remoteSignal = IbgdaRemoteBuffer{};
+  pb.state.reset();
 }
 
 void MultiPeerIbTransportBase::openNics() {
@@ -240,7 +790,9 @@ void MultiPeerIbTransportBase::openNics() {
   // Priority 1: Explicit GPU-to-NIC mapping from config (entries [0..numNics_)
   // used in order — first is preferred).
   auto it = config_.gpuNicMap.find(config_.cudaDevice);
-  if (it != config_.gpuNicMap.end() && !it->second.empty()) {
+  const bool usingGpuNicMap =
+      it != config_.gpuNicMap.end() && !it->second.empty();
+  if (usingGpuNicMap) {
     const auto& names = it->second;
     if (static_cast<int>(names.size()) < numNics_) {
       throw std::runtime_error(
@@ -263,14 +815,16 @@ void MultiPeerIbTransportBase::openNics() {
 
   // Priority 2: Auto-discovery (top-numNics_ candidates by NUMA affinity).
   if (nics_[0].deviceName.empty()) {
-    // On AMD, the `DataDirectMode::Only` default triggers `ibv_reg_dmabuf_mr`
-    // inside `augmentWithDataDirect()`, which is not exercised on AMD's
-    // libibverbs path here. Force `Disabled` to skip the DataDirect probe.
+    // Pass the configured Data-Direct mode through so discovery's DD probing
+    // honors config.enableDataDirect (Disabled here yields no DD candidates).
+    // On AMD, force Disabled: augmentWithDataDirect()'s ibv_reg_dmabuf_mr probe
+    // is not exercised on AMD's libibverbs path.
 #ifdef __HIP_PLATFORM_AMD__
     auto discovery = GpuNicDiscovery(
         config_.cudaDevice, config_.ibHca, DataDirectMode::Disabled);
 #else
-    auto discovery = GpuNicDiscovery(config_.cudaDevice, config_.ibHca);
+    auto discovery = GpuNicDiscovery(
+        config_.cudaDevice, config_.ibHca, config_.enableDataDirect);
 #endif
     const auto& candidates = discovery.getCandidates();
     if (static_cast<int>(candidates.size()) < numNics_) {
@@ -285,10 +839,34 @@ void MultiPeerIbTransportBase::openNics() {
     }
     for (int n = 0; n < numNics_; ++n) {
       nics_[n].deviceName = candidates[n].name;
+      // Discovery already probed Data-Direct capability for each candidate;
+      // read it cheaply (no extra sysfs probe needed on this path).
+      nics_[n].isDataDirect = candidates[n].isDataDirect;
     }
     VLOG(1) << "MultiPeerIbTransport: auto-discovered NIC "
             << nics_[0].deviceName << " for GPU device " << config_.cudaDevice;
   }
+
+  // Data-Direct active per NIC = requested (config Auto) AND capable. RO mode
+  // string for logging by enum value (Disabled/Enabled/Auto) so autodetection
+  // vs explicit opt-in stays distinguishable. Computed once before the bring-up
+  // loop so each NIC can log its resolved status inline.
+  const bool ddEnabled = config_.enableDataDirect != DataDirectMode::Disabled;
+  const char* roMode = "auto";
+  switch (config_.enablePciRelaxedOrdering) {
+    case MultipeerIbTransportConfig::PciRelaxedOrderingMode::Disabled:
+      roMode = "disabled";
+      break;
+    case MultipeerIbTransportConfig::PciRelaxedOrderingMode::Enabled:
+      roMode = "enabled";
+      break;
+    case MultipeerIbTransportConfig::PciRelaxedOrderingMode::Auto:
+      roMode = "auto";
+      break;
+  }
+  // RO must be uniform across NICs (the MR cache keys on one effective-ordering
+  // bool per allocation); AND in each NIC's capability as it is brought up.
+  relaxedOrderingCapable_ = numNics_ > 0;
 
   // Open + setup each NIC: find by name, open ctx, alloc PD, query GID + port.
   for (int n = 0; n < numNics_; ++n) {
@@ -317,6 +895,23 @@ void MultiPeerIbTransportBase::openNics() {
     if (!nics_[n].ibvPd) {
       throw std::runtime_error(
           "Failed to allocate protection domain on NIC " + nics_[n].deviceName);
+    }
+
+    // Probe PCIe Relaxed Ordering support once per NIC. registerBuffer() gates
+    // IBV_ACCESS_RELAXED_ORDERING on this; on a driver that rejects the flag,
+    // applying it would fail every data-MR registration and break setup, so an
+    // unsupporting NIC falls back to strict ordering instead.
+    nics_[n].relaxedOrderingCapable =
+        nicSupportsRelaxedOrdering(nics_[n].ibvPd);
+
+    // Detect Data-Direct capability for the explicit gpuNicMap path.
+    // registerBuffer() auto-selects the Data-Direct (BAR1) path when
+    // nics_[n].isDataDirect is set. The auto-discovery path sets that flag for
+    // free from the discovery candidate; the gpuNicMap path bypasses discovery,
+    // so run the same capability gate here on the just-opened device.
+    if (usingGpuNicMap) {
+      nics_[n].isDataDirect = nicSupportsDataDirect(
+          deviceList[nicIdx], nics_[n].ibvCtx, nics_[n].ibvPd);
     }
 
     if (symbols.ibv_internal_query_gid(
@@ -378,25 +973,83 @@ void MultiPeerIbTransportBase::openNics() {
                    << " differs from NIC 0 active_mtu=" << localMtu_
                    << "; using NIC 0's MTU for negotiation";
     }
+
+    // NIC fully brought up: fold its RO capability into the cross-NIC aggregate
+    // and log its resolved Data-Direct / Relaxed-Ordering status inline.
+    relaxedOrderingCapable_ =
+        relaxedOrderingCapable_ && nics_[n].relaxedOrderingCapable;
+    LOG(INFO) << "MultiPeerIbTransport: NIC " << n << " ("
+              << nics_[n].deviceName << ") Data-Direct enabled=" << ddEnabled
+              << " nicCapable=" << nics_[n].isDataDirect << " -> "
+              << ((ddEnabled && nics_[n].isDataDirect) ? "ACTIVE" : "inactive")
+              << "; relaxedOrdering=" << roMode
+              << " nicCapable=" << nics_[n].relaxedOrderingCapable;
   }
+
+  // PCIe Relaxed Ordering is applied only when every NIC accepts the flag
+  // (aggregated above). Surface an explicit Enabled request that can't be met
+  // (it falls back to strict ordering rather than throwing); otherwise just
+  // record the resolved setting: config, capability, and the ordering in
+  // effect.
+  const bool useRelaxedOrdering =
+      relaxedOrderingActiveForNic(config_, relaxedOrderingCapable_);
+  if (config_.enablePciRelaxedOrdering ==
+          MultipeerIbTransportConfig::PciRelaxedOrderingMode::Enabled &&
+      !relaxedOrderingCapable_) {
+    LOG(WARNING) << "MultiPeerIbTransport: PCIe Relaxed Ordering requested "
+                    "(Enabled) but not supported on all NICs; falling back to "
+                    "strict ordering on data MRs";
+  } else {
+    LOG(INFO) << "MultiPeerIbTransport: PCIe Relaxed Ordering config=" << roMode
+              << " allNicsCapable=" << relaxedOrderingCapable_ << " -> "
+              << (useRelaxedOrdering ? "ACTIVE" : "strict");
+  }
+
   // Success: SCOPE_EXIT frees the device list; SCOPE_FAIL is skipped, so the
   // opened ctx/PD are kept for the transport's lifetime.
 }
 
 IbgdaLocalBuffer MultiPeerIbTransportBase::registerBuffer(
     void* ptr,
-    std::size_t size) {
+    std::size_t size,
+    bool relaxedOrdering) {
   if (ptr == nullptr || size == 0) {
     throw std::invalid_argument("Invalid buffer pointer or size");
   }
 
+  // Resolve the effective Relaxed Ordering once, up front: the caller's request
+  // gated by config (NCCL_IB_PCI_RELAXED_ORDERING) AND by NIC capability probed
+  // during openNics. Gating on capability means a NIC whose driver rejects
+  // IBV_ACCESS_RELAXED_ORDERING falls back to strict ordering here rather than
+  // failing every data-MR registration below. This is the actual MR access
+  // flag, so it is part of the cache identity (key) below and is reused for the
+  // access flags — keeping the two from drifting apart.
+  const bool useRelaxedOrdering = relaxedOrdering &&
+      relaxedOrderingActiveForNic(config_, relaxedOrderingCapable_);
+
   // Fast path: containment lookup — if [ptr, ptr+size) falls entirely within an
-  // existing registration, return the cached per-NIC lkeys with no driver call.
+  // existing registration with the same effective ordering, return the cached
+  // per-NIC lkeys with no driver call.
   const auto addr = reinterpret_cast<uintptr_t>(ptr);
   auto it = registeredBuffers_.upper_bound(addr);
   if (it != registeredBuffers_.begin()) {
     --it;
     if (addr + size <= it->first + it->second.allocSize) {
+      // The cache holds one MR set per allocation; its access flags (including
+      // Relaxed Ordering) are fixed at registration, so the effective ordering
+      // is part of the cache key. A containment hit resolving to different
+      // ordering would silently get the wrong semantics.
+      if (it->second.relaxedOrdering != useRelaxedOrdering) {
+        throw std::runtime_error(
+            fmt::format(
+                "registerBuffer: ptr={} is contained in an existing registration "
+                "(allocBase=0x{:x}) registered with relaxedOrdering={} but "
+                "requested relaxedOrdering={}",
+                ptr,
+                it->first,
+                it->second.relaxedOrdering,
+                useRelaxedOrdering));
+      }
       it->second.refs++;
       VLOG(1) << "MultiPeerIbTransport: cache hit for ptr=" << ptr
               << " allocBase=0x" << std::hex << it->first << std::dec
@@ -435,29 +1088,106 @@ IbgdaLocalBuffer MultiPeerIbTransportBase::registerBuffer(
   int accessFlags = ibverbx::IBV_ACCESS_LOCAL_WRITE |
       ibverbx::IBV_ACCESS_REMOTE_WRITE | ibverbx::IBV_ACCESS_REMOTE_READ |
       ibverbx::IBV_ACCESS_REMOTE_ATOMIC;
+  // PCIe Relaxed Ordering (resolved above as useRelaxedOrdering): on bulk data
+  // MRs only, let NIC<->HBM DMA TLPs pipeline instead of strict-ordering to
+  // ~half rate. Signal/counter MRs stay strict so a strict flag write cannot be
+  // reordered ahead of the data on the shared route.
+  if (useRelaxedOrdering) {
+    accessFlags |= ibverbx::IBV_ACCESS_RELAXED_ORDERING;
+  }
+  // mlx5 Data-Direct (config.enableDataDirect): on a DD-capable NIC, register
+  // through the data-direct (BAR1) PCIe path for ~2x NIC<->HBM write BW on
+  // GB300 (NCCL's GDAKI path). Applied to every MR registered here so data and
+  // signal/counter share the same route on the same QP -- preserving
+  // data-before-flag ordering without a flush. Autodetected per NIC.
 
   CachedMr cached;
   cached.allocSize = allocSize;
   cached.refs = 1;
+  cached.relaxedOrdering = useRelaxedOrdering;
 
-  // Try DMABUF first per NIC, fall back to plain reg_mr per NIC. If any NIC's
-  // registration fails, deregister everything already registered and propagate.
+  // Per NIC, register the MR in priority order, each path falling through to
+  // the next on failure:
+  //   1. Data-Direct: PCIe-mapped (BAR1) dmabuf + mlx5dv DATA_DIRECT reg. Only
+  //      on a DD-capable NIC with DD enabled. The regular C2C dmabuf is NOT
+  //      used here -- DD needs its own PCIe-mapped dmabuf.
+  //   2. Regular DMABUF: default (C2C) dmabuf + ibv_reg_dmabuf_mr.
+  //   3. Plain ibv_reg_mr.
+  // If any NIC ultimately fails, deregister everything already done and throw.
   for (int n = 0; n < numNics_; ++n) {
     ibverbx::ibv_mr* mr = nullptr;
-    auto dmabuf = export_gpu_dmabuf_aligned(
-        reinterpret_cast<void*>(allocBase), allocSize);
-    if (dmabuf) {
-      if (symbols.ibv_internal_reg_dmabuf_mr != nullptr) {
-        mr = symbols.ibv_internal_reg_dmabuf_mr(
-            nics_[n].ibvPd,
-            dmabuf->alignment.dmabufOffset,
-            allocSize,
-            static_cast<uint64_t>(allocBase),
-            dmabuf->fd,
-            accessFlags);
+    // 1. Data-Direct. When selected for this NIC it is mandatory: every MR on
+    //    the NIC must share the Data-Direct route so data and signal/counter
+    //    stay ordered on one QP without a flush (see the per-MR-uniformity note
+    //    above). A per-MR fallback would mix DD and non-DD MRs on the same QP
+    //    and break that ordering, so any Data-Direct failure here is fatal --
+    //    deregister the MRs done so far and throw, rather than silently
+    //    downgrading this one MR to the regular path.
+    if (dataDirectActiveForNic(config_, nics_[n].isDataDirect) &&
+        symbols.mlx5dv_internal_reg_dmabuf_mr != nullptr) {
+      auto ddDmabuf = export_gpu_dmabuf_aligned(
+          reinterpret_cast<void*>(allocBase),
+          allocSize,
+          DmaBufExportKind::Pcie);
+      if (!ddDmabuf) {
+        for (int j = 0; j < n; ++j) {
+          symbols.ibv_internal_dereg_mr(cached.mrs[j]);
+        }
+        throw std::runtime_error(
+            fmt::format(
+                "Data-Direct selected for NIC {} but PCIe DMA-BUF export failed "
+                "(allocSize={}); refusing to mix DD and non-DD MRs on one QP "
+                "(PCIe DMA-BUF export needs CUDA >= 12.8 and a capable driver)",
+                n,
+                allocSize));
       }
-      close(dmabuf->fd);
+      errno = 0;
+      mr = symbols.mlx5dv_internal_reg_dmabuf_mr(
+          nics_[n].ibvPd,
+          ddDmabuf->alignment.dmabufOffset,
+          allocSize,
+          static_cast<uint64_t>(allocBase),
+          ddDmabuf->fd,
+          accessFlags,
+          ibverbx::MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+      // Capture the registration errno before close(): a failing (or even
+      // successful) close() may clobber errno, which would mask the real
+      // mlx5dv_reg_dmabuf_mr failure reason in the message below.
+      const int regErrno = errno;
+      close(ddDmabuf->fd);
+      if (!mr) {
+        for (int j = 0; j < n; ++j) {
+          symbols.ibv_internal_dereg_mr(cached.mrs[j]);
+        }
+        throw std::runtime_error(
+            fmt::format(
+                "Data-Direct mlx5dv_reg_dmabuf_mr failed for NIC {} "
+                "(allocSize={} errno={} ({})); refusing to mix DD and non-DD "
+                "MRs on one QP",
+                n,
+                allocSize,
+                regErrno,
+                folly::errnoStr(regErrno)));
+      }
     }
+    // 2. Regular DMABUF (default C2C mapping).
+    if (!mr) {
+      auto dmabuf = export_gpu_dmabuf_aligned(
+          reinterpret_cast<void*>(allocBase), allocSize);
+      if (dmabuf) {
+        if (symbols.ibv_internal_reg_dmabuf_mr != nullptr) {
+          mr = symbols.ibv_internal_reg_dmabuf_mr(
+              nics_[n].ibvPd,
+              dmabuf->alignment.dmabufOffset,
+              allocSize,
+              static_cast<uint64_t>(allocBase),
+              dmabuf->fd,
+              accessFlags);
+        }
+        close(dmabuf->fd);
+      }
+    }
+    // 3. Plain reg_mr.
     if (!mr) {
       errno = 0;
       mr = symbols.ibv_internal_reg_mr(
@@ -1110,14 +1840,27 @@ void MultiPeerIbTransportBase::validatePeerTopology(
               peerInfo.numNics,
               numNics_));
     }
-    if (peerInfo.numQpsPerPeerPerNic != config_.numQpsPerPeerPerNic) {
+    const int expectedNumQpsPerPeerPerNic = config_.numQpsPerPeerPerNic();
+    if (peerInfo.numQpsPerPeerPerNic != expectedNumQpsPerPeerPerNic) {
       throw std::runtime_error(
           fmt::format(
               "Peer rank {} reports numQpsPerPeerPerNic={} but mine is {}; all "
               "ranks must use the same numQpsPerPeerPerNic",
               peerRank,
               peerInfo.numQpsPerPeerPerNic,
-              config_.numQpsPerPeerPerNic));
+              expectedNumQpsPerPeerPerNic));
+    }
+    if (peerInfo.maxGroups != config_.maxGroups ||
+        peerInfo.qpsPerBlockPerNic != config_.qpsPerBlockPerNic) {
+      throw std::runtime_error(
+          fmt::format(
+              "Peer rank {} reports maxGroups={} qpsPerBlockPerNic={} but "
+              "mine are {} {}; all ranks must use the same IB QP shape",
+              peerRank,
+              peerInfo.maxGroups,
+              peerInfo.qpsPerBlockPerNic,
+              config_.maxGroups,
+              config_.qpsPerBlockPerNic));
     }
   }
 }

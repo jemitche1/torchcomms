@@ -303,6 +303,93 @@ class RunMastBenchmarksTest(unittest.TestCase):
         self.assertEqual(failures, ["1 fatal runtime log lines"])
         self.assertEqual(warnings, ["1 post-result runtime log lines"])
 
+    def test_job_result_passed_uses_structured_result(self) -> None:
+        result = {
+            "benchmark": "disagg_prefill_decode",
+            "connector": "UniflowConnector",
+            "correctness": {"mismatches": 0, "passed": True, "total_checked": 2},
+            "mode": "accuracy",
+            "performance": {
+                "median_s": 10.0,
+                "req_per_s": 4.0,
+            },
+            "schema_version": 1,
+            "status": "passed",
+        }
+        job = run_mast_benchmarks.JobResult(
+            spec=self.job_spec(),
+            app_uri="mast://torchx/torchx-bench-cn-uni-tp1",
+            state="SUCCEEDED",
+            log_lines=[
+                "trainer/0 [0]:BENCHMARK_RESULT_JSON: " + json.dumps(result),
+                "trainer/0 [0]:previous run had RuntimeError but recovered",
+            ],
+        )
+
+        self.assertTrue(job.passed)
+
+    def test_print_summary_distinguishes_usable_result_from_runtime_clean(
+        self,
+    ) -> None:
+        result = {
+            "benchmark": "disagg_prefill_decode",
+            "connector": "UniflowConnector",
+            "correctness": {"mismatches": 0, "passed": True, "total_checked": 2},
+            "mode": "accuracy",
+            "performance": {
+                "median_s": 10.0,
+                "req_per_s": 4.0,
+            },
+            "schema_version": 1,
+            "status": "passed",
+        }
+        job = run_mast_benchmarks.JobResult(
+            spec=self.job_spec(),
+            app_uri="mast://torchx/torchx-bench-cn-uni-tp1",
+            state="SUCCEEDED",
+            log_lines=[
+                "trainer/0 [0]:BENCHMARK_RESULT_JSON: " + json.dumps(result),
+                "trainer/0 [0]:Traceback (most recent call last):",
+            ],
+        )
+
+        with self.assertLogs(run_mast_benchmarks.logger, level="INFO") as logs:
+            run_mast_benchmarks.print_summary("pkg:abcdef0", [job])
+
+        rendered = "\n".join(logs.output)
+        self.assertIn("comparison=USABLE runtime=ISSUES", rendered)
+        self.assertIn("post_result_runtime_errors=1", rendered)
+
+    def test_make_job_specs_logs_when_tp_values_shadow_tp(self) -> None:
+        args = argparse.Namespace(
+            connector="uniflow",
+            layout="cn",
+            tp=4,
+            tp_values=[1, 2],
+            job_prefix="bench",
+            nixl_kv_buffer_device="cuda",
+            pytorch_cuda_alloc_conf="expandable_segments:True",
+        )
+
+        with self.assertLogs(run_mast_benchmarks.logger, level="WARNING") as logs:
+            specs = run_mast_benchmarks.make_job_specs(args, "pkg:abcdef0")
+
+        self.assertEqual([spec.tp for spec in specs], [1, 2])
+        self.assertIn("--tp=4 is ignored", "\n".join(logs.output))
+
+    @staticmethod
+    def job_spec() -> run_mast_benchmarks.JobSpec:
+        return run_mast_benchmarks.JobSpec(
+            connector_key="uniflow",
+            connector_class="UniflowConnector",
+            layout="cn",
+            tp=1,
+            nixl_kv_buffer_device="cuda",
+            pytorch_cuda_alloc_conf="expandable_segments:True",
+            name="bench-cn-uni-tp1",
+            session_id="codex-abcdef0-cn-uniflow-tp1",
+        )
+
     @staticmethod
     def progress_line(*, completed_iters: int, completed_requests: int) -> str:
         payload = {

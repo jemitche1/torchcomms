@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <queue>
+#include <string_view>
 #include <tuple>
 #include <utility>
+
+#include "comms/uniflow/logging/Logger.h"
 
 namespace uniflow {
 
@@ -15,6 +18,58 @@ namespace {
 /// Lower type is better; for equal types, higher bandwidth is better.
 bool isBetterPath(const TopoPath& a, const TopoPath& b) {
   return std::tie(a.type, b.bw) < std::tie(b.type, a.bw);
+}
+
+/// Shared NIC-selection core. Ranks NICs by the path returned from @p pathFor
+/// and returns all NICs tied for the best (lowest) path type and bandwidth.
+///
+/// When @p netdevPrefix is non-empty AND the topology has known netdev names,
+/// NICs are first restricted to those whose backing netdev name starts with the
+/// prefix; if that yields nothing, it logs a warning and falls back to
+/// filter-only selection (the legacy behavior). Topologies that do not populate
+/// netdev names skip the prefix predicate entirely (no warning).
+template <typename PathFor>
+std::vector<std::string> selectNicsImpl(
+    const Topology& topo,
+    const NicFilter& filter,
+    std::string_view netdevPrefix,
+    PathFor&& pathFor) {
+  const auto pick = [&](bool requirePrefix) {
+    std::vector<std::string> nics;
+    PathType bestType = PathType::DIS;
+    uint32_t maxBw = 0;
+    const int count = static_cast<int>(topo.nicCount());
+    for (int i = 0; i < count; ++i) {
+      if (!topo.filterNic(i, filter)) {
+        continue;
+      }
+      if (requirePrefix && !topo.matchesNetdevPrefix(i, netdevPrefix)) {
+        continue;
+      }
+      const auto& nicNode = topo.getNicNode(i);
+      const auto& path = pathFor(nicNode);
+      if (path.type < bestType || (path.type == bestType && path.bw > maxBw)) {
+        nics.clear();
+        nics.push_back(nicNode.name);
+        bestType = path.type;
+        maxBw = path.bw;
+      } else if (path.type == bestType && path.bw == maxBw) {
+        nics.push_back(nicNode.name);
+      }
+    }
+    return nics;
+  };
+
+  if (!netdevPrefix.empty() && topo.hasNetdevNames()) {
+    auto preferred = pick(/*requirePrefix=*/true);
+    if (!preferred.empty()) {
+      return preferred;
+    }
+    UNIFLOW_LOG_WARN(
+        "No NIC matched netdev prefix '{}'; falling back to filter-only NIC selection",
+        netdevPrefix);
+  }
+  return pick(/*requirePrefix=*/false);
 }
 
 } // namespace
@@ -338,53 +393,87 @@ bool Topology::filterNic(int nicIndex, const NicFilter& filter) const {
   return filter.matches(nodes_[nicNodeIds_[nicIndex]].name);
 }
 
-std::vector<std::string> Topology::selectCpuNics(
-    const NicFilter& filter) const {
-  int count = static_cast<int>(nicCount());
-  std::vector<std::string> nics;
-  PathType bestType = PathType::DIS;
-  uint32_t maxBw = 0;
+bool Topology::matchesNetdevPrefix(int nicIndex, std::string_view netdevPrefix)
+    const {
+  if (netdevPrefix.empty()) {
+    return true;
+  }
+  const auto& nicData = std::get<TopoNode::NicData>(getNicNode(nicIndex).data);
+  return std::string_view(nicData.netdevName).starts_with(netdevPrefix);
+}
+
+bool Topology::hasNetdevNames() const {
+  const int count = static_cast<int>(nicCount());
   for (int i = 0; i < count; ++i) {
-    if (!filterNic(i, filter)) {
-      continue;
-    }
-    const auto& nicNode = getNicNode(i);
-    const auto& numaNode =
-        getCpuNode(std::get<TopoNode::NicData>(nicNode.data).numaNode);
-    const auto& path = getPath(numaNode.id, nicNode.id, {.allowC2C = true});
-    if (path.type < bestType || (path.type == bestType && path.bw > maxBw)) {
-      nics.clear();
-      nics.push_back(nicNode.name);
-      bestType = path.type;
-      maxBw = path.bw;
-    } else if (path.type == bestType && path.bw == maxBw) {
-      nics.push_back(nicNode.name);
+    const auto& nicData = std::get<TopoNode::NicData>(getNicNode(i).data);
+    if (!nicData.netdevName.empty()) {
+      return true;
     }
   }
-  return nics;
+  return false;
+}
+
+std::vector<std::string> Topology::selectCpuNics(
+    const NicFilter& filter,
+    std::string_view netdevPrefix) const {
+  return selectNicsImpl(
+      *this,
+      filter,
+      netdevPrefix,
+      [this](const TopoNode& nicNode) -> const TopoPath& {
+        const auto& numaNode =
+            getCpuNode(std::get<TopoNode::NicData>(nicNode.data).numaNode);
+        return getPath(numaNode.id, nicNode.id, {.allowC2C = true});
+      });
 }
 
 std::vector<std::string> Topology::selectGpuNics(
     int cudaDeviceId,
-    const NicFilter& filter) const {
+    const NicFilter& filter,
+    std::string_view netdevPrefix) const {
   const auto& gpuNode = getGpuNode(cudaDeviceId);
-  int count = static_cast<int>(nicCount());
+  return selectNicsImpl(
+      *this,
+      filter,
+      netdevPrefix,
+      [this, &gpuNode](const TopoNode& nicNode) -> const TopoPath& {
+        return getPath(gpuNode.id, nicNode.id, {.allowC2C = true});
+      });
+}
+
+std::vector<std::string> Topology::selectCpuNicsForNuma(
+    int numaId,
+    const NicFilter& filter,
+    size_t maxNics) const {
+  if (numaId < 0 || numaId >= static_cast<int>(cpuNodeIds_.size()) ||
+      cpuNodeIds_[numaId] < 0) {
+    return {};
+  }
+  const auto& numaNode = getCpuNode(numaId);
+  auto nics = selectNicsImpl(
+      *this,
+      filter,
+      "",
+      [this, &numaNode](const TopoNode& nicNode) -> const TopoPath& {
+        return getPath(numaNode.id, nicNode.id, {.allowC2C = true});
+      });
+  if (maxNics > 0 && nics.size() > maxNics) {
+    nics.resize(maxNics);
+  }
+  return nics;
+}
+
+std::vector<std::string> Topology::selectCpuNicsForNumaNodes(
+    const NicFilter& filter,
+    size_t maxNicsPerNuma) const {
   std::vector<std::string> nics;
-  PathType bestType = PathType::DIS;
-  uint32_t maxBw = 0;
-  for (int i = 0; i < count; ++i) {
-    if (!filterNic(i, filter)) {
-      continue;
-    }
-    const auto& nicNode = getNicNode(i);
-    const auto& path = getPath(gpuNode.id, nicNode.id, {.allowC2C = true});
-    if (path.type < bestType || (path.type == bestType && path.bw > maxBw)) {
-      nics.clear();
-      nics.push_back(nicNode.name);
-      bestType = path.type;
-      maxBw = path.bw;
-    } else if (path.type == bestType && path.bw == maxBw) {
-      nics.push_back(nicNode.name);
+  for (int numaId = 0; numaId < static_cast<int>(cpuNodeIds_.size());
+       ++numaId) {
+    auto numaNics = selectCpuNicsForNuma(numaId, filter, maxNicsPerNuma);
+    for (auto& nic : numaNics) {
+      if (std::find(nics.begin(), nics.end(), nic) == nics.end()) {
+        nics.push_back(std::move(nic));
+      }
     }
   }
   return nics;

@@ -109,6 +109,14 @@ int readNumaNode(SysfsApi& sysfs, std::string_view pciDevicePath) {
   return static_cast<int>(val);
 }
 
+/// Read the backing netdev name for an IB device by listing
+/// /sys/class/infiniband/<dev>/device/net/. Vendor-neutral (works for mlx5,
+/// bnxt_re, etc.). Returns the first entry, or empty if none is found.
+std::string readNetdevName(SysfsApi& sysfs, const std::string& ibdevPath) {
+  auto entries = sysfs.listDir(ibdevPath + "/device/net");
+  return entries.empty() ? std::string{} : entries.front();
+}
+
 /// Convert a sysfs max_link_speed string to Mbps per lane.
 /// Handles both old ("16 GT/s") and new ("16.0 GT/s PCIe") kernel formats.
 /// Encoding overhead is already baked into the returned value.
@@ -609,6 +617,7 @@ Result<std::vector<NicDiscovery>> discoverNics(
                     .numaNode = 0,
                     .port = activePort,
                     .portSpeedMbps = portSpeedMbps,
+                    .netdevName = readNetdevName(sysfs, ibdevPath),
                 },
             .sysfsPath = ibdevPath,
             .ancestorChain = {},
@@ -623,6 +632,7 @@ Result<std::vector<NicDiscovery>> discoverNics(
                     .numaNode = readNumaNode(sysfs, pciDevicePath),
                     .port = activePort,
                     .portSpeedMbps = portSpeedMbps,
+                    .netdevName = readNetdevName(sysfs, ibdevPath),
                 },
             .sysfsPath = pciDevicePath,
             .ancestorChain = buildAncestorChain(sysfs, pciDevicePath),
@@ -1016,7 +1026,7 @@ CudaTopologyDiscovery::CudaTopologyDiscovery(
     std::shared_ptr<IbvApi> ibvApi,
     std::shared_ptr<SysfsApi> sysfsApi)
     : cudaApi_(cudaApi ? std::move(cudaApi) : std::make_shared<CudaApi>()),
-      nvmlApi_(nvmlApi ? std::move(nvmlApi) : std::make_shared<NvmlApi>()),
+      nvmlApi_(nvmlApi ? std::move(nvmlApi) : createNvmlApi()),
       ibvApi_(ibvApi ? std::move(ibvApi) : std::make_shared<IbvApi>()),
       sysfsApi_(sysfsApi ? std::move(sysfsApi) : std::make_shared<SysfsApi>()) {
 }

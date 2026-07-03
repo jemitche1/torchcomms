@@ -37,7 +37,6 @@ struct MultipeerIbgdaDeviceTransport;
 struct P2pIbgdaTransportBuildParams;
 struct PeerQpPayload;
 struct PeerBufferPayload;
-struct PeerBufferSizes;
 } // namespace comms::prims
 
 namespace comms::prims {
@@ -47,10 +46,9 @@ namespace comms::prims {
 // the ctor signature below are unchanged.
 using MultipeerIbgdaTransportConfig = MultipeerIbTransportConfig;
 
-// The exchange wire structs and allGather caps (kMaxRanksForAllGather,
-// kMaxQpsPerPeerPerNic) now live in MultiPeerIbTransport.h so they are shared
-// across IB backends. Keep the historical IBGDA names as aliases so callers and
-// the .cc are unchanged.
+// The exchange wire structs and allGather caps now live in
+// MultiPeerIbTransport.h so they are shared across IB backends. Keep the
+// historical IBGDA names as aliases so callers and the .cc are unchanged.
 using IbgdaTransportExchInfo = IbTransportExchInfo;
 using IbgdaTransportExchInfoAll = IbTransportExchInfoAll;
 
@@ -206,11 +204,8 @@ class MultipeerIbgdaTransport
   // backend supplies the register_mr_on_nics()/lookup_alloc_base()/
   // deregister_mr() hooks below).
 
-  /**
-   * Get the number of QP sets per (peer, NIC).
-   * Total QPs to a peer = numQpsPerPeerPerNic() * numNics().
-   */
-  int numQpsPerPeerPerNic() const;
+  int maxGroups() const;
+  int qpsPerBlockPerNic() const;
 
   // numNics() is inherited from MultiPeerIbTransport.
 
@@ -226,9 +221,6 @@ class MultipeerIbgdaTransport
   void allocateResources();
   void registerMemory();
   void createQpGroups();
-  void allocate_send_recv_buffers();
-  void exchange_send_recv_buffers();
-  void cleanup_send_recv_buffers();
   void cleanup();
   // Connect a QP to a peer (or self for loopback). The nic argument selects
   // which local NIC's AH attrs / port to use; the peerInfo carries the
@@ -245,14 +237,10 @@ class MultipeerIbgdaTransport
   void connectPeerLoopback(int peerIndex);
   P2pIbgdaTransportBuildParams buildPeerTransportParams(int peerIndex) const;
 
-  PeerBufferSizes computePeerBufferSizes() const;
-
   void doMaterializePeer(int peerRank);
 
   PeerQpPayload buildLocalQpPayload(int peerIndex) const;
-  void allocatePeerBuffers(int peerIndex, PeerBufferPayload& payload);
   void connectPeerMainQps(int peerIndex, const PeerQpPayload& remotePayload);
-  void applyRemoteViews(int peerIndex, const PeerBufferPayload& remotePayload);
   void cleanupPeerOnFailure(int peerIndex);
 
   // MultiPeerIbTransport drives the shared control plane (config, MR registry,
@@ -269,15 +257,18 @@ class MultipeerIbgdaTransport
   // numNics_ is inherited (protected) from MultiPeerIbTransport;
   // nicDevices_.size() == numNics_ after openIbDevice().
 
-  // Per-NIC host-side IB verbs resources. qpGroups and loopbackCompanionQps
-  // are indexed [peer * numQpsPerPeerPerNic + q].
+  // Per-NIC host-side IB verbs resources. blockQpGroups and
+  // loopbackCompanionQps are indexed [peer * maxGroups + block]. The lane-0
+  // main QP comes from blockQpGroups; extra main QPs are indexed
+  // [(peer * maxGroups + block) * (qpsPerBlockPerNic - 1) + (lane - 1)].
   // Backend-specific (DOCA) per-NIC state. The generic per-NIC resources
   // (device name, context, PD, GID) live in MultiPeerIbTransport::nics_,
   // index-aligned with this vector; openIbDevice() fills both.
   struct NicDocaResources {
     doca_verbs_ah_attr* ahAttr{nullptr};
     ibverbx::ibv_mr* sinkMr{nullptr};
-    std::vector<doca_gpu_verbs_qp_group_hl*> qpGroups;
+    std::vector<doca_gpu_verbs_qp_group_hl*> blockQpGroups;
+    std::vector<doca_gpu_verbs_qp_hl*> extraMainQps;
     std::vector<doca_gpu_verbs_qp_hl*> loopbackCompanionQps;
   };
   std::vector<NicDocaResources> nicDoca_;
@@ -311,32 +302,12 @@ class MultipeerIbgdaTransport
   // Exchange info received from peers
   std::vector<IbgdaTransportExchInfo> peerExchInfo_;
 
-  // Per-peer send/recv buffer views (populated by both modes).
-  struct SendRecvPeerBuffers {
-    IbgdaLocalBuffer sendStaging;
-    IbgdaLocalBuffer recvStaging;
-    IbgdaLocalBuffer signal;
-    IbgdaLocalBuffer counter;
-    std::optional<DeviceSpan<IbSendRecvState::ProgressSlot>> state;
-    IbgdaRemoteBuffer remoteRecvStaging;
-    IbgdaRemoteBuffer remoteSignal;
-  };
-  std::vector<SendRecvPeerBuffers> sendRecvPeerBuffers_;
-
-  // Eager mode: bulk allocations for all peers. Null in lazy mode.
-  std::unique_ptr<meta::comms::DeviceBuffer> sendStagingBulk_;
-  std::unique_ptr<meta::comms::DeviceBuffer> recvStagingBulk_;
-  std::unique_ptr<meta::comms::DeviceBuffer> signalBulk_;
-  std::unique_ptr<meta::comms::DeviceBuffer> counterBulk_;
-  std::unique_ptr<meta::comms::DeviceBuffer> stateBulk_;
-  IbgdaLocalBuffer recvStagingBulkReg_;
-  IbgdaLocalBuffer signalBulkReg_;
-  IbgdaLocalBuffer counterBulkReg_;
-
-  // Lazy mode: per-peer contiguous allocation (staging + signal + counter +
-  // state + slot-index). Null for unmaterialized peers.
-  // Empty in eager mode.
-  std::vector<std::unique_ptr<meta::comms::DeviceBuffer>> lazyPeerBufs_;
+  // Per-peer send/recv buffer views (IbSendRecvPeerBuffers) and the eager-mode
+  // bulk allocations now live in MultiPeerIbTransportBase
+  // (sendRecvPeerBuffers_). Eager allocation/exchange/cleanup delegate to the
+  // base's allocateSendRecvBuffersEager(Device)/exchangeSendRecvBuffersEager()/
+  // cleanupSendRecvBuffers(); the lazy path below fills the inherited
+  // sendRecvPeerBuffers_ directly.
 
   // Lazy state (pendingPeers_/peerMaterialized_/materializationFailed_) is
   // inherited (protected) from MultiPeerIbTransport.

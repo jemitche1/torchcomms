@@ -352,15 +352,16 @@ class JobResult:
 
     @property
     def passed(self) -> bool:
-        output = "\n".join(self.log_lines)
+        summary = BenchmarkLogParser().parse(self.log_lines)
+        if summary.structured_result is not None:
+            return self.state == "SUCCEEDED" and summary.result_usable_for_comparison
         return (
             self.state == "SUCCEEDED"
-            and "CORRECTNESS PASSED" in output
-            and "ALL ACCURACY TESTS PASSED" in output
-            and "PERFORMANCE:" in output
-            and "Traceback" not in output
-            and "RuntimeError" not in output
-            and "ValueError" not in output
+            and summary.correctness_passed
+            and summary.all_accuracy_passed
+            and summary.performance_seen
+            and summary.mismatch_count == 0
+            and not summary.fatal_runtime_errors
         )
 
 
@@ -2253,7 +2254,13 @@ def parse_args() -> argparse.Namespace:
 def make_job_specs(args: argparse.Namespace, package: str) -> list[JobSpec]:
     connectors = list(CONNECTORS) if args.connector == "both" else [args.connector]
     layouts = ["sn", "cn"] if args.layout == "both" else [args.layout]
-    tp_values = args.tp_values if args.tp_values is not None else [args.tp]
+    if args.tp_values is not None and args.tp != 1:
+        logger.warning(
+            "--tp=%d is ignored because --tp-values=%s was supplied",
+            args.tp,
+            args.tp_values,
+        )
+    tp_values = args.tp_values or [args.tp]
     package_suffix = package_hash_suffix(package)
     run_suffix = time.strftime("%m%d%H%M%S")
     specs: list[JobSpec] = []
@@ -2419,17 +2426,26 @@ def alloc_conf_key(pytorch_cuda_alloc_conf: str) -> str:
 def print_summary(package: str, results: Sequence[JobResult]) -> None:
     logger.info("\nSummary")
     logger.info("Package: %s", package)
+    parser = BenchmarkLogParser()
     for result in results:
-        status = "PASS" if result.passed else "FAIL"
+        summary = parser.parse(result.log_lines)
+        comparison_status = "USABLE" if result.passed else "UNUSABLE"
+        runtime_status = "CLEAN" if not summary.fatal_runtime_errors else "ISSUES"
         logger.info(
-            "%s: %s %s TP=%d %s %s",
-            status,
+            "comparison=%s runtime=%s layout=%s connector=%s tp=%d state=%s app_uri=%s",
+            comparison_status,
+            runtime_status,
             result.spec.layout.upper(),
             result.spec.connector_class,
             result.spec.tp,
             result.state,
             result.app_uri,
         )
+        if summary.post_result_runtime_errors:
+            logger.info(
+                "  post_result_runtime_errors=%d",
+                len(summary.post_result_runtime_errors),
+            )
         for line in result.log_lines:
             logger.info("  %s", line)
 

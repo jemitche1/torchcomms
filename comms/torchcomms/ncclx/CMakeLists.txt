@@ -47,7 +47,6 @@ separate_arguments(FOLLY_LDFLAGS NATIVE_COMMAND "${FOLLY_LDFLAGS_RAW}")
 # /path/to/libglog.a — the simple substring match handles all forms.
 list(FILTER FOLLY_LDFLAGS EXCLUDE REGEX "glog")
 list(FILTER FOLLY_LDFLAGS EXCLUDE REGEX "gflags")
-list(FILTER FOLLY_LDFLAGS EXCLUDE REGEX "libfmt")
 
 execute_process(
     COMMAND pkg-config --libs --static absl_log absl_check
@@ -121,6 +120,7 @@ target_include_directories(torchcomms_comms_ncclx PRIVATE
     ${CONDA_INCLUDE}
     ${Python3_INCLUDE_DIRS}
 )
+torchcomms_use_torch_pybind11(torchcomms_comms_ncclx)
 target_compile_features(torchcomms_comms_ncclx PRIVATE cxx_std_20)
 
 # Add device API compile definition if headers are available
@@ -143,11 +143,16 @@ target_link_libraries(torchcomms_comms_ncclx PRIVATE
     ${TORCH_PYTHON_LIB}
 )
 if(USE_SYSTEM_LIBS)
+    # Link libfmt explicitly: torchcomms compiles with FMT_HEADER_ONLY=1
+    # (via fmt::fmt INTERFACE target) so most fmt symbols are inlined, but
+    # a few (assert_fail, thousands_sep_impl) still emit out-of-line
+    # references.
     target_link_libraries(torchcomms_comms_ncclx PRIVATE
         ${NCCLX_SHARED_LIB}
         ${FOLLY_LDFLAGS}
         "-lboost_program_options"
         "-lboost_filesystem"
+        "-lfmt"
     )
 else()
     set(TORCHCOMMS_NCCLX_PRIMS_LINK_LIBS "")
