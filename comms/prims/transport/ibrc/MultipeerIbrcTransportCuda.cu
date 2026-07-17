@@ -24,30 +24,30 @@ void writeIbrcDeviceSlot(
     int peerIndex,
     DeviceSpan<IbrcCmdQueueDevice> queues,
     uint32_t numNics,
-    uint32_t maxGroups,
-    uint32_t numQpsPerPeerPerNic,
-    DeviceSpan<IbrcBlockQpState> blockQpState,
+    uint32_t maxChannels,
+    uint32_t qpsPerConnection,
+    DeviceSpan<IbLocalChannel> localChannels,
     IbgdaRemoteBuffer remoteSignalBuf,
     IbgdaLocalBuffer localSignalBuf,
     IbgdaLocalBuffer counterDeviceBuf,
     IbgdaLocalBuffer counterHostBuf,
     int numSignalSlots,
     int numCounterSlots,
-    IbSendRecvState sendRecvState) {
+    IbChannelLayout channelLayout) {
   auto* slots = static_cast<P2pIbrcTransportDevice*>(slotsHost);
   new (&slots[peerIndex]) P2pIbrcTransportDevice(
       queues,
       numNics,
-      maxGroups,
-      numQpsPerPeerPerNic,
-      blockQpState,
+      maxChannels,
+      qpsPerConnection,
+      localChannels,
       remoteSignalBuf,
       localSignalBuf,
       counterDeviceBuf,
       counterHostBuf,
       numSignalSlots,
       numCounterSlots,
-      sendRecvState);
+      channelLayout);
 }
 
 } // namespace comms::prims

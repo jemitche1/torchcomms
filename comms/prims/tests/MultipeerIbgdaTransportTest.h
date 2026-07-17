@@ -123,15 +123,37 @@ void testPutOnly(
 bool supportsProgressSendRecv();
 
 /**
+ * Test kernel: snapshot send/recv pipeline geometry through the unified IB
+ * transport wrapper. Output: pipelineDepth, pipelineWindow, pipelineChunk.
+ */
+void testPipelineGeometry(
+    P2pIbTransportDevice transport,
+    uint64_t* output,
+    int numBlocks,
+    int blockSize);
+
+/**
  * Test kernel: Blocking pipelined send or recv.
  */
 void testSendRecv(
     P2pIbgdaTransportDevice* transport,
     void* buffer,
     std::size_t nbytes,
-    int activeBlocks,
     std::size_t maxSignalBytes,
     bool send,
+    int numBlocks,
+    int blockSize);
+
+/**
+ * Test kernel: two sequential bidirectional blocking send/recv calls.
+ */
+void testTwoCallSendThenRecv(
+    P2pIbTransportDevice transport,
+    const void* sendBuffer,
+    void* recvBuffer,
+    std::size_t firstBytes,
+    std::size_t secondBytes,
+    std::size_t maxSignalBytes,
     int numBlocks,
     int blockSize);
 
@@ -142,7 +164,6 @@ void testProgressSendRecv(
     P2pIbgdaTransportDevice* transport,
     void* buffer,
     std::size_t nbytes,
-    int activeBlocks,
     std::size_t maxSignalBytes,
     bool send,
     int numBlocks,
@@ -157,7 +178,6 @@ void testProgressReservations(
     int64_t* output,
     std::size_t sendBytes,
     std::size_t recvBytes,
-    int activeBlocks,
     int numBlocks,
     int blockSize);
 

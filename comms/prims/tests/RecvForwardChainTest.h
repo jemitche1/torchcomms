@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace comms::prims {
 class P2pIbgdaTransportDevice;

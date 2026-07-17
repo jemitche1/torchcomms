@@ -3,8 +3,9 @@
 // Tile: cooperative vectorized tile operations for GPU collectives.
 //
 // A Tile is a fixed-size block of elements distributed across threads in a
-// ThreadGroup, backed by uint4 registers. All memory operations use 16-byte
-// (uint4) vectorized loads/stores for optimal coalescing.
+// ThreadGroup, backed by uint4 registers. Aligned memory operations use
+// 16-byte (uint4) vectorized loads/stores for optimal coalescing; unaligned
+// base pointers fall back to scalar element loads/stores.
 //
 // TERMINOLOGY
 // ===========
@@ -313,32 +314,36 @@ tile_load(
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
   using TileType = Tile<T, kTileElems, kBlockSize, RegisterStorage>;
   constexpr int kVPT = TileType::kVPT;
-  constexpr int kTileVecs = TileType::kTileVecs;
   constexpr int kEPV = VecOps<T>::kElemsPerVec;
 
   TileType tile;
-  if (reinterpret_cast<uintptr_t>(ptr) % alignof(uint4) != 0) {
-    printf(
-        "tile_load: ptr %p is not 16-byte aligned (required for uint4 vectorized access)\n",
-        ptr);
-    __trap();
-  }
-  const uint4* src = reinterpret_cast<const uint4*>(ptr) + tile_idx * kTileVecs;
+  const bool aligned = reinterpret_cast<uintptr_t>(ptr) % alignof(uint4) == 0;
   const std::size_t full_vecs = valid_elems / kEPV;
-  const int remainder = static_cast<int>(valid_elems % kEPV);
+  const T* elem_base = ptr + tile_idx * kTileElems;
 
 #pragma unroll
   for (int k = 0; k < kVPT; k++) {
-    std::size_t idx = group.thread_id_in_group + k * group.group_size;
-    if (idx < full_vecs) {
-      tile.vecs[k] = src[idx];
-    } else if (idx == full_vecs && remainder > 0) {
-      tile.vecs[k] = make_uint4(0, 0, 0, 0);
-      const T* elem_src = ptr + tile_idx * kTileElems + idx * kEPV;
-      T* elem_dst = reinterpret_cast<T*>(&tile.vecs[k]);
-      for (int e = 0; e < remainder; e++) {
-        elem_dst[e] = elem_src[e];
+    const std::size_t idx = group.thread_id_in_group + k * group.group_size;
+    const std::size_t elem_offset = idx * kEPV;
+    if (aligned && idx < full_vecs) {
+      // Fast path: fully-valid vector from an aligned base — 16-byte load.
+      tile.vecs[k] = reinterpret_cast<const uint4*>(elem_base)[idx];
+    } else if (elem_offset < valid_elems) {
+      // Boundary or unaligned vector: gather valid elements into a
+      // register-resident temporary, then assign the whole vector. kEPV is a
+      // compile-time constant so this loop fully unrolls and never indexes
+      // tile.vecs[] with a runtime value — keeping the tile in registers rather
+      // than spilling it to local memory.
+      uint4 tmp = make_uint4(0, 0, 0, 0);
+      T* tmp_elems = reinterpret_cast<T*>(&tmp);
+      const T* elem_src = elem_base + elem_offset;
+#pragma unroll
+      for (int e = 0; e < kEPV; e++) {
+        if (elem_offset + e < valid_elems) {
+          tmp_elems[e] = elem_src[e];
+        }
       }
+      tile.vecs[k] = tmp;
     } else {
       tile.vecs[k] = make_uint4(0, 0, 0, 0);
     }
@@ -375,29 +380,31 @@ __device__ __forceinline__ void tile_store(
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
   using TileType = Tile<T, kTileElems, kBlockSize, RegisterStorage>;
   constexpr int kVPT = TileType::kVPT;
-  constexpr int kTileVecs = TileType::kTileVecs;
   constexpr int kEPV = VecOps<T>::kElemsPerVec;
 
-  if (reinterpret_cast<uintptr_t>(ptr) % alignof(uint4) != 0) {
-    printf(
-        "tile_store: ptr %p is not 16-byte aligned (required for uint4 vectorized access)\n",
-        ptr);
-    __trap();
-  }
-  uint4* dst = reinterpret_cast<uint4*>(ptr) + tile_idx * kTileVecs;
+  const bool aligned = reinterpret_cast<uintptr_t>(ptr) % alignof(uint4) == 0;
   const std::size_t full_vecs = valid_elems / kEPV;
-  const int remainder = static_cast<int>(valid_elems % kEPV);
+  T* elem_base = ptr + tile_idx * kTileElems;
 
 #pragma unroll
   for (int k = 0; k < kVPT; k++) {
-    std::size_t idx = group.thread_id_in_group + k * group.group_size;
-    if (idx < full_vecs) {
-      dst[idx] = tile.vecs[k];
-    } else if (idx == full_vecs && remainder > 0) {
-      const T* elem_src = reinterpret_cast<const T*>(&tile.vecs[k]);
-      T* elem_dst = ptr + tile_idx * kTileElems + idx * kEPV;
-      for (int e = 0; e < remainder; e++) {
-        elem_dst[e] = elem_src[e];
+    const std::size_t idx = group.thread_id_in_group + k * group.group_size;
+    const std::size_t elem_offset = idx * kEPV;
+    if (aligned && idx < full_vecs) {
+      // Fast path: fully-valid vector to an aligned base — 16-byte store.
+      reinterpret_cast<uint4*>(elem_base)[idx] = tile.vecs[k];
+    } else if (elem_offset < valid_elems) {
+      // Boundary or unaligned vector: scatter valid elements from a
+      // register-resident copy. The fully-unrolled compile-time loop keeps the
+      // tile in registers (no runtime-indexed reads of tile.vecs[]).
+      uint4 tmp = tile.vecs[k];
+      const T* tmp_elems = reinterpret_cast<const T*>(&tmp);
+      T* elem_dst = elem_base + elem_offset;
+#pragma unroll
+      for (int e = 0; e < kEPV; e++) {
+        if (elem_offset + e < valid_elems) {
+          elem_dst[e] = tmp_elems[e];
+        }
       }
     }
   }

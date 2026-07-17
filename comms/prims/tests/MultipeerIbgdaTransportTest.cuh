@@ -71,20 +71,30 @@ __global__ void putOnlyKernel(
     IbgdaRemoteBuffer remoteBuf,
     std::size_t nbytes);
 
+__global__ void pipelineGeometryKernel(
+    P2pIbTransportDevice transport,
+    uint64_t* output);
+
 __global__ void sendRecvKernel(
     P2pIbgdaTransportDevice* transport,
     void* buffer,
     std::size_t nbytes,
-    int activeBlocks,
     std::size_t maxSignalBytes,
     bool send);
+
+__global__ void twoCallSendThenRecvKernel(
+    P2pIbTransportDevice transport,
+    const void* sendBuffer,
+    void* recvBuffer,
+    std::size_t firstBytes,
+    std::size_t secondBytes,
+    std::size_t maxSignalBytes);
 
 #ifndef __HIP_PLATFORM_AMD__
 __global__ void progressSendRecvKernel(
     P2pIbgdaTransportDevice* transport,
     void* buffer,
     std::size_t nbytes,
-    int activeBlocks,
     std::size_t maxSignalBytes,
     bool send);
 
@@ -92,8 +102,7 @@ __global__ void progressReservationKernel(
     P2pIbgdaTransportDevice* transport,
     int64_t* output,
     std::size_t sendBytes,
-    std::size_t recvBytes,
-    int activeBlocks);
+    std::size_t recvBytes);
 #endif
 
 __global__ void

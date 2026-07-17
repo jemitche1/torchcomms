@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -52,6 +53,54 @@ bool isTcpEnvironment() {
   return std::getenv("MASTER_ADDR") != nullptr &&
       std::getenv("MASTER_PORT") != nullptr && std::getenv("RANK") != nullptr &&
       std::getenv("WORLD_SIZE") != nullptr;
+}
+
+// Read a KEY=VALUE from /etc/nccl.conf (NCCL's global config file). Returns the
+// trimmed value, or "" if the file is unreadable or the key is absent. Mirrors
+// NCCL's own fallback: an env var takes precedence, otherwise /etc/nccl.conf is
+// consulted. Minimal parser: skips blank/`#` lines, trims surrounding
+// whitespace around the key and value.
+std::string readNcclConf(const std::string& key) {
+  std::ifstream conf("/etc/nccl.conf");
+  if (!conf.is_open()) {
+    return std::string();
+  }
+  std::string line;
+  while (std::getline(conf, line)) {
+    const auto first = line.find_first_not_of(" \t");
+    if (first == std::string::npos || line[first] == '#') {
+      continue;
+    }
+    const auto eq = line.find('=', first);
+    if (eq == std::string::npos) {
+      continue;
+    }
+    const auto keyEnd = line.find_last_not_of(" \t", eq - 1);
+    if (keyEnd == std::string::npos ||
+        line.substr(first, keyEnd - first + 1) != key) {
+      continue;
+    }
+    const auto valFirst = line.find_first_not_of(" \t", eq + 1);
+    if (valFirst == std::string::npos) {
+      return std::string();
+    }
+    const auto valLast = line.find_last_not_of(" \t\r\n");
+    return line.substr(valFirst, valLast - valFirst + 1);
+  }
+  return std::string();
+}
+
+// NIC selection for the benchmark transport. Returns an NCCL_IB_HCA-style
+// filter string (e.g. "mlx5_0") for the transport, or "" for PCIe-topology
+// auto-discovery. Resolution order matches NCCL: the NCCL_IB_HCA env var wins;
+// if it is unset, fall back to /etc/nccl.conf. Needed to pin ranks onto
+// rail-aligned NICs (auto-discovery otherwise picks NICs that cannot reach each
+// other over RoCE).
+std::string benchIbHca() {
+  if (const char* hca = std::getenv("NCCL_IB_HCA")) {
+    return std::string(hca);
+  }
+  return readNcclConf("NCCL_IB_HCA");
 }
 
 class DistributedBenchmarkEnvironment {
@@ -116,7 +165,27 @@ struct BenchmarkSize {
   std::size_t nbytes;
 };
 
-constexpr std::array<BenchmarkSize, 13> kBenchmarkSizes{{
+constexpr std::array<BenchmarkSize, 33> kBenchmarkSizes{{
+    {"1B", 1ULL},
+    {"2B", 2ULL},
+    {"4B", 4ULL},
+    {"8B", 8ULL},
+    {"16B", 16ULL},
+    {"32B", 32ULL},
+    {"64B", 64ULL},
+    {"128B", 128ULL},
+    {"256B", 256ULL},
+    {"512B", 512ULL},
+    {"1KB", 1ULL << 10},
+    {"2KB", 2ULL << 10},
+    {"4KB", 4ULL << 10},
+    {"8KB", 8ULL << 10},
+    {"16KB", 16ULL << 10},
+    {"32KB", 32ULL << 10},
+    {"64KB", 64ULL << 10},
+    {"128KB", 128ULL << 10},
+    {"256KB", 256ULL << 10},
+    {"512KB", 512ULL << 10},
     {"1MB", 1ULL << 20},
     {"2MB", 2ULL << 20},
     {"4MB", 4ULL << 20},
@@ -191,13 +260,11 @@ class IbgdaSendRecvBenchmarkContext {
 
     MultipeerIbgdaTransportConfig transportConfig{
         .cudaDevice = localRank_,
-        .dataBufferSize = kSlotSize,
-        .sendRecv =
-            MultipeerIbgdaTransportConfig::SendRecvConfig{
-                .maxGroups = kNumBlocks,
-                .pipelineDepth = kPipelineDepth,
-            },
+        .perChannelSize = kSlotSize / kNumBlocks,
+        .max_num_channels = kNumBlocks,
+        .pipelineDepth = kPipelineDepth,
     };
+    transportConfig.ibHca = benchIbHca();
     transport_ = std::make_unique<MultipeerIbgdaTransport>(
         globalRank_, worldSize_, bootstrap_, transportConfig);
     transport_->exchange();

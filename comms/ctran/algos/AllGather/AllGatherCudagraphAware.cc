@@ -5,16 +5,18 @@
 // selectCtgraphAlgo() from topology and message size. Two registration paths:
 //
 //   ctgraph_pipeline/rdpipeline (nLocalRanks > 1): the intra-node NVL broadcast
-//     addresses must be stable across replays, so the recvbuff is registered as
-//     a local-NVL window (createAllGatherPWithWindow); the cross-node rail
-//     rkeys are exchanged in the exec path.
+//     addresses must be stable across replays, so the recvbuff is registered
+//     via a scoped regcache handle owned by the persistent AllGatherP request,
+//     and the local NVL IPC imports are self-managed by the request (released
+//     at graph destroy); cross-node rail rkeys are exchanged in the exec path.
+//     Teardown is triggerd by the captured graph destory callback that releases
+//     resource with refcount and defers CUDA release to later user thread call.
 //
-//   ctgraph_ring/rd (nLocalRanks == 1): only the local registration persists
-//     (localPersistBuffReg); remote peers are exchanged per replay in the GPE
-//     host node.
-//
-// Resources are handed to deferred cleanup, which runs at comm destruction
-// (after all replays) on the main thread.
+//   ctgraph_ring/rd (nLocalRanks == 1): the recvbuff is registered via a scoped
+//     regcache handle held for the captured graph's lifetime and released by a
+//     dedicated graph-destroy callback (same model as the pipeline branch,
+//     minus the IPC imports); remote peers are exchanged per replay
+//     in the GPE host node.
 
 #include <folly/ScopeGuard.h>
 #include <memory>
@@ -23,22 +25,18 @@
 #include "comms/ctran/Ctran.h"
 #include "comms/ctran/algos/AllGather/AllGatherImpl.h"
 #include "comms/ctran/algos/AllGatherP/AlgoImpl.h"
-#include "comms/ctran/algos/AllGatherP/AllGatherPWithWin.h"
+#include "comms/ctran/algos/AllGatherP/CommUtils.h"
 #include "comms/ctran/algos/CtranAlgo.h"
+#include "comms/ctran/regcache/RegCache.h"
+#include "comms/ctran/utils/CudaGraphUtils.h"
 #include "comms/ctran/utils/MathUtils.h"
-#include "comms/utils/CudaRAII.h"
 #include "comms/utils/cvars/nccl_cvars.h"
 
-namespace {
+using ctran::allgatherp::createPersistentRequest;
+using ctran::allgatherp::destroyPersistentRequest;
+using ctran::utils::cudagraph::registerGraphDestroyCallback;
 
-// localPersistBuffReg: register recvbuff locally via globalRegisterWithPtr.
-// Only local registration persists; remote exchange happens at each replay.
-commResult_t localPersistBuffReg(void* recvbuff, size_t recvBytes) {
-  meta::comms::StreamCaptureModeGuard captureGuard{
-      cudaStreamCaptureModeRelaxed};
-  FB_COMMCHECK(ctran::globalRegisterWithPtr(recvbuff, recvBytes, true, true));
-  return commSuccess;
-}
+namespace {
 
 enum NCCL_ALLGATHER_ALGO selectCtgraphAlgo(
     size_t sendBytes,
@@ -75,11 +73,12 @@ commResult_t ctranAllGatherCudagraphAware(
 
   CLOGF_SUBSYS(
       INFO,
-      COLL,
-      "AllGather cudagraph-aware: algo {} "
-      "sendcount {} recvBytes {} commHash {:x} commDesc {} nRanks {} nLocalRanks {} nNodes {}",
+      INIT,
+      "CTRAN-AGP: AllGather cudagraph-aware: algo {} "
+      "sendcount {} recvbuff {} recvBytes {} commHash {:x} commDesc {} nRanks {} nLocalRanks {} nNodes {}",
       allGatherAlgoName(algo),
       sendcount,
+      recvbuff,
       recvBytes,
       statex->commHash(),
       statex->commDesc(),
@@ -90,21 +89,62 @@ commResult_t ctranAllGatherCudagraphAware(
   switch (algo) {
     case NCCL_ALLGATHER_ALGO::ctgraph_pipeline:
     case NCCL_ALLGATHER_ALGO::ctgraph_rdpipeline: {
-      // Build the windowed persistent algo, run it, then hand the
-      // request/window/nvlComm to the deferred cleanup -- they must outlive all
-      // graph replays.
+      // FIXME: ctgraph_pipeline/rdpipeline should handle nLocalRanks == 1 too,
+      // so consolidate with ctgraph_ring|ctgraph_rd
+      if (statex->nLocalRanks() <= 1) {
+        FB_ERRORRETURN(
+            commInvalidUsage,
+            "ctgraph_pipeline/rdpipeline requires nLocalRanks > 1; got {}",
+            statex->nLocalRanks());
+      }
+
       CtranPersistentRequest* request = nullptr;
-      FB_COMMCHECK(
-          ctran::createAllGatherPWithWindow(
-              comm, recvbuff, recvBytes, stream, &request));
-      // No localPersistBuffReg here (cf. the ring/rd branch below): registering
-      // recvbuff as a window in createAllGatherPWithWindow is also its local
-      // registration, which the algo uses (via pArgs->recvHdl) for the rail
-      // puts.
-      auto cleanup = [request]() {
-        ctran::destroyAllGatherPWithWindow(request);
+      FB_COMMCHECK(createPersistentRequest(
+          comm,
+          stream,
+          recvbuff,
+          sendcount * nRanks,
+          datatype,
+          &request,
+          // Need wait for IPC exchange before capture CE copy
+          /*waitForInit=*/true));
+      auto cleanupGuard = folly::makeGuard([request, comm]() {
+        // Unregister the cleanup token before deleting the request: the
+        // token's closure captures the raw request pointer, so leaving it in
+        // the comm registry would let a later drainPersistentCleanups() run it
+        // on freed memory (use-after-free).
+        comm->unregisterPersistentCleanup(request->cleanup_);
+        FB_COMMCHECKIGNORE(destroyPersistentRequest(request));
+        delete request;
+      });
+
+      // Hand teardown to the captured graph (SW-only) BEFORE capturing the
+      // collective ops: if op capture fails, the graph tears down the request
+      // via this callback instead of releasing its NVL imports / registration
+      // while the captured graph still references them.
+      //
+      // Release the pooled pipeSync + scoped registration through the shared
+      // cleanup token (runs at most once). If the comm was destroyed first
+      // (comm-then-graph ordering), the comm drain already ran the token and
+      // this no-ops -- the token's shared_ptr lives in the request, which the
+      // comm drain does NOT delete, so it is safe to touch here. Never
+      // unregister from the comm registry in this callback: it may run after
+      // the comm is gone. The spent token therefore lingers in the comm's
+      // persistentCleanups_ registry until CtranComm::destroy() drains it;
+      // this is bounded by the number of distinct graph captures sharing (and
+      // destroyed during the lifetime of) this comm -- typically O(1) in
+      // steady-state training (capture once, replay many) -- so it is an
+      // acceptable bounded retention, not an unbounded leak. The graph owns the
+      // request object (never returned to the user), so this callback deletes
+      // it after releasing resources.
+      auto destroyCb = [](void* p) {
+        auto* req = static_cast<CtranPersistentRequest*>(p);
+        DCHECK(req->cleanup_ != nullptr);
+        req->cleanup_->run();
+        delete req;
       };
-      auto cleanupGuard = folly::makeGuard(cleanup);
+      FB_COMMCHECK(registerGraphDestroyCallback(stream, request, destroyCb));
+      cleanupGuard.dismiss();
 
       auto* pAlgo =
           reinterpret_cast<ctran::allgatherp::AlgoImpl*>(request->algo);
@@ -114,21 +154,35 @@ commResult_t ctranAllGatherCudagraphAware(
       } else {
         FB_COMMCHECK(pAlgo->execPipeline(sendbuff, sendcount, datatype));
       }
-
-      // Exec succeeded; hand ownership to the deferred cleanup (runs at comm
-      // destroy, after all graph replays).
-      cleanupGuard.dismiss();
-      comm->cudagraphDeferredCleanup.add(std::move(cleanup));
       break;
     }
     case NCCL_ALLGATHER_ALGO::ctgraph_ring:
     case NCCL_ALLGATHER_ALGO::ctgraph_rd: {
-      FB_COMMCHECK(localPersistBuffReg(recvbuff, recvBytes));
+      // Scoped local registration of recvbuff, owned for the captured graph's
+      // lifetime. Require segment already be allocator-cached (CCA hook).
+      // FIXME: ctgraph_ring|ctgraph_rd can be consolidated with
+      // ctgraph_{*}pipeline too.
+      ctran::ScopedRegHdl localRecvReg;
+      auto regCache = ctran::RegCache::getInstance();
+      ctran::CHECK_VALID_REGCACHE(regCache);
+      FB_COMMCHECK(regCache->acquireScopedRegister(
+          recvbuff,
+          recvBytes,
+          comm->statex_->cudaDev(),
+          comm->ctran_->mapper->getBackends(),
+          localRecvReg));
 
-      auto cleanup = [recvbuff, recvBytes]() {
-        ctran::globalDeregisterWithPtr(recvbuff, recvBytes);
+      // Heap-own the scoped ref so a graph-destroy callback can release it.
+      auto* heldReg = new ctran::ScopedRegHdl(std::move(localRecvReg));
+      auto cleanupGuard = folly::makeGuard([heldReg]() { delete heldReg; });
+
+      // SW-only release, safe in the CUDA user-object destroy context. Actual
+      // deregistration is deferred to next regcache access.
+      auto destroyCb = [](void* p) {
+        delete static_cast<ctran::ScopedRegHdl*>(p);
       };
-      auto cleanupGuard = folly::makeGuard(cleanup);
+      FB_COMMCHECK(registerGraphDestroyCallback(stream, heldReg, destroyCb));
+      cleanupGuard.dismiss();
 
       if (algo == NCCL_ALLGATHER_ALGO::ctgraph_ring) {
         FB_COMMCHECK(ctranAllGatherRing(
@@ -137,9 +191,6 @@ commResult_t ctranAllGatherCudagraphAware(
         FB_COMMCHECK(ctranAllGatherStreamedRd(
             sendbuff, recvbuff, sendcount, datatype, comm, stream));
       }
-
-      cleanupGuard.dismiss();
-      comm->cudagraphDeferredCleanup.add(std::move(cleanup));
       break;
     }
     default:

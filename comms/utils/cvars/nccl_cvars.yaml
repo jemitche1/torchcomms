@@ -97,6 +97,49 @@ cvars:
      consolidated abort ERR line on stderr (gpeProfiler_->debugString())
      keeps producing per-phase latencies. Set true to enable Scuba flush.
 
+ - name        : NCCL_CTRAN_GPE_DEVICE_RING
+   type        : bool
+   default     : false
+   description : |-
+     Enable the device-ring GPE dispatch path (see
+     comms/ctran/gpe/docs/gpe_device_ring.md). When false (default), GPE
+     dispatch is unchanged: captured CUDA graphs use in-graph HOST nodes
+     that enqueue each command to the per-comm CPU FIFO on replay. When
+     true, ring-capable collective kernels publish their command id to a
+     per-comm host-mapped ring (HRDWRingBuffer) as they start, and the GPE
+     worker consumes the ring in true GPU execution order — no HOST nodes
+     are added to the graph, eliminating the driver's replay launch-blocking
+     bug while preserving the runtime-produced ordering that static
+     coalescing cannot reproduce. Requires sm_90+ (System-scope 128b atomic
+     exchange); ignored on HIP/pre-Hopper, where the host-node path is used.
+     The eager (non-capture) path is unchanged regardless of this setting.
+
+ - name        : NCCL_CTRAN_GPE_DEVICE_RING_SIZE
+   type        : int
+   default     : 8192
+   description : |-
+     Number of entries in the per-comm device dispatch ring used when
+     NCCL_CTRAN_GPE_DEVICE_RING is true. Rounded up to a power of two. The ring
+     is lossless (blocking write policy): an undersized ring never drops
+     entries. Instead a kernel that fills it stalls at start until the GPE
+     worker drains a slot, throttling device work (logged, rate-limited). Size
+     it to the maximum number of proxy-having collectives that can be
+     concurrently in flight on a single comm, so writers never stall. Each
+     entry is 16 bytes of pinned host memory.
+
+ - name        : NCCL_CTRAN_GPE_DEVICE_RING_POLL_US
+   type        : int
+   default     : 50
+   description : |-
+     Idle poll interval in microseconds for the device-ring GPE worker when
+     NCCL_CTRAN_GPE_DEVICE_RING is true. The worker blocks on the CPU FIFO
+     condvar and is woken immediately by control/eager submits (TERMINATE,
+     abort), but the device ring cannot signal the condvar, so it also wakes
+     every poll interval to drain the ring. This bounds device-ring dispatch
+     latency (and how long a full ring stalls the writer) while keeping an idle
+     worker off-core. Smaller = lower latency, more wakeups; larger = fewer
+     wakeups, higher latency. Ignored on the host-node path.
+
  - name        : NCCL_CTRAN_GPE_PROFILING_SAMPLING_WEIGHT
    type        : int
    default     : 1000
@@ -1162,13 +1205,6 @@ cvars:
      When enabled, dedicated IB blocks publish chunk-ready counters and
      dedicated NVLink blocks fan out chunks as soon as they arrive.
 
- - name        : NCCL_CTRAN_HIER_AG_NVL_NUM_BLOCKS
-   type        : int
-   default     : 16
-   description : |-
-     Number of CUDA thread blocks for the experimental overlapped
-     cthierarchical_ring AllGather NVLink fanout role.
-
  - name        : NCCL_CTRAN_HIER_AG_OVERLAP_CHUNK_BYTES
    type        : uint64_t
    default     : 0
@@ -1309,18 +1345,6 @@ cvars:
    description : |-
      Number of threads in each thread block used for intra-node
      AllToAllv kernel.
-
- - name        : NCCL_CTRAN_ALLTOALL_DEDUP_NUM_THREAD_BLOCKS_PER_RAIL_P2P
-   type        : int
-   default     : 16
-   description : |-
-     Number of thread blocks used for each rail peer AllToAllDedup kernel.
-
- - name        : NCCL_CTRAN_ALLTOALL_DEDUP_THREAD_BLOCK_SIZE
-   type        : int
-   default     : 256
-   description : |-
-     Number of threads in each thread block used for AllToAllDedup kernel.
 
  - name        : NCCL_CTRAN_ALLTOALLV_DEDUP_SEND_NUM_THREAD_BLOCK_GROUPS
    type        : int
@@ -1524,10 +1548,9 @@ cvars:
    type        : uint64_t
    default     : 128
    description : |-
-     Maximum chunks of a staging buffer in P2P NVL copy-based kernel, this is
-     used to allocate IPC buffer for chunk states. The value = 16M/128k (maximum
-     staging buffer / minimum chunk size). The size of per-peer ChunkState buffer
-     is CTRAN_P2P_NVL_DEVMEM_MAX_CHUNKS * sizeof(ChunkState)=128*128=16KB
+     Maximum chunks of a staging buffer in P2P NVL copy-based kernel. The value
+     = 16M/128k (maximum staging buffer / minimum chunk size). Currently unused
+     after the cooperative chunk-state path was removed.
 
  - name        : NCCL_CTRAN_P2P_NVL_COPY_PIPELINE_DEPTH
    type        : size_t
@@ -1905,14 +1928,6 @@ cvars:
      Chunk size in bytes for NVL transport in Pipes MultiPeerTransport.
      Controls the granularity of parallel copy operations over NVLink.
 
- - name        : NCCL_CTRAN_PIPES_USE_DUAL_STATE_BUFFER
-   type        : bool
-   default     : false
-   description : |-
-     Enable dual state buffer mode for NVL transport in Pipes
-     MultiPeerTransport. When enabled, uses two chunk state buffers
-     instead of one, allowing overlap of copy and signal operations.
-
  - name        : NCCL_CTRAN_PIPES_DISABLE_IB
    type        : bool
    default     : false
@@ -2208,15 +2223,12 @@ cvars:
  - name        : NCCL_ALLGATHER_P_ALGO
    type        : enum
    default     : ctpipeline
-   choices     : ctdirect, ctpipeline, ctrdpipeline, ctsrdpipeline
+   choices     : ctdirect, ctpipeline, ctsrdpipeline
    description : |-
      The algorithm to use for AllgatherP communication
      ctdirect - Ctran-based direct point-to-point algorithm
      ctpipeline - Ctran-based pipeline algorithm that pipelines
                   inter-node rail ring and intra-node CopyEngine based copy
-     ctrdpipeline - Ctran-based hybrid algorithm that does recursive doubling across
-                    rails for inter-node exchange and CopyEngine based broadcast
-                    within the NVLink domain. Requires nNodes to be a power of 2.
      ctsrdpipeline - Ctran-based hybrid algorithm that streams recursive-doubling
                      forwards across rails while keeping NVLink-domain CopyEngine
                      broadcast step-based. Requires nNodes to be a power of 2.
@@ -2263,12 +2275,13 @@ cvars:
  - name        : NCCL_REDUCESCATTER_ALGO
    type        : enum
    default     : orig
-   choices     : orig, ctran, ctdirect, ctring, ctrhd
+   choices     : orig, ctran, ctdirect, ctdirect_ib, ctring, ctrhd
    description : |-
      The algorithm to use for ReduceScatter communication
      orig - Copy-based ring algorithm
      ctran - Ctran-based algorithm automatically picked by the library
      ctdirect - Ctran-based direct point-to-point algorithm
+     ctdirect_ib - Ctran-based direct IB algorithm
      ctring - Ctran-based rail ring algorithm for inter-node only case
      ctrhd - Ctran-based recursive vector-halving distance-doubling algorithm
 
@@ -2283,11 +2296,12 @@ cvars:
  - name        : NCCL_ALLTOALL_ALGO
    type        : enum
    default     : orig
-   choices     : orig, ctran
+   choices     : orig, ctran, ctgraph
    description : |-
      The algorithm to use for alltoall communication
      orig - Copy-based communication
      ctran - Ctran-based communication
+     ctgraph - Cudagraph-aware Ctran-based communication (captured into a CUDA graph)
 
  - name        : NCCL_ALLTOALLV_ALGO
    type        : enum
@@ -2308,12 +2322,6 @@ cvars:
      The algorithm to use for NCCL RMA communication
      orig - nccl rma communication
      ctran - Ctran-based rma communication
-
- - name        : NCCL_CTRAN_ALLTOALL_CUDAGRAPH_AWARE_ENABLE
-   type        : bool
-   default     : false
-   description : |-
-     If enable cudagraph-aware optimization for ctran alltoall.
 
  - name        : NCCL_CTRAN_ENABLE
    type        : bool
@@ -2899,29 +2907,6 @@ cvars:
    default     : false
    description : |-
      Enable top level nccl comm register/deregister call logging.
-
- - name        : NCCL_COMM_TRACING_SERVICE_ENABLE
-   type        : bool
-   default     : false
-   description : |-
-     Enable thrift server for analyzer debugging. NCCL_COMMS_TRACING_SERVICE_PORTS
-     must also be set
-
- - name        : NCCL_COMMS_TRACING_SERVICE_PORTS
-   type        : stringlist
-   default     :
-   description : |-
-     Comma separated list of ports to use for comms tracing service.
-     Local rank i will use port i in the list.
-
- - name        : NCCL_COMM_TRACING_SERVICE_WARN_ON_PORT_CONFLICT
-   type        : bool
-   default     : false
-   description : |-
-     By default, the tracing service will crash the main process,
-     if it cannot start due to port conflict.
-     This flag allows users to choose to only log a warning in that case,
-     and the main process will continue to run.
 
  - name        : NCCL_NET_GDR_C2C
    type        : bool

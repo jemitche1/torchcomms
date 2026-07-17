@@ -1,10 +1,15 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#pragma once
+
 #include <iostream>
 #include <vector>
 #include "comms/ctran/CtranComm.h"
+#include "comms/ctran/algos/AllGatherP/Types.h"
 #include "comms/ctran/algos/CtranAlgo.h"
+#include "comms/ctran/algos/common/NvlUtils.h"
 #include "comms/ctran/mapper/CtranMapper.h"
+#include "comms/ctran/regcache/RegCache.h"
 #include "comms/ctran/utils/CudaGraphUtils.h"
 #include "comms/ctran/utils/ExtUtils.h"
 
@@ -13,156 +18,62 @@ inline void* getPtr(void* base, size_t offset) {
   return (void*)((uintptr_t)base + offset);
 }
 
-inline commResult_t nvlBarrier(CtranComm* comm, cudaStream_t stream) {
-  const auto statex = comm->statex_.get();
-  const auto localRank = statex->localRank();
-  const auto nLocalRanks = statex->nLocalRanks();
+using ctran::algos::copyToSelf;
+using ctran::algos::nvlBarrier;
+using ctran::algos::nvlCeBcast;
 
-  // Barrier to make sure all local ranks are ready to start intranode comm.
+// Exchange intra-node NVL IPC handles into pArgs and mark initialized. Owns
+// the remote-buffer resize, the intraAllGatherCtrl + intraBarrier, per-peer
+// IPC logging, and setting initState. Logs its timing breakdown on the GPE
+// thread. INVARIANT: must run on the GPE thread (submitted via submitHost),
+// which already holds the mapper epoch through the worker loop
+// (CtranGpeImpl.cc); never call it inline on a user thread. Shared verbatim
+// by the eager and graph-capture init paths.
+inline commResult_t exchangeIpcReg(CtranComm* comm, PersistArgs& pArgs) {
+  auto* mapper = comm->ctran_->mapper.get();
 
-  std::array<void*, 3> kernelArgs;
-  kernelArgs.at(0) = (void*)&localRank;
-  kernelArgs.at(1) = (void*)&nLocalRanks;
-  auto devState_d = comm->ctran_->algo->getDevState();
-  kernelArgs.at(2) = (void*)&devState_d;
-  dim3 grid = {1, 1, 1};
-  dim3 blocks = {1, 1, 1};
-  FB_CUDACHECK(cudaFuncSetAttribute(
-      reinterpret_cast<void*>(ncclKernelNvlBarrier),
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      sizeof(CtranAlgoDeviceState)));
-  FB_CUDACHECK(cudaLaunchKernel(
-      reinterpret_cast<void*>(ncclKernelNvlBarrier),
-      grid,
-      blocks,
-      kernelArgs.data(),
-      sizeof(CtranAlgoDeviceState),
-      stream));
-  return commSuccess;
-}
+  const auto* const statex = comm->statex_.get();
+  const int nRanks = statex->nRanks();
+  pArgs.remoteRecvBuffs.assign(nRanks, nullptr);
+  pArgs.remoteAccessKeys.assign(nRanks, CtranMapperRemoteAccessKey());
 
-inline commResult_t nvlCeBcast(
-    CtranComm* comm,
-    const void* sendBuff,
-    const size_t sendSize,
-    const size_t recvOffset,
-    PersistArgs& pArgs,
-    cudaStream_t stream,
-    bool barrier = true) {
-  const auto statex = comm->statex_.get();
-  const auto rank = statex->rank();
-  const auto localRank = statex->localRank();
-  const auto nLocalRanks = statex->nLocalRanks();
+  CtranMapperTimer ctrlTimer;
+  FB_COMMCHECK(mapper->intraAllGatherCtrl(
+      pArgs.recvbuff,
+      pArgs.recvHdl,
+      pArgs.remoteRecvBuffs,
+      pArgs.remoteAccessKeys,
+      pArgs.remoteIpcRegHdls_));
+  const double ctrlUs = ctrlTimer.durationUs();
 
-  // Barrier to make sure all local ranks has arrived before CE bcast, to
-  // avoid unwanted incast traffic congestion
-  if (barrier) {
-    nvlBarrier(comm, stream);
+  CtranMapperTimer barrierTimer;
+  FB_COMMCHECK(mapper->intraBarrier());
+  const double barrierUs = barrierTimer.durationUs();
+
+  CLOGF_SUBSYS(
+      INFO,
+      INIT,
+      "CTRAN-AGP: Rank {} IPC exchange breakdown: intraAllGatherCtrl {} us, intraBarrier {} us, nLocalRanks {}",
+      statex->rank(),
+      ctrlUs,
+      barrierUs,
+      statex->nLocalRanks());
+
+  const int myRank = statex->rank();
+  const int nLocalRanks = statex->nLocalRanks();
+  for (int i = 0; i < nLocalRanks; ++i) {
+    const int peerRank = statex->localRankToRank(i);
+    CLOGF_SUBSYS(
+        INFO,
+        INIT,
+        "CTRAN-AGP     Peer {}: addr {} ipcImport {}",
+        i,
+        pArgs.remoteRecvBuffs[peerRank],
+        myRank == peerRank ? "(local)"
+                           : pArgs.remoteIpcRegHdls_.at(i).toString());
   }
 
-  const size_t numOps = nLocalRanks - 1;
-  std::vector<void*> dsts(numOps);
-  std::vector<void*> srcs(numOps);
-  std::vector<size_t> sizes(numOps);
-
-  // Copy data to other local ranks, each rank starts with the next rank as peer
-  // and shift by 1 to avoid all-to-one incast traffic
-  for (auto r = 1; r < nLocalRanks; r++) {
-    const auto localPeer = (localRank + r) % nLocalRanks;
-    const auto peer = statex->localRankToRank(localPeer);
-
-    if (pArgs.remoteAccessKeys[peer].backend != CtranMapperBackend::NVL) {
-      FB_ERRORRETURN(
-          commInvalidArgument,
-          "Peer {} has non-NVL backend in nvlCeBcast",
-          peer);
-    }
-
-    auto recvPtr = getPtr(pArgs.remoteRecvBuffs[peer], recvOffset);
-    CLOGF_TRACE(
-        COLL,
-        "Rank {} CE copy to peer {}, sendBuff {} -> recvBuff {} ({} + recvOffset {}), sendSize {}",
-        rank,
-        peer,
-        sendBuff,
-        recvPtr,
-        pArgs.remoteRecvBuffs[peer],
-        recvOffset,
-        sendSize);
-    dsts.at(r - 1) = recvPtr;
-    srcs.at(r - 1) = const_cast<void*>(sendBuff);
-    sizes.at(r - 1) = sendSize;
-  }
-
-  // cudaMemcpyBatchAsync operations are not permitted during CUDA graph
-  // capture. Fall back to parallel cudaMemcpyAsync calls which are captured as
-  // memcpy nodes in the graph.
-  utils::cudagraph::StreamCaptureInfo captureInfo;
-  FB_CUDACHECK(utils::cudagraph::getStreamCaptureInfo(stream, captureInfo));
-  if (captureInfo.status == cudaStreamCaptureStatusActive) {
-    for (size_t i = 0; i < numOps; i++) {
-      FB_CUDACHECK(cudaMemcpyAsync(
-          dsts.at(i), srcs.at(i), sizes.at(i), cudaMemcpyDefault, stream));
-    }
-  } else {
-#if CUDART_VERSION >= 12080
-    cudaMemcpyAttributes attr = {};
-    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
-
-#if CUDART_VERSION < 13000
-    size_t failIdx = 0;
-    FB_CUDACHECK(cudaMemcpyBatchAsync(
-        dsts.data(),
-        srcs.data(),
-        sizes.data(),
-        numOps,
-        attr,
-        &failIdx,
-        stream));
-#else
-    FB_CUDACHECK(cudaMemcpyBatchAsync(
-        dsts.data(), srcs.data(), sizes.data(), numOps, attr, stream));
-#endif
-
-#else
-    auto mapper = comm->ctran_->mapper.get();
-    for (size_t i = 0; i < numOps; i++) {
-      FB_COMMCHECK(mapper->icopy(dsts.at(i), srcs.at(i), sizes.at(i), stream));
-    }
-#endif
-  }
-
-  return commSuccess;
-}
-
-// Copy data to self for out-of-place AllGather. No-op if it is an in-place
-// allgather.
-inline commResult_t copyToSelf(
-    CtranComm* comm,
-    const void* sendBuff,
-    const size_t sendSize,
-    PersistArgs& pArgs,
-    cudaStream_t stream) {
-  const auto statex = comm->statex_.get();
-  const auto rank = statex->rank();
-  const auto recvOffset = rank * sendSize;
-
-  // Copy data to self for out-of-place allgather
-  auto recvPtr = getPtr(pArgs.recvbuff, recvOffset);
-  if (recvPtr != sendBuff) {
-    CLOGF_TRACE(
-        COLL,
-        "Rank {} CE copy to self, sendbuff {} -> recvbuff {} ({} + recvOffset {}), sendSize {}",
-        rank,
-        sendBuff,
-        recvPtr,
-        pArgs.recvbuff,
-        recvOffset,
-        sendSize);
-    FB_COMMCHECK(
-        comm->ctran_->mapper->icopy(recvPtr, sendBuff, sendSize, stream));
-  }
+  pArgs.initState = InitState::kInitialized;
   return commSuccess;
 }
 } // namespace ctran::allgatherp

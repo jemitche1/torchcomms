@@ -4,10 +4,13 @@
 
 #include <cuda_runtime.h>
 
+#include <folly/container/F14Set.h>
+
 #include "comms/ctran/Ctran.h"
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/CtranPipes.h"
 #include "comms/ctran/algos/CtranAlgo.h"
+#include "comms/ctran/algos/PersistentCleanup.h"
 #include "comms/ctran/gpe/CtranGpe.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/regcache/RegCache.h"
@@ -115,8 +118,19 @@ comms::prims::Transport* CtranComm::getMultiPeerTransportsPtr() const {
   }
   return multiPeerTransport_->get_device_handle().transports.data();
 }
+comms::prims::Transport* CtranComm::getMultiPeerTransportsPtr(
+    const std::vector<int>& peers) {
+  if (!multiPeerTransport_) {
+    return nullptr;
+  }
+  return multiPeerTransport_->get_device_handle(peers).transports.data();
+}
 #else
 comms::prims::Transport* CtranComm::getMultiPeerTransportsPtr() const {
+  return nullptr;
+}
+comms::prims::Transport* CtranComm::getMultiPeerTransportsPtr(
+    const std::vector<int>& /*peers*/) {
   return nullptr;
 }
 #endif // defined(ENABLE_PRIMS)
@@ -135,6 +149,24 @@ void CtranComm::recordAlgoStats(
     const size_t msgSize) {
   if (algoStats_) {
     algoStats_->record(opName, algoName, msgSize);
+  }
+}
+
+void CtranComm::registerPersistentCleanup(
+    std::shared_ptr<PersistentCleanup> cleanup) {
+  persistentCleanups_.wlock()->insert(std::move(cleanup));
+}
+
+void CtranComm::unregisterPersistentCleanup(
+    const std::shared_ptr<PersistentCleanup>& cleanup) {
+  persistentCleanups_.wlock()->erase(cleanup);
+}
+
+void CtranComm::drainPersistentCleanups() {
+  folly::F14FastSet<std::shared_ptr<PersistentCleanup>> local;
+  persistentCleanups_.withWLock([&local](auto& set) { local.swap(set); });
+  for (const auto& cleanup : local) {
+    cleanup->run();
   }
 }
 
@@ -199,16 +231,16 @@ void CtranComm::destroy() {
   // their de-initialization here.
 #if defined(ENABLE_PRIMS)
   pipesTrace_.reset();
-  if (hierarchicalAgReadyCounters_ != nullptr) {
-    cudaFree(hierarchicalAgReadyCounters_);
-    hierarchicalAgReadyCounters_ = nullptr;
-    hierarchicalAgReadyCounterCount_ = 0;
-  }
   // Must be destroyed before ctran_ (which owns SharedResource staging
   // buffers used as external data buffers) and before bootstrap_ (since
   // multiPeerTransport_ holds a non-owning reference to it).
   multiPeerTransport_.reset();
 #endif // defined(ENABLE_PRIMS)
+  // Release every outstanding persistent request's pooled pipeSync + scoped
+  // registration before ctran_.reset() (which triggers CtranGpe::terminate()'s
+  // pool-drain spin-wait). Runs each cleanup token at most once; tokens already
+  // run by an eager free / graph-destroy callback no-op here.
+  drainPersistentCleanups();
   ctran_.reset();
   bootstrap_.reset();
   colltraceNew_.reset();

@@ -13,6 +13,7 @@
 #include "comms/ctran/algos/AllGatherP/Types.h"
 #include "comms/ctran/algos/CtranAlgo.h"
 #include "comms/ctran/algos/IPersistPlan.h"
+#include "comms/ctran/algos/common/GpeRing.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/profiler/Profiler.h"
 #include "comms/ctran/utils/DevUtils.cuh"
@@ -166,18 +167,18 @@ commResult_t gpeFn(const std::vector<std::unique_ptr<struct OpElem>>& opGroup) {
 
 namespace ctran::allgatherp {
 extern __global__ void ncclKernelAllGatherPPipeStart(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState);
 extern __global__ void ncclKernelAllGatherPPipeSync(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     PipeSyncKernArgs args);
 extern __global__ void ncclKernelAllGatherPPipeEnd(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     PipeEndKernArgs args);
 extern __global__ void ncclKernelAllGatherPPipe(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState);
 
 commResult_t AlgoImpl::execStreamedRecursiveDoubling(
@@ -246,7 +247,12 @@ commResult_t AlgoImpl::execStreamedRecursiveDoubling(
 
   // The streamed GPE path sources every outgoing chunk from recvbuff, including
   // the local rank's own chunk. Keep the copy stream-ordered before PipeStart.
-  FB_COMMCHECK(copyToSelf(comm_, sendbuff, sendSize, pArgs, stream_));
+  FB_COMMCHECK(copyToSelf(
+      comm_,
+      sendbuff,
+      getPtr(pArgs.recvbuff, comm_->statex_->rank() * sendSize),
+      sendSize,
+      stream_));
 
   if (nNodes > 1) {
     auto op = std::make_unique<OpElem>(
@@ -277,7 +283,13 @@ commResult_t AlgoImpl::execStreamedRecursiveDoubling(
 
   if (nLocalRanks > 1) {
     FB_COMMCHECK(nvlCeBcast(
-        comm_, sendbuff, sendSize, myRank * sendSize, pArgs, stream_));
+        comm_,
+        sendbuff,
+        sendSize,
+        myRank * sendSize,
+        pArgs.remoteRecvBuffs,
+        pArgs.remoteAccessKeys,
+        stream_));
 
     for (int step = 0; step < recvPlan.nSteps(); step++) {
       PipeSyncKernArgs syncArgs = {
@@ -301,7 +313,8 @@ commResult_t AlgoImpl::execStreamedRecursiveDoubling(
             srcPtr,
             sendSize,
             offset,
-            pArgs,
+            pArgs.remoteRecvBuffs,
+            pArgs.remoteAccessKeys,
             stream_,
             chunkIndex++ == 0));
       }

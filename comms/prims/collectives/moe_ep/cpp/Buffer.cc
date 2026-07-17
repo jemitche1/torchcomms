@@ -25,8 +25,13 @@
 #include "comms/prims/collectives/moe_ep/cpp/intranode/kernels/Dispatch.cuh"
 #include "comms/prims/collectives/moe_ep/cpp/intranode/kernels/Layout.cuh"
 #include "comms/prims/collectives/moe_ep/cpp/intranode/kernels/Notify.cuh"
+#include "comms/prims/collectives/moe_ep/cpp/low_latency/Runtime.h"
+#include "comms/prims/collectives/moe_ep/cpp/low_latency/kernels/Clean.cuh"
+#include "comms/prims/collectives/moe_ep/cpp/low_latency/kernels/Combine.cuh"
+#include "comms/prims/collectives/moe_ep/cpp/low_latency/kernels/Dispatch.cuh"
 #include "comms/prims/collectives/moe_ep/cpp/shared/kernels/KernelConfigs.cuh"
 #include "comms/prims/memory/GpuMemHandler.h"
+#include "secure_lib/secure_string.h"
 
 namespace comms::prims::moe_ep {
 
@@ -47,11 +52,9 @@ void checkCuda(cudaError_t err, const char* msg) {
  * single-rank fast path when nRanks == 1, and `MultiPeerNvlTransport`'s
  * `exchange()` does its own metadata gather.
  *
- * For multi-rank mode, a real `PreExchangedBootstrap` (per Q2/Q6 in the
- * design) gets plumbed through `Buffer::sync()` in a follow-up commit.
- * Until then, this stub is enough for single-rank smoke tests; multi-rank
- * intranode_dispatch will be exercised once D5's PreExchangedBootstrap
- * lands.
+ * For multi-rank mode, a real `PreExchangedBootstrap` is plumbed through
+ * `Buffer::sync()`; this stub is sufficient for the single-rank path and
+ * smoke tests.
  */
 class StubBootstrap : public meta::comms::IBootstrap {
  public:
@@ -81,6 +84,90 @@ class StubBootstrap : public meta::comms::IBootstrap {
   const int nRanks_;
 };
 
+/**
+ * PyAllGatherBootstrap — IBootstrap that delegates allGather to a Python
+ * callable. The callable receives the local data slot as bytes and must
+ * return concatenated `nranks * len` bytes (peer i's data at offset i*len).
+ *
+ * This is how Python `dist.all_gather_object` (or similar) gets bridged
+ * into MultipeerIbgdaTransport's QP-info exchange. The callback runs with
+ * the GIL held, so it can safely invoke Python collective APIs.
+ *
+ * `barrier` is a no-op; assumes Python pre-barriered. send/recv unsupported.
+ */
+class PyAllGatherBootstrap : public meta::comms::IBootstrap {
+ public:
+  PyAllGatherBootstrap(int rank, int nRanks, py::object allGatherCb)
+      : rank_(rank), nRanks_(nRanks), allGatherCb_(std::move(allGatherCb)) {}
+
+  ~PyAllGatherBootstrap() override {
+    // Py_DECREF of the callback requires the GIL, but this object can be
+    // destroyed while the GIL is released (the last shared_ptr reference may
+    // be dropped inside setupIbgda under gil_scoped_release, possibly on
+    // another thread). Reset the member here under an explicit guard: a bare
+    // gil_scoped_acquire would not help since the member is destroyed after
+    // the destructor body, once the guard is already gone.
+    py::gil_scoped_acquire gil;
+    allGatherCb_ = py::object();
+  }
+
+  // Owned via shared_ptr and never copied/moved; declared to satisfy the
+  // rule-of-five now that a destructor is user-provided.
+  PyAllGatherBootstrap(const PyAllGatherBootstrap&) = delete;
+  PyAllGatherBootstrap& operator=(const PyAllGatherBootstrap&) = delete;
+  PyAllGatherBootstrap(PyAllGatherBootstrap&&) = delete;
+  PyAllGatherBootstrap& operator=(PyAllGatherBootstrap&&) = delete;
+
+  folly::SemiFuture<int> allGather(void* buf, int len, int rank, int nranks)
+      override {
+    if (rank != rank_ || nranks != nRanks_) {
+      return folly::makeSemiFuture<int>(
+          std::runtime_error("PyAllGatherBootstrap: rank/nranks mismatch"));
+    }
+    try {
+      // Extract local data slot, call Python, marshal gathered result back.
+      py::gil_scoped_acquire gil;
+      const char* localData =
+          static_cast<const char*>(buf) + static_cast<std::size_t>(rank) * len;
+      py::bytes localBytes(localData, len);
+      py::object result = allGatherCb_(localBytes);
+      std::string gathered = result.cast<std::string>();
+      const std::size_t expected = static_cast<std::size_t>(nranks) * len;
+      if (gathered.size() != expected) {
+        throw std::runtime_error(
+            "PyAllGatherBootstrap: Python callback returned " +
+            std::to_string(gathered.size()) + " bytes, expected " +
+            std::to_string(expected));
+      }
+      checked_memcpy(buf, expected, gathered.data(), expected);
+    } catch (const std::exception& e) {
+      return folly::makeSemiFuture<int>(std::runtime_error(e.what()));
+    }
+    return folly::makeSemiFuture(0);
+  }
+
+  folly::SemiFuture<int> barrier(int /*rank*/, int /*nranks*/) override {
+    return folly::makeSemiFuture(0);
+  }
+
+  folly::SemiFuture<int>
+  send(void* /*buf*/, int /*len*/, int /*peer*/, int /*tag*/) override {
+    return folly::makeSemiFuture<int>(
+        std::runtime_error("PyAllGatherBootstrap: send not supported"));
+  }
+
+  folly::SemiFuture<int>
+  recv(void* /*buf*/, int /*len*/, int /*peer*/, int /*tag*/) override {
+    return folly::makeSemiFuture<int>(
+        std::runtime_error("PyAllGatherBootstrap: recv not supported"));
+  }
+
+ private:
+  const int rank_;
+  const int nRanks_;
+  py::object allGatherCb_;
+};
+
 } // namespace
 
 Buffer::Buffer(
@@ -103,10 +190,19 @@ Buffer::Buffer(
   if (rank_ < 0 || rank_ >= numRanks_) {
     throw std::invalid_argument("Buffer: rank out of bounds");
   }
-  if (numRanks_ <= 0 || numRanks_ > NUM_MAX_NVL_PEERS) {
-    // Phase 1 is intranode-only; Phase 3 (D5) adds multi-NVL-peer handling.
+  if (numRanks_ <= 0) {
+    throw std::invalid_argument("Buffer: numRanks must be > 0");
+  }
+  // For non-low-latency intranode mode, only one NVL node is supported
+  // (the intranode kernel addresses peers via the per-rank `buffer_ptrs`
+  // table sized at NUM_MAX_NVL_PEERS). Low-latency mode supports
+  // cross-node via the hybrid IPC+IBGDA path — same-node peers go via
+  // NVLink IPC, cross-node peers via `MultipeerIbgdaTransport` (wired
+  // up by `setup_low_latency_ibgda()` post-sync).
+  if (!lowLatencyMode_ && numRanks_ > NUM_MAX_NVL_PEERS) {
     throw std::invalid_argument(
-        "Buffer: numRanks must be in (0, NUM_MAX_NVL_PEERS] for Phase 1");
+        "Buffer: numRanks > NUM_MAX_NVL_PEERS requires low_latency_mode=True "
+        "(internode intranode_dispatch/combine kernel is not yet implemented)");
   }
 
   checkCuda(cudaGetDevice(&deviceId_), "Buffer: cudaGetDevice failed");
@@ -130,8 +226,10 @@ Buffer::Buffer(
   // dma-buf-compatible; matches `GpuMemHandler::kCudaIpcUncached`.
   const std::size_t barrierBytes =
       static_cast<std::size_t>(kernels::NUM_MAX_FIFO_SLOTS) * sizeof(int);
-  const std::size_t totalBytes =
-      static_cast<std::size_t>(numNvlBytes_) + barrierBytes;
+  llRdmaOffset_ = static_cast<std::size_t>(numNvlBytes_) + barrierBytes;
+  const std::size_t rdmaRegionBytes =
+      lowLatencyMode_ ? static_cast<std::size_t>(numRdmaBytes_) : 0;
+  const std::size_t totalBytes = llRdmaOffset_ + rdmaRegionBytes;
 #ifdef __HIP_PLATFORM_AMD__
   checkCuda(
       hipExtMallocWithFlags(
@@ -158,6 +256,12 @@ Buffer::Buffer(
         cudaMemsetAsync(barrierPtr, 0, barrierBytes, /*stream=*/nullptr),
         "Buffer: cudaMemsetAsync(barrier region) failed");
   }
+  if (rdmaRegionBytes > 0) {
+    void* llPtr = static_cast<std::uint8_t*>(localIpcBuffer_) + llRdmaOffset_;
+    checkCuda(
+        cudaMemsetAsync(llPtr, 0, rdmaRegionBytes, /*stream=*/nullptr),
+        "Buffer: cudaMemsetAsync(LL RDMA region) failed");
+  }
 }
 
 Buffer::~Buffer() {
@@ -181,7 +285,7 @@ Buffer::~Buffer() {
 }
 
 int Buffer::get_num_rdma_ranks() const noexcept {
-  // Phase 1: intranode-only → exactly 1 RDMA rank (this node).
+  // Intranode-only → exactly 1 RDMA rank (this node).
   return 1;
 }
 
@@ -241,10 +345,21 @@ void Buffer::sync(
   // `rank_` is the local buffer; other entries come from
   // `cudaIpcOpenMemHandle(peer_i_handle)`. The opened pointers are owned by
   // this Buffer and closed in the destructor.
+  //
+  // Multi-node LL: peers on a different node (i.e. different
+  // `rank / NUM_MAX_NVL_PEERS`) are not reachable via cudaIpcOpenMemHandle —
+  // their `peerIpcBuffers_[i]` stays nullptr and the LL kernel branches to
+  // the IBGDA path for those peers.
+  const int myNodeIdx = rank_ / NUM_MAX_NVL_PEERS;
   peerIpcBuffers_.assign(numRanks_, nullptr);
   for (int i = 0; i < numRanks_; ++i) {
     if (i == rank_) {
       peerIpcBuffers_[i] = localIpcBuffer_;
+      continue;
+    }
+    // Cross-node peer: skip IPC open. IBGDA path provides reachability.
+    if (i / NUM_MAX_NVL_PEERS != myNodeIdx) {
+      peerIpcBuffers_[i] = nullptr;
       continue;
     }
     if (!ipcHandles[i].has_value()) {
@@ -266,28 +381,60 @@ void Buffer::sync(
     cudaIpcMemHandle_t peerHandle{};
     std::memcpy(&peerHandle, handleBytes.data(), sizeof(peerHandle));
     void* peerPtr = nullptr;
-    checkCuda(
-        cudaIpcOpenMemHandle(
-            &peerPtr, peerHandle, cudaIpcMemLazyEnablePeerAccess),
-        "Buffer::sync: cudaIpcOpenMemHandle failed");
+    // For LL mode, cross-node peers' IPC opens fail (P2P not available).
+    // Leave peerIpcBuffers_[i] = nullptr so the LL kernel's hybrid branch
+    // routes to the IBGDA path. For intranode mode, all peers must succeed
+    // (single-node-only requirement).
+    cudaError_t ipcErr = cudaIpcOpenMemHandle(
+        &peerPtr, peerHandle, cudaIpcMemLazyEnablePeerAccess);
+    if (ipcErr != cudaSuccess) {
+      if (lowLatencyMode_) {
+        // Cross-node peer: clear the sticky CUDA error so subsequent
+        // cudaMalloc / kernel launches don't fail with the stale error,
+        // then leave peerIpcBuffers_[i] = nullptr — kernel routes via IBGDA.
+        (void)cudaGetLastError();
+        continue;
+      }
+      throw std::runtime_error(
+          std::string("Buffer::sync: cudaIpcOpenMemHandle failed for peer ") +
+          std::to_string(i) + ": " + cudaGetErrorString(ipcErr));
+    }
     peerIpcBuffers_[i] = peerPtr;
   }
 
   // Construct intranode runtime via the pre-allocated-buffer ctor: skips
   // GpuMemHandler/transport entirely since Python already gathered IPC
   // handles for us.
-  intranode_ = std::make_unique<IntranodeRuntime>(
-      rank_,
-      numRanks_,
-      static_cast<std::size_t>(numNvlBytes_),
-      localIpcBuffer_,
-      localIpcHandle_,
-      peerIpcBuffers_);
+  //
+  // Skip when low_latency_mode + numRanks > NUM_MAX_NVL_PEERS —
+  // IntranodeRuntime itself checks numRanks <= NUM_MAX_NVL_PEERS, and LL
+  // kernels don't use the intranode runtime at all (they use LowLatencyRuntime,
+  // constructed lazily on first low_latency_dispatch call).
+  if (!lowLatencyMode_ || numRanks_ <= NUM_MAX_NVL_PEERS) {
+    intranode_ = std::make_unique<IntranodeRuntime>(
+        rank_,
+        numRanks_,
+        static_cast<std::size_t>(numNvlBytes_),
+        localIpcBuffer_,
+        localIpcHandle_,
+        peerIpcBuffers_);
+  }
 
   // Full device sync after sync() ensures the host-to-device pointer-table
   // memcpys + barrier-region memset are visible to all subsequent kernels
   // (which may run on a stream different from the one used in setup).
   checkCuda(cudaDeviceSynchronize(), "Buffer::sync: cudaDeviceSynchronize");
+
+  // When low_latency_mode=true, also stand up the LL runtime
+  // (owns the symmetric LL buffer, atomic counters, IBGDA transport).
+  // The dispatch tokens / hidden / num_experts are not known at sync()
+  // time — those land on the first dispatch call. LowLatencyRuntime is
+  // constructed lazily in `low_latency_dispatch`; this branch only
+  // validates the mode's invariants.
+  if (lowLatencyMode_ && numRdmaBytes_ <= 0) {
+    throw std::runtime_error(
+        "Buffer::sync: low_latency_mode requires num_rdma_bytes > 0");
+  }
 
   available_ = true;
 }
@@ -296,6 +443,7 @@ void Buffer::destroy() {
   if (destroyed_) {
     return;
   }
+  lowLatency_.reset();
   intranode_.reset();
   destroyed_ = true;
   available_ = false;
@@ -332,7 +480,7 @@ Buffer::get_dispatch_layout(
       {numTokens, numRanks_},
       torch::TensorOptions().dtype(torch::kBool).device(topkIdx.device()));
 
-  // Phase 1 intranode → no per-RDMA-rank tensor.
+  // Intranode → no per-RDMA-rank tensor.
   std::optional<torch::Tensor> numTokensPerRdmaRank = std::nullopt;
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -413,14 +561,14 @@ py::tuple Buffer::intranode_dispatch(
     x = xTuple[0].cast<torch::Tensor>();
     xScales = xTuple[1].cast<torch::Tensor>();
     isFp8 = true;
-    // FP8 scale path is deferred: the kernel derives num_scales from
+    // FP8 scale path is not yet supported: the kernel derives num_scales from
     // scale_hidden_stride (Dispatch.cu), which collapses to 1 for contiguous
     // scales and silently under-fills the recv-scale buffer. Reject the
-    // (data, scales) tuple until the FP8-enablement diff threads num_scales.
+    // (data, scales) tuple until the FP8 scale path threads num_scales.
     TORCH_CHECK(
         !isFp8,
         "intranode_dispatch: FP8 (x=(data, scales)) is not supported yet; the "
-        "scale path is deferred to a follow-up diff. Pass a bf16/fp16 tensor.");
+        "scale path is not implemented. Pass a bf16/fp16 tensor.");
   } else {
     // Tensor path — fall back on cast-or-throw to bypass unreliable
     // pybind11::isinstance<torch::Tensor>.
@@ -732,7 +880,7 @@ Buffer::intranode_combine(
   }
   TORCH_CHECK(
       x.dim() == 2 && x.is_contiguous() && x.scalar_type() == torch::kBFloat16,
-      "Phase 1 combine requires bf16 contiguous 2D x");
+      "intranode combine requires bf16 contiguous 2D x");
   TORCH_CHECK(config.num_sms % 2 == 0, "config.num_sms must be even");
 
   if (!py::isinstance<py::dict>(handle)) {
@@ -842,10 +990,382 @@ Buffer::intranode_combine(
   return std::make_tuple(recvX, recvTopkWeights, event);
 }
 
+// ---- Low-latency dispatch / combine ----
+//
+// Lazily construct the LowLatencyRuntime on first call (the dispatch
+// dimensions aren't known at sync() time). These methods set up the
+// runtime, allocate the output tensors, and call into the low-latency
+// kernels.
+
+py::tuple Buffer::low_latency_dispatch(
+    const torch::Tensor& x,
+    const torch::Tensor& topkIdx,
+    int numMaxDispatchTokensPerRank,
+    int numExperts,
+    bool useFp8,
+    bool /*roundScale*/,
+    bool /*useUe8m0*/,
+    bool /*asyncFinish*/,
+    bool /*returnRecvHook*/) {
+  if (!available_) {
+    throw std::runtime_error("Buffer::low_latency_dispatch: not synced yet");
+  }
+  if (!lowLatencyMode_) {
+    throw std::runtime_error(
+        "Buffer::low_latency_dispatch: requires low_latency_mode=True");
+  }
+  TORCH_CHECK(
+      x.dim() == 2 && x.is_contiguous() && x.scalar_type() == torch::kBFloat16,
+      "x must be 2D contiguous bf16");
+  TORCH_CHECK(
+      topkIdx.dim() == 2 && topkIdx.is_contiguous() &&
+          topkIdx.scalar_type() == torch::kInt64,
+      "topk_idx must be 2D contiguous int64");
+  TORCH_CHECK(
+      x.size(0) == topkIdx.size(0) && x.size(0) <= numMaxDispatchTokensPerRank,
+      "x.size(0) and topk_idx.size(0) must match and fit in cap");
+  TORCH_CHECK(numExperts % numRanks_ == 0, "num_experts % num_ranks != 0");
+
+  const int hidden = static_cast<int>(x.size(1));
+  const int numLocalExperts = numExperts / numRanks_;
+
+  if (!lowLatency_) {
+    auto bootstrap = std::make_shared<StubBootstrap>(rank_, numRanks_);
+    void* llBuffer = static_cast<uint8_t*>(localIpcBuffer_) + llRdmaOffset_;
+    lowLatency_ = std::make_unique<LowLatencyRuntime>(
+        bootstrap,
+        rank_,
+        numRanks_,
+        static_cast<std::size_t>(numRdmaBytes_),
+        numMaxDispatchTokensPerRank,
+        hidden,
+        numExperts,
+        /*numQpsPerRank=*/numLocalExperts,
+        /*externalRdmaBuffer=*/llBuffer);
+  }
+
+  auto packedRecvX = torch::empty(
+      {numLocalExperts, numRanks_ * numMaxDispatchTokensPerRank, hidden},
+      x.options().dtype(useFp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
+  auto packedRecvSrcInfo = torch::zeros(
+      {numLocalExperts, numRanks_ * numMaxDispatchTokensPerRank},
+      torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
+  auto packedRecvLayoutRange = torch::zeros(
+      {numLocalExperts, numRanks_},
+      torch::TensorOptions().dtype(torch::kInt64).device(x.device()));
+  auto packedRecvCount = torch::zeros(
+      {numLocalExperts},
+      torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
+
+  std::optional<torch::Tensor> packedRecvXScales;
+  if (useFp8) {
+    packedRecvXScales = torch::empty(
+        {numLocalExperts,
+         hidden / 128,
+         numRanks_ * numMaxDispatchTokensPerRank},
+        torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+  }
+
+  const int numTokens = static_cast<int>(x.size(0));
+  const int numTopk = static_cast<int>(topkIdx.size(1));
+
+  // Wire peer data pointers for NVLink IPC writes. Offset each peer's
+  // base pointer to the LL RDMA region within the shared IPC buffer.
+  // For cross-node peers (peerIpcBuffers_[i] == nullptr because
+  // cudaIpcOpenMemHandle failed), keep the entry nullptr — the kernel
+  // branches on this to route to the IBGDA path. Adding llRdmaOffset_ to
+  // nullptr would produce a small invalid address that passes the kernel's
+  // `!= nullptr` check and triggers a memory fault on the IPC write.
+  if (lowLatency_->getPeerDataPtrsDevice() == nullptr &&
+      !peerIpcBuffers_.empty()) {
+    std::vector<void*> llPeerPtrs(numRanks_);
+    for (int i = 0; i < numRanks_; ++i) {
+      llPeerPtrs[i] = (peerIpcBuffers_[i] != nullptr)
+          ? static_cast<uint8_t*>(peerIpcBuffers_[i]) + llRdmaOffset_
+          : nullptr;
+    }
+    lowLatency_->setPeerDataPtrs(llPeerPtrs);
+  }
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // Explicit memset to guarantee zeroing on HIP
+  checkCuda(
+      cudaMemsetAsync(
+          packedRecvCount.data_ptr(), 0, numLocalExperts * sizeof(int), stream),
+      "Buffer::low_latency_dispatch: memset(packedRecvCount) failed");
+  checkCuda(
+      cudaMemsetAsync(
+          packedRecvLayoutRange.data_ptr(),
+          0,
+          numLocalExperts * numRanks_ * sizeof(std::int64_t),
+          stream),
+      "Buffer::low_latency_dispatch: memset(packedRecvLayoutRange) failed");
+
+  // Compute buffer region pointers from layout offsets
+  auto* llBase = static_cast<uint8_t*>(lowLatency_->getLocalRdmaBufferPtr());
+  const auto& layout = lowLatency_->layout();
+  auto* rdmaRecvX = llBase + layout.dispatchRecvXOffset;
+  auto* rdmaRecvCount =
+      reinterpret_cast<std::int64_t*>(llBase + layout.dispatchRecvCountOffset);
+  auto* rdmaX = llBase + layout.dispatchSendXOffset;
+
+  int phase = 3; // send + recv
+
+  kernels::low_latency_dispatch(
+      packedRecvX.data_ptr(),
+      packedRecvXScales.has_value()
+          ? static_cast<float*>(packedRecvXScales->data_ptr())
+          : nullptr,
+      packedRecvSrcInfo.data_ptr<int>(),
+      packedRecvLayoutRange.data_ptr<std::int64_t>(),
+      packedRecvCount.data_ptr<int>(),
+      lowLatency_->getGlobalAtomicCounter(),
+      rdmaRecvX,
+      rdmaRecvCount,
+      rdmaX,
+      x.data_ptr(),
+      topkIdx.data_ptr<std::int64_t>(),
+      lowLatency_->getAtomicCounterPerExpert(),
+      lowLatency_->getAtomicFinishCounterPerExpert(),
+      lowLatency_->getNextCleanBuffer(),
+      lowLatency_->getNextCleanBufferIntCount(),
+      numTokens,
+      hidden,
+      numMaxDispatchTokensPerRank,
+      numTopk,
+      numExperts,
+      rank_,
+      numRanks_,
+      useFp8,
+      false, // roundScale
+      false, // useUe8m0
+      lowLatency_->getPeerDataPtrsDevice(),
+      // IBGDA cross-node descriptors. Populated by setupIbgda() (for
+      // multi-node configs); nullptr on single-node where all peers are
+      // P2P-capable and the kernel takes the IPC fast path.
+      lowLatency_->getIbgdaDeviceTransport(),
+      lowLatency_->getLocalRdmaXBufDevice(),
+      lowLatency_->getPeerRemoteRecvXDevice(),
+      lowLatency_->getPeerRemoteRecvCountDevice(),
+      phase,
+      stream);
+
+  // Synchronize to get packed_recv_count values
+  cudaStreamSynchronize(stream);
+
+  // Build handle for combine: (src_info, layout_range, packed_recv_x_ref).
+  // Test accesses handle[0], handle[1]; handle[2] is for
+  // get_next_low_latency_combine_buffer shape reference.
+  auto handle =
+      py::make_tuple(packedRecvSrcInfo, packedRecvLayoutRange, packedRecvX);
+
+  // packed_recv_x: single tensor (BF16) or tuple (FP8 data, scales)
+  py::object packedRecvXResult;
+  if (useFp8 && packedRecvXScales.has_value()) {
+    packedRecvXResult = py::make_tuple(packedRecvX, *packedRecvXScales);
+  } else {
+    packedRecvXResult = py::cast(packedRecvX);
+  }
+
+  // Return: (packed_recv_x, packed_recv_count, handle, event, recv_hook)
+  auto noopHook = py::cpp_function([]() {});
+  return py::make_tuple(
+      packedRecvXResult, packedRecvCount, handle, EventHandle(), noopHook);
+}
+
+py::tuple Buffer::low_latency_combine(
+    const torch::Tensor& x,
+    const torch::Tensor& topkIdx,
+    const torch::Tensor& topkWeights,
+    const py::object& handle,
+    bool /*useLogfmt*/,
+    bool /*asyncFinish*/,
+    bool /*returnRecvHook*/) {
+  if (!available_) {
+    throw std::runtime_error("Buffer::low_latency_combine: not synced yet");
+  }
+  if (!lowLatencyMode_) {
+    throw std::runtime_error(
+        "Buffer::low_latency_combine: requires low_latency_mode=True");
+  }
+  if (!lowLatency_) {
+    throw std::runtime_error(
+        "Buffer::low_latency_combine: dispatch must be called first");
+  }
+
+  TORCH_CHECK(
+      x.dim() == 3 && x.is_contiguous() && x.scalar_type() == torch::kBFloat16,
+      "combine x must be 3D contiguous bf16 (numLocalExperts, cap, hidden)");
+  TORCH_CHECK(
+      topkIdx.dim() == 2 && topkIdx.is_contiguous() &&
+          topkIdx.scalar_type() == torch::kInt64,
+      "topk_idx must be 2D contiguous int64");
+  TORCH_CHECK(
+      topkWeights.dim() == 2 && topkWeights.is_contiguous() &&
+          topkWeights.scalar_type() == torch::kFloat32,
+      "topk_weights must be 2D contiguous float32");
+
+  const int numCombinedTokens = static_cast<int>(topkIdx.size(0));
+  const int numTopk = static_cast<int>(topkIdx.size(1));
+  const int hidden = static_cast<int>(x.size(2));
+  const int numExperts = lowLatency_->numExperts();
+
+  // Extract dispatch handle: (src_info, layout_range)
+  py::tuple handleTuple = handle.cast<py::tuple>();
+  auto srcInfo = handleTuple[0].cast<torch::Tensor>();
+  auto layoutRange = handleTuple[1].cast<torch::Tensor>();
+  const int numMaxDispatchTokensPerRank =
+      lowLatency_->numMaxDispatchTokensPerRank();
+
+  auto combinedX = torch::empty(
+      {numCombinedTokens, hidden},
+      torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()));
+
+  // Compute buffer region pointers from layout offsets
+  auto* llBase = static_cast<uint8_t*>(lowLatency_->getLocalRdmaBufferPtr());
+  const auto& layout = lowLatency_->layout();
+  auto* combineRecvX = llBase + layout.combineRecvXOffset;
+  auto* combineRecvFlag =
+      reinterpret_cast<std::int64_t*>(llBase + layout.combineRecvFlagOffset);
+  auto* combineSendX = llBase + layout.combineSendXOffset;
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // combineRecvFlag is zeroed inside the kernel after reading.
+  // Only need to zero the workspace (atomic_clean_flag).
+  checkCuda(
+      cudaMemsetAsync(
+          lowLatency_->getCombineWorkspace(), 0, sizeof(int), stream),
+      "Buffer::low_latency_combine: cudaMemsetAsync(combineWorkspace) failed");
+
+  int phase = 3; // send + recv
+
+  kernels::low_latency_combine(
+      combinedX.data_ptr(),
+      combineRecvX,
+      combineRecvFlag,
+      combineSendX,
+      x.data_ptr(),
+      topkIdx.data_ptr<std::int64_t>(),
+      topkWeights.data_ptr<float>(),
+      srcInfo.data_ptr<int>(),
+      layoutRange.data_ptr<std::int64_t>(),
+      lowLatency_->getGlobalAtomicCounter(),
+      lowLatency_->getNextCleanBuffer(),
+      lowLatency_->getNextCleanBufferIntCount(),
+      numCombinedTokens,
+      hidden,
+      numMaxDispatchTokensPerRank,
+      numTopk,
+      numExperts,
+      rank_,
+      numRanks_,
+      lowLatency_->getCombineWorkspace(),
+      lowLatency_->getPeerDataPtrsDevice(),
+      // IBGDA cross-node descriptors. nullptr on single-node.
+      lowLatency_->getIbgdaDeviceTransport(),
+      lowLatency_->getLocalCombineXBufDevice(),
+      lowLatency_->getPeerRemoteCombineRecvXDevice(),
+      lowLatency_->getPeerRemoteCombineRecvFlagDevice(),
+      phase,
+      false, // zero_copy
+      stream);
+
+  cudaStreamSynchronize(stream);
+
+  auto noopHook = py::cpp_function([]() {});
+  return py::make_tuple(combinedX, EventHandle(), noopHook);
+}
+
+void Buffer::clean_low_latency_buffer(
+    int /*numMaxDispatchTokensPerRank*/,
+    int /*hidden*/,
+    int /*numExperts*/) {
+  if (!available_) {
+    throw std::runtime_error(
+        "Buffer::clean_low_latency_buffer: not synced yet");
+  }
+  if (!lowLatency_) {
+    // Nothing to clean — runtime not yet constructed.
+    return;
+  }
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // Zero the two signal regions the LL kernels poll on between iterations: the
+  // dispatch recv-count slots and the combine recv-flag slots (both int64
+  // arrays). Steady-state dispatch/combine self-reset these, so this is a
+  // defensive reset for failure recovery and buffer reuse.
+  auto* llBase = static_cast<uint8_t*>(lowLatency_->getLocalRdmaBufferPtr());
+  const auto& layout = lowLatency_->layout();
+  auto* dispatchRecvCount =
+      reinterpret_cast<std::int64_t*>(llBase + layout.dispatchRecvCountOffset);
+  auto* combineRecvFlag =
+      reinterpret_cast<std::int64_t*>(llBase + layout.combineRecvFlagOffset);
+  kernels::clean_low_latency_buffer(
+      dispatchRecvCount,
+      static_cast<int>(layout.dispatchRecvCountBytes / sizeof(std::int64_t)),
+      combineRecvFlag,
+      static_cast<int>(layout.combineRecvFlagBytes / sizeof(std::int64_t)),
+      rank_,
+      numRanks_,
+      /*mask_buffer_ptr=*/nullptr,
+      /*sync_buffer_ptr=*/nullptr,
+      stream);
+}
+
+void Buffer::set_low_latency_buffer_idx(int idx) {
+  if (idx != 0 && idx != 1) {
+    throw std::invalid_argument(
+        "Buffer::set_low_latency_buffer_idx: idx must be 0 or 1");
+  }
+  lowLatencyBufferIdx_ = idx;
+}
+
+void Buffer::setup_low_latency_ibgda(
+    int numMaxDispatchTokensPerRank,
+    int hidden,
+    int numExperts,
+    py::object allGatherCallback) {
+  if (!available_) {
+    throw std::runtime_error("Buffer::setup_low_latency_ibgda: not synced yet");
+  }
+  if (!lowLatencyMode_) {
+    throw std::runtime_error(
+        "Buffer::setup_low_latency_ibgda: requires low_latency_mode=True");
+  }
+  if (numRanks_ < 2) {
+    return; // single-rank: no peers, nothing to set up
+  }
+  // Eagerly construct the LL runtime so cross-node QPs can be set up before
+  // the first dispatch — otherwise the kernel would try to send to cross-node
+  // peers with no IBGDA wired.
+  if (!lowLatency_) {
+    const int numLocalExperts = numExperts / numRanks_;
+    auto bootstrap = std::make_shared<StubBootstrap>(rank_, numRanks_);
+    void* llBuffer = static_cast<uint8_t*>(localIpcBuffer_) + llRdmaOffset_;
+    lowLatency_ = std::make_unique<LowLatencyRuntime>(
+        bootstrap,
+        rank_,
+        numRanks_,
+        static_cast<std::size_t>(numRdmaBytes_),
+        numMaxDispatchTokensPerRank,
+        hidden,
+        numExperts,
+        /*numQpsPerRank=*/numLocalExperts,
+        /*externalRdmaBuffer=*/llBuffer);
+  }
+  auto bootstrap = std::make_shared<PyAllGatherBootstrap>(
+      rank_, numRanks_, std::move(allGatherCallback));
+  // Release GIL during the C++ collective so the Python callback can
+  // re-acquire it; the bootstrap re-acquires per-call.
+  py::gil_scoped_release release;
+  lowLatency_->setupIbgda(std::move(bootstrap));
+}
+
 void Buffer::notImplemented(const char* methodName) const {
   throw std::runtime_error(
-      std::string("Buffer::") + methodName +
-      " is not yet implemented in this commit (D3 work-in-progress)");
+      std::string("Buffer::") + methodName + " is not yet implemented");
 }
 
 } // namespace comms::prims::moe_ep

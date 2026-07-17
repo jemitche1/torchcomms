@@ -19,6 +19,7 @@
 #include "comms/ctran/algos/ReduceScatter/Types.h"
 #include "comms/ctran/algos/SendRecv/Types.h"
 #include "comms/ctran/algos/common/GpeKernelSync.h"
+#include "comms/ctran/algos/common/GpeRing.h"
 #include "comms/ctran/gpe/CtranGpeDev.h"
 #include "comms/ctran/profiler/IGpeProfilerReporter.h"
 #include "comms/ctran/utils/PinnedHostPool.h"
@@ -33,13 +34,6 @@ typedef commResult_t (*opFunc)(
 // CtranGpeImpl.h:209 — both must alias the same instantiation.
 using GpeKernelSyncPool = PinnedHostPool<ctran::algos::GpeKernelSync>;
 
-namespace ctran {
-using PersistentObj =
-    std::variant<std::monostate, std::unique_ptr<alltoallp::AlgoImpl>>;
-using PreLaunchGraphPrepareFn =
-    commResult_t (*)(opFunc& opFunc, struct OpElem* op, PersistentObj& pObj);
-} // namespace ctran
-
 struct OpElem {
   enum opType {
     ALLGATHER,
@@ -52,7 +46,6 @@ struct OpElem {
     ALLTOALLP,
     ALLTOALLV,
     DEVICE_ALLTOALLV,
-    ALLTOALL_DEDUP,
     ALLTOALLV_DEDUP,
     BROADCAST,
     REDUCESCATTER,
@@ -171,20 +164,6 @@ struct OpElem {
       commDataType_t datatype;
     } device_alltoallv;
     struct {
-      const void* sendbuff;
-      const size_t* sendcounts;
-      const size_t* sdispls;
-      void* recvbuff;
-      const size_t* recvcounts;
-      const size_t* rdispls;
-      commDataType_t datatype;
-      std::unordered_map<int, KernelElem*> bcastElemMap;
-      void* sendHdl;
-      void* recvHdl;
-      std::vector<void*> remoteRecvBuffs;
-      std::vector<struct CtranMapperRemoteAccessKey> remoteAccessKeys;
-    } alltoall_dedup;
-    struct {
       // Reference to persistent algo fields
       void* pArgs;
       void* algoResource;
@@ -258,8 +237,6 @@ struct OpElem {
 
   OpElem(enum opType type, CtranComm* comm, ICtran* ctran, uint64_t opCount);
 
-  OpElem(OpElem* op);
-
   OpElem(
       enum opType type,
       cudaStream_t stream,
@@ -292,7 +269,6 @@ struct KernelConfig {
     ALLTOALL,
     DEVICE_ALLTOALLV,
     ALLTOALLV,
-    ALLTOALL_DEDUP,
     ALLTOALLV_DEDUP,
     BROADCAST,
     BROADCAST_UNPACK,
@@ -391,8 +367,7 @@ class CtranGpe {
       opFunc func,
       KernelConfig& kernelConfig,
       const void* ncclKernel,
-      std::optional<std::chrono::milliseconds> timeout = std::nullopt,
-      ctran::PreLaunchGraphPrepareFn graphPrepareFn = nullptr);
+      std::optional<std::chrono::milliseconds> timeout = std::nullopt);
 
   // Submit host mem communication. No kernel is launched, and only the host
   // side func will be submitted to the GPE thread. Also the op won't be
@@ -464,82 +439,76 @@ ncclKernelNvlBarrier(int rank, int nLocalRanks, CtranAlgoDeviceState* devState);
 
 template <typename T>
 extern __global__ void ncclKernelAllGatherCtranDirect(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::allgather::KernelArgs args);
 
 __global__ void ncclKernelAllGatherCtranRing(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::allgather::KernelArgs args);
 
 template <typename T, commRedOp_t RedOp>
 __global__ void ncclKernelAllReduceCtranDirect(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::allreduce::KernelArgs args);
 
 extern __global__ void ncclKernelSend(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::sendrecv::KernelSendArgs args);
 
 template <bool UNPACK>
 extern __global__ void ncclKernelRecv(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::sendrecv::KernelRecvArgs args);
 
 template <bool UNPACK>
 extern __global__ void ncclKernelSendRecv(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::sendrecv::KernelSendRecvArgs args);
 
 extern __global__ void ncclKernelSendRecvP2p(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::sendrecv::KernArgs args);
 
 template <bool UNPACK>
 __global__ void ncclKernelBroadcast(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::broadcast::KernelArgs args);
 
 template <typename T>
 extern __global__ void ncclKernelAllToAll(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::alltoall::KernelArgs args);
 
 template <typename T>
 extern __global__ void ncclKernelAllToAllv(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::alltoallv::KernelArgs args);
 
-template <typename T>
-extern __global__ void ncclKernelAllToAllDedup(
-    int* flag,
-    CtranAlgoDeviceState* devState,
-    ctran::alltoalldedup::KernelArgs args);
-
 template <typename T, commRedOp_t RedOp>
 __global__ void ncclKernelReduceScatterDirect(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::reducescatter::KernelArgs args);
 
 template <typename T, commRedOp_t RedOp>
 __global__ void ncclKernelReduceScatterRing(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::reducescatter::KernelArgs args);
 
 template <typename T, commRedOp_t RedOp>
 __global__ void ncclKernelReduceScatterRHD(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::reducescatter::KernelArgs args);
 

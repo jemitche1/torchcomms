@@ -6,6 +6,7 @@
 #include "comms/ctran/algos/AllGatherP/CommUtils.h"
 #include "comms/ctran/algos/AllGatherP/Types.h"
 #include "comms/ctran/algos/CtranAlgo.h"
+#include "comms/ctran/algos/common/GpeRing.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/profiler/Profiler.h"
 #include "comms/ctran/utils/ExtUtils.h"
@@ -161,18 +162,18 @@ commResult_t gpeFn(const std::vector<std::unique_ptr<struct OpElem>>& opGroup) {
 
 namespace ctran::allgatherp {
 extern __global__ void ncclKernelAllGatherPPipeStart(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState);
 extern __global__ void ncclKernelAllGatherPPipeSync(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     PipeSyncKernArgs args);
 extern __global__ void ncclKernelAllGatherPPipeEnd(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     PipeEndKernArgs args);
 extern __global__ void ncclKernelAllGatherPPipe(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState);
 
 commResult_t AlgoImpl::execPipeline(
@@ -282,14 +283,25 @@ commResult_t AlgoImpl::execPipeline(
   }
 
   // Copy data to self for out-of-place allgather
-  FB_COMMCHECK(copyToSelf(comm_, sendbuff, sendSize, pArgs, stream_));
+  FB_COMMCHECK(copyToSelf(
+      comm_,
+      sendbuff,
+      getPtr(pArgs.recvbuff, comm_->statex_->rank() * sendSize),
+      sendSize,
+      stream_));
 
   // Submit intra-node copies in the pipeline
   if (nLocalRanks > 1) {
     // - Step 0: Broadcast local chunk to intra-node peers
     // Copy data to other local ranks
     FB_COMMCHECK(nvlCeBcast(
-        comm_, sendbuff, sendSize, myRank * sendSize, pArgs, stream_));
+        comm_,
+        sendbuff,
+        sendSize,
+        myRank * sendSize,
+        pArgs.remoteRecvBuffs,
+        pArgs.remoteAccessKeys,
+        stream_));
 
     const int upPeer = (nRanks + myRank - nLocalRanks) & (nRanks - 1);
 
@@ -313,8 +325,14 @@ commResult_t AlgoImpl::execPipeline(
       const auto offset =
           getRecvChunkIdxInRail(upPeer, step, nLocalRanks, nRanks) * sendSize;
       const auto sendPtr = getPtr(pArgs.recvbuff, offset);
-      FB_COMMCHECK(
-          nvlCeBcast(comm_, sendPtr, sendSize, offset, pArgs, stream_));
+      FB_COMMCHECK(nvlCeBcast(
+          comm_,
+          sendPtr,
+          sendSize,
+          offset,
+          pArgs.remoteRecvBuffs,
+          pArgs.remoteAccessKeys,
+          stream_));
     }
 
     PipeEndKernArgs kernArgs = {

@@ -25,23 +25,29 @@ P2pIbgdaTransportDevice* buildDeviceTransportsOnGpu(
   int companionQpsPerNic = static_cast<int>(
       params[0].h_nicDeviceIbgdaResources[0].companionQps.size());
   for (int i = 0; i < numPeers; ++i) {
-    CHECK_EQ(params[i].maxGroups, params[0].maxGroups)
-        << "All peers must have the same maxGroups";
-    CHECK_EQ(params[i].qpsPerBlockPerNic, params[0].qpsPerBlockPerNic)
-        << "All peers must have the same qpsPerBlockPerNic";
+    CHECK_EQ(params[i].maxChannels, params[0].maxChannels)
+        << "All peers must have the same maxChannels";
+    CHECK_EQ(params[i].qpsPerConnection, params[0].qpsPerConnection)
+        << "All peers must have the same qpsPerConnection";
+    CHECK_EQ(params[i].qpDirectionCount, params[0].qpDirectionCount)
+        << "All peers must have the same qpDirectionCount";
     CHECK_EQ(
         static_cast<int>(params[i].h_nicDeviceIbgdaResources.size()), numNics)
         << "All peers must have the same numNics";
     for (int n = 0; n < numNics; ++n) {
       CHECK_EQ(
           static_cast<int>(params[i].h_nicDeviceIbgdaResources[n].qps.size()),
-          params[i].maxGroups * params[i].qpsPerBlockPerNic)
-          << "Main QP count must equal maxGroups * qpsPerBlockPerNic";
+          params[i].maxChannels * params[i].qpDirectionCount *
+              params[i].qpsPerConnection)
+          << "Main QP count must equal maxChannels * qpDirectionCount * "
+             "qpsPerConnection";
       CHECK_EQ(
           static_cast<int>(
               params[i].h_nicDeviceIbgdaResources[n].companionQps.size()),
-          params[i].maxGroups)
-          << "Companion QP count must equal maxGroups";
+          params[i].maxChannels * params[i].qpDirectionCount *
+              params[i].qpsPerConnection)
+          << "Companion QP count must equal maxChannels * qpDirectionCount * "
+             "qpsPerConnection";
       CHECK_EQ(
           static_cast<int>(params[i].h_nicDeviceIbgdaResources[n].qps.size()),
           mainQpsPerNic)
@@ -124,16 +130,30 @@ P2pIbgdaTransportDevice* buildDeviceTransportsOnGpu(
 
   // 3. Build transport objects pointing into the contiguous
   // NicDeviceIbgdaResources array.
-  IbgdaBlockQpState* d_allBlockQpState = nullptr;
+  IbLocalChannel* d_allLocalChannels = nullptr;
   std::size_t blockStateBytes = static_cast<std::size_t>(numPeers) *
-      params[0].maxGroups * sizeof(IbgdaBlockQpState);
-  err = cudaMalloc(&d_allBlockQpState, blockStateBytes);
+      params[0].maxChannels * sizeof(IbLocalChannel);
+  err = cudaMalloc(&d_allLocalChannels, blockStateBytes);
   CHECK(err == cudaSuccess)
-      << "Failed to allocate GPU block QP state: " << cudaGetErrorString(err);
-  outGpuAllocations.push_back(d_allBlockQpState);
-  err = cudaMemset(d_allBlockQpState, 0, blockStateBytes);
-  CHECK(err == cudaSuccess)
-      << "Failed to zero GPU block QP state: " << cudaGetErrorString(err);
+      << "Failed to allocate GPU IB channel state: " << cudaGetErrorString(err);
+  outGpuAllocations.push_back(d_allLocalChannels);
+  std::vector<IbLocalChannel> h_localChannels(
+      static_cast<std::size_t>(numPeers) * params[0].maxChannels);
+  for (int i = 0; i < numPeers; ++i) {
+    for (int channel = 0; channel < params[i].maxChannels; ++channel) {
+      const auto channelIndex =
+          static_cast<std::size_t>(i) * params[0].maxChannels + channel;
+      h_localChannels[channelIndex] =
+          makeIbLocalChannel(params[i].channelLayout, channel);
+    }
+  }
+  err = cudaMemcpy(
+      d_allLocalChannels,
+      h_localChannels.data(),
+      blockStateBytes,
+      cudaMemcpyHostToDevice);
+  CHECK(err == cudaSuccess) << "Failed to initialize GPU IB channel state: "
+                            << cudaGetErrorString(err);
 
   std::vector<P2pIbgdaTransportDevice> h_transports;
   h_transports.reserve(numPeers);
@@ -147,11 +167,13 @@ P2pIbgdaTransportDevice* buildDeviceTransportsOnGpu(
         params[i].counterBuf,
         params[i].numSignalSlots,
         params[i].numCounterSlots,
-        params[i].maxGroups,
-        params[i].qpsPerBlockPerNic,
-        DeviceSpan<IbgdaBlockQpState>(
-            d_allBlockQpState + i * params[i].maxGroups, params[i].maxGroups),
-        params[i].sendRecvState);
+        params[i].maxChannels,
+        params[i].qpsPerConnection,
+        params[i].qpDirectionCount,
+        DeviceSpan<IbLocalChannel>(
+            d_allLocalChannels + i * params[i].maxChannels,
+            params[i].maxChannels),
+        params[i].channelLayout);
   }
 
   // 4. Allocate and copy transport objects to GPU.
@@ -242,16 +264,26 @@ void writeDeviceTransportSlot(
       << "Failed to copy per-peer NicDeviceIbgdaResources to GPU: "
       << cudaGetErrorString(err);
 
-  IbgdaBlockQpState* d_blockQpState = nullptr;
+  IbLocalChannel* d_localChannels = nullptr;
   std::size_t blockStateBytes =
-      static_cast<std::size_t>(params.maxGroups) * sizeof(IbgdaBlockQpState);
-  err = cudaMalloc(&d_blockQpState, blockStateBytes);
-  CHECK(err == cudaSuccess) << "Failed to allocate per-peer block QP state: "
+      static_cast<std::size_t>(params.maxChannels) * sizeof(IbLocalChannel);
+  err = cudaMalloc(&d_localChannels, blockStateBytes);
+  CHECK(err == cudaSuccess) << "Failed to allocate per-peer IB channel state: "
                             << cudaGetErrorString(err);
-  outGpuAllocations.push_back(d_blockQpState);
-  err = cudaMemset(d_blockQpState, 0, blockStateBytes);
+  outGpuAllocations.push_back(d_localChannels);
+  std::vector<IbLocalChannel> h_localChannels(params.maxChannels);
+  for (int channel = 0; channel < params.maxChannels; ++channel) {
+    h_localChannels[channel] =
+        makeIbLocalChannel(params.channelLayout, channel);
+  }
+  err = cudaMemcpy(
+      d_localChannels,
+      h_localChannels.data(),
+      blockStateBytes,
+      cudaMemcpyHostToDevice);
   CHECK(err == cudaSuccess)
-      << "Failed to zero per-peer block QP state: " << cudaGetErrorString(err);
+      << "Failed to initialize per-peer IB channel state: "
+      << cudaGetErrorString(err);
 
   P2pIbgdaTransportDevice hostTransport(
       DeviceSpan<NicDeviceIbgdaResources>(d_nicResources, numNics),
@@ -260,10 +292,11 @@ void writeDeviceTransportSlot(
       params.counterBuf,
       params.numSignalSlots,
       params.numCounterSlots,
-      params.maxGroups,
-      params.qpsPerBlockPerNic,
-      DeviceSpan<IbgdaBlockQpState>(d_blockQpState, params.maxGroups),
-      params.sendRecvState);
+      params.maxChannels,
+      params.qpsPerConnection,
+      params.qpDirectionCount,
+      DeviceSpan<IbLocalChannel>(d_localChannels, params.maxChannels),
+      params.channelLayout);
 
   err = cudaMemcpy(
       deviceArray + peerIndex,

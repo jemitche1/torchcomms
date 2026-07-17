@@ -5,6 +5,8 @@
 #include <cstddef>
 #include "comms/ctran/algos/AllToAll/Types.h"
 #include "comms/ctran/algos/CtranAlgoDev.h"
+#include "comms/ctran/algos/common/GpeRing.h"
+#include "comms/prims/core/TiledBuffer.cuh"
 #include "comms/prims/core/Timeout.cuh"
 #include "comms/prims/memory/DeviceSpan.cuh"
 #include "comms/prims/transport/Transport.cuh"
@@ -40,11 +42,23 @@ __device__ __forceinline__ void send_peer(
       transport.p2p_nvl.ll128_send_group(
           group, const_cast<char*>(src), bytes, timeout);
     } else {
-      transport.p2p_nvl.send_group(
-          group, const_cast<char*>(src), bytes, timeout);
+      comms::prims::TiledBuffer<char> tiles(
+          const_cast<char*>(src), bytes, group);
+      transport.p2p_nvl.send(
+          group,
+          tiles.tile_data(group.group_id),
+          tiles.tile_bytes(group.group_id),
+          /*max_signal_bytes=*/0,
+          timeout);
     }
   } else {
-    transport.p2p_nvl.send_group(group, const_cast<char*>(src), bytes, timeout);
+    comms::prims::TiledBuffer<char> tiles(const_cast<char*>(src), bytes, group);
+    transport.p2p_nvl.send(
+        group,
+        tiles.tile_data(group.group_id),
+        tiles.tile_bytes(group.group_id),
+        /*max_signal_bytes=*/0,
+        timeout);
   }
 }
 
@@ -63,16 +77,28 @@ __device__ __forceinline__ void recv_peer(
     if (use_ll128) {
       transport.p2p_nvl.ll128_recv_group(group, dst, bytes, timeout);
     } else {
-      transport.p2p_nvl.recv_group(group, dst, bytes, timeout);
+      comms::prims::TiledBuffer<char> tiles(dst, bytes, group);
+      transport.p2p_nvl.recv(
+          group,
+          tiles.tile_data(group.group_id),
+          tiles.tile_bytes(group.group_id),
+          /*max_signal_bytes=*/0,
+          timeout);
     }
   } else {
-    transport.p2p_nvl.recv_group(group, dst, bytes, timeout);
+    comms::prims::TiledBuffer<char> tiles(dst, bytes, group);
+    transport.p2p_nvl.recv(
+        group,
+        tiles.tile_data(group.group_id),
+        tiles.tile_bytes(group.group_id),
+        /*max_signal_bytes=*/0,
+        timeout);
   }
 }
 
 template <PipeProtocol Proto>
 __global__ void ncclKernelDeviceAllToAllvPipes(
-    int* /* flag */,
+    ctran::gpe::KernelFlagDev* /* flag */,
     CtranAlgoDeviceState* /* devState */,
     ctran::device_alltoallv_pipes::KernArgs args) {
   const int nLocalRanks = args.nLocalRanks;
@@ -162,12 +188,12 @@ __global__ void ncclKernelDeviceAllToAllvPipes(
 
 // Explicit template instantiations for both protocols.
 template __global__ void ncclKernelDeviceAllToAllvPipes<PipeProtocol::Simple>(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::device_alltoallv_pipes::KernArgs args);
 
 template __global__ void ncclKernelDeviceAllToAllvPipes<PipeProtocol::LL128>(
-    int* flag,
+    ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     ctran::device_alltoallv_pipes::KernArgs args);
 

@@ -28,10 +28,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup conda env
-        uses: conda-incubator/setup-miniconda@v2
+        uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5 # v4
         with:
           miniconda-version: "latest"
-          conda-version: "25.11.1"
           activate-environment: test
           python-version: '3.14'
           auto-activate: false
@@ -53,7 +52,7 @@ jobs:
           set -eux
 
           conda install -y git
-          conda install -y -c conda-forge glog==0.4.0 gflags fmt
+          conda install -y -c conda-forge glog==0.4.0 gflags==2.2.2 fmt==12.2.0
           pip install cmake==3.31.6
           export USE_NCCL=0
           export USE_NCCLX=0

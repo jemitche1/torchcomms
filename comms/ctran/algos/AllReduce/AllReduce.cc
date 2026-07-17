@@ -28,29 +28,11 @@ bool ctranAllReduceSupport(CtranComm* comm, enum NCCL_ALLREDUCE_ALGO algo) {
     case NCCL_ALLREDUCE_ALGO::ctran:
     case NCCL_ALLREDUCE_ALGO::ctdirect:
       return true;
-    case NCCL_ALLREDUCE_ALGO::ctree:
-      if (!NCCL_CTRAN_USE_PIPES) {
-        CLOGF(
-            WARN,
-            "ctree algo requires NCCL_CTRAN_USE_PIPES=1 for Pipes transports");
-        return false;
-      }
-      if (comm->statex_->nNodes() > 1 && !NCCL_CTRAN_IBGDA_SENDRECV_ENABLE) {
-        CLOGF(
-            WARN,
-            "ctree algo requires NCCL_CTRAN_IBGDA_SENDRECV_ENABLE=1 for inter-node IB transfers");
-        return false;
-      }
-      return true;
-    case NCCL_ALLREDUCE_ALGO::cthierarchical_ring:
-      // The real support predicate and implementation land in the next stacked
-      // diff. Return false for now so explicit selection falls back at the
-      // McclComm layer (non-silent WARN) rather than reaching the
-      // not-yet-implemented stub.
-      CLOGF(
-          WARN,
-          "cthierarchical_ring algo is not yet implemented; falling back to baseline");
-      return false;
+    /*
+     * ctree and cthierarchical_ring are hosted by MCCL (McclComm routes those
+     * NCCL_ALLREDUCE_ALGO values to the MCCL-owned fused collectives); CTRAN no
+     * longer implements them.
+     */
     default: // invalid query
       return false;
   }
@@ -88,12 +70,10 @@ commResult_t ctranAllReduce(
       }
       return ctranAllReduceRing(
           sendbuff, recvbuff, count, datatype, redOp, comm, stream, timeout);
-    case NCCL_ALLREDUCE_ALGO::ctree:
-      return ctranAllReduceTree(
-          sendbuff, recvbuff, count, datatype, redOp, comm, stream, timeout);
-    case NCCL_ALLREDUCE_ALGO::cthierarchical_ring:
-      return ctranAllReduceHierarchicalRing(
-          sendbuff, recvbuff, count, datatype, redOp, comm, stream, timeout);
+    /*
+     * ctree and cthierarchical_ring are hosted by MCCL now (see
+     * ctranAllReduceSupport); they never reach this dispatcher.
+     */
     case NCCL_ALLREDUCE_ALGO::ctdirect:
     default:
       return ctranAllReduceDirect(

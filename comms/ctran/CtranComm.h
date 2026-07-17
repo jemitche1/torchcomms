@@ -12,6 +12,8 @@
 #include <vector>
 
 #include <folly/Synchronized.h>
+#include <folly/container/F14Set.h>
+#include "comms/ctran/algos/PersistentCleanup.h"
 #include "comms/ctran/bootstrap/ICtranBootstrap.h"
 #include "comms/ctran/commstate/CommStateX.h"
 #include "comms/ctran/interfaces/ICtran.h"
@@ -34,13 +36,11 @@ using meta::comms::CommBackend;
 // -1 means use CVAR default.
 struct ctranPipesConfig {
   int64_t nvlChunkSize{-1};
-  int useDualStateBuffer{-1}; // -1=cvar, 0=single, 1=dual
   bool ibLazyConnect{false};
   int64_t ibgdaDataBufferSize{-1};
 
   bool operator==(const ctranPipesConfig& other) const {
     return nvlChunkSize == other.nvlChunkSize &&
-        useDualStateBuffer == other.useDualStateBuffer &&
         ibLazyConnect == other.ibLazyConnect &&
         ibgdaDataBufferSize == other.ibgdaDataBufferSize;
   }
@@ -174,6 +174,14 @@ class CtranComm {
   // initialized.
   comms::prims::Transport* getMultiPeerTransportsPtr() const;
 
+  // Lazy-safe overload: materializes `peers` (via get_device_handle(peers))
+  // and returns the Transport array pointer. Required in lazy-connect mode,
+  // where the no-arg overload throws. Non-const because materialization
+  // mutates transport state. An empty `peers` list materializes nothing and
+  // still returns a valid pointer (for ranks that use no IB slots).
+  comms::prims::Transport* getMultiPeerTransportsPtr(
+      const std::vector<int>& peers);
+
   // Returns a snapshot of the algo stats, or std::nullopt if stats are
   // disabled.
   std::optional<meta::comms::colltrace::AlgoStatDump> dumpAlgoStats() const;
@@ -224,10 +232,12 @@ class CtranComm {
   std::shared_ptr<meta::comms::colltrace::ICollTrace> colltraceNew_;
   std::shared_ptr<ncclx::memory::memCacheAllocator> memCache_;
   std::unique_ptr<ncclx::CommStateX> statex_;
+  // AMD carve-out only: ENABLE_PRIMS is on for every non-AMD build (see
+  // comms/ctran/def_build.bzl), so these members exist everywhere except AMD.
+  // The guard changes CtranComm's layout, so consumers must compile with a
+  // consistent macro (the OSS build propagates it via MCCL_ENABLE_PRIMS).
 #if defined(ENABLE_PRIMS)
   std::unique_ptr<comms::prims::MultiPeerTransport> multiPeerTransport_;
-  uint64_t* hierarchicalAgReadyCounters_{nullptr};
-  size_t hierarchicalAgReadyCounterCount_{0};
   std::unique_ptr<comms::prims::PipesTrace> pipesTrace_;
 #endif // defined(ENABLE_PRIMS)
 
@@ -252,6 +262,18 @@ class CtranComm {
   };
   CudagraphDeferredCleanup cudagraphDeferredCleanup;
 
+  // Registry of persistent-request cleanup tokens (see PersistentCleanup.h).
+  // Each token releases one persistent request's pooled GpeKernelSync
+  // (pipeSync) + scoped registration. destroy() drains this set (running each
+  // token once) BEFORE ctran_.reset() -> CtranGpe::terminate(), guaranteeing
+  // every pooled pipeSync is returned before terminate()'s pool-drain
+  // spin-wait -- no matter which teardown path (eager free, graph-destroy
+  // callback, comm cleanup) fires first.
+  void registerPersistentCleanup(std::shared_ptr<PersistentCleanup> cleanup);
+  void unregisterPersistentCleanup(
+      const std::shared_ptr<PersistentCleanup>& cleanup);
+  void drainPersistentCleanups();
+
  private:
   friend class CtranGpe;
   friend commResult_t ctranInit(
@@ -275,4 +297,7 @@ class CtranComm {
   std::shared_ptr<AsyncError> asyncErr_;
   std::shared_ptr<Abort> abort_;
   uint64_t ctranOpCount_{0};
+
+  folly::Synchronized<folly::F14FastSet<std::shared_ptr<PersistentCleanup>>>
+      persistentCleanups_;
 };

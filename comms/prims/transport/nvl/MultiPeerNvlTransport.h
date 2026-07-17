@@ -2,12 +2,17 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstddef>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <string>
 
 #include "comms/common/bootstrap/IBootstrap.h"
 #include "comms/prims/memory/GpuMemHandler.h"
 #include "comms/prims/transport/Transport.cuh"
+#include "comms/prims/transport/nvl/MultimemNvlTransport.h"
 #include "comms/prims/transport/nvl/P2pNvlTransportDevice.cuh"
 #include "comms/prims/transport/self/P2pSelfTransportDevice.cuh"
 // On AMD, `meta::comms::DeviceBuffer` is provided by
@@ -21,6 +26,8 @@
 
 namespace comms::prims {
 
+constexpr std::size_t kDefaultNvlPerChannelSize = 512ULL * 1024;
+
 // Forward declarations for multi-peer device transport types
 struct Transport;
 
@@ -29,26 +36,19 @@ struct Transport;
  *
  * IMPORTANT: All ranks must use identical configuration values.
  *
- * Memory per rank = (nRanks - 1) × pipelineDepth × dataBufferSize
+ * For the fixed-channel tile protocol:
+ *   one channel window = perChannelSize
+ *   one channel chunk = perChannelSize / pipelineDepth
+ *
+ * Memory per rank = (nRanks - 1) * maxNumChannels * perChannelSize
  */
 struct MultiPeerNvlTransportConfig {
-  // Size of staging buffer per pipeline slot (bytes).
-  // Larger transfers split into multiple steps of this size.
-  // Typical: 1-256 MB depending on message sizes.
-  std::size_t dataBufferSize{0};
-
-  // Chunk size for parallel processing (bytes).
-  // Smaller = more parallelism, larger = less sync overhead.
-  // Should be multiple of 16 bytes. Typical: 8 KB - 4 MB.
-  std::size_t chunkSize{0};
-
-  // Number of pipeline slots for overlapping communication.
+  // Number of slots/chunks within one channel.
   // Higher = better latency hiding but more memory.
   // Typical: 2-4 for most workloads.
   std::size_t pipelineDepth{0};
 
   // Number of P2P signal slots per peer for chunk-level pipeline coordination.
-  // Used by signalBufferHandler_ and P2pNvlTransportDevice for send()/recv().
   // This is separate from WindowConfig.peerSignalCount (inbox model).
   // Typical: 1-num of blocks for most workloads.
   std::size_t p2pSignalCount{1};
@@ -59,42 +59,14 @@ struct MultiPeerNvlTransportConfig {
   // Typical: 1 for tile sendrecv dynamic block count support.
   std::size_t p2pBarrierCount{0};
 
-  // Maximum block count for the tile sendrecv protocol.
-  // Allocates persistent step state and dedicated tile signals internally.
+  // Maximum number of channels for the tile sendrecv protocol.
+  // Allocates one NvlChannelState per channel per peer (cursors + signals).
   // send/recv use these without user-managed state.
-  int tile_max_groups{128};
+  int maxNumChannels{64};
 
-  // If true, use dual chunk state buffers (one on each side) for local polling
-  // on both sender and receiver. If false (default), use single chunk state
-  // buffer on receiver side only.
-  //
-  // Single State Mode (default):
-  //   - 1 ChunkState per chunk, stored on receiver side
-  //   - Sender polls over NVLink (slower), receiver polls locally (faster)
-  //   - Lower memory usage
-  //
-  // Dual State Mode:
-  //   - 2 ChunkStates per chunk: receiverState (for data-ready signal),
-  //     senderState (for ready-to-send signal)
-  //   - Both sender and receiver poll locally (faster on both sides)
-  //   - Higher memory usage, better performance for high-throughput workloads
-  //
-  // DUAL STATE MODE - STATE MACHINE:
-  //   Sender: poll local senderState for READY_TO_SEND → send data →
-  //           mark local senderState as UNREADY → signal receiver's
-  //           receiverState
-  //   Receiver: poll local receiverState for stepId → read data →
-  //           mark local receiverState as UNREADY → signal sender's senderState
-  //                                                  as READY_TO_SEND
-  //
-  // DUAL STATE MODE - STRIDED CHUNK ASSIGNMENT REQUIREMENT:
-  //   Dual state mode MUST use for_each_item_strided for chunk
-  //   distribution. The UNREADY state uses plain write + group.sync() for
-  //   efficiency (st.release.gpu is too slow). This write is only visible
-  //   within the same thread group. Strided ensures chunk K is ALWAYS
-  //   assigned to group (K % total_groups), making the unready write visible
-  //   after group.sync().
-  bool useDualStateBuffer{false};
+  // Total staging window size for one channel (bytes).
+  // Must be 16-byte aligned when maxNumChannels > 0.
+  std::size_t perChannelSize{kDefaultNvlPerChannelSize};
 
   // Size of LL128 packet buffer per peer (bytes).
   // When > 0, allocates LL128 buffers and enables
@@ -113,6 +85,15 @@ struct MultiPeerNvlTransportConfig {
   // keeps the default behavior: fabric handles when available, cudaIpc
   // otherwise.
   std::optional<MemSharingMode> memSharingMode;
+
+  // NVLS multicast: when true, the transport composes an internal
+  // MultimemNvlTransport (from `multimem` below) and reports it via
+  // hasMultimemNvlTransport(). The actual multicast setup runs lazily on the
+  // first getMultimemNvlTransportDevice() call, and only when the device
+  // supports multimem and the NVL team has more than two ranks. `multimem` is
+  // ignored unless `enableMultimem` is true.
+  bool enableMultimem{false};
+  MultimemNvlTransportConfig multimem;
 };
 
 /**
@@ -127,8 +108,9 @@ struct MultiPeerNvlTransportConfig {
  *   buffer region that this rank writes into via NVLink.
  *
  * SIZE REQUIREMENTS:
- *   Each per-peer buffer must be at least (pipelineDepth * dataBufferSize)
- *   bytes, matching the config passed to MultiPeerNvlTransport.
+ *   Each per-peer buffer must be at least
+ *   (maxNumChannels * perChannelSize) bytes, matching the config passed to
+ *   MultiPeerNvlTransport.
  *   setExternalDataBuffers() validates this and throws on mismatch.
  *
  * OWNERSHIP:
@@ -259,6 +241,10 @@ class MultiPeerNvlTransport {
    *    preallocated device array (allocated in constructor)
    * 3. Implicit barrier ensures all ranks complete before returning
    *
+   * Optional multimem NVL setup is not performed here; it is a separate
+   * collective operation triggered by getMultimemNvlTransportDevice() so
+   * non-multimem collectives do not pay the multicast allocation cost.
+   *
    * The type of handle (fabric or cudaIpc) depends on the automatically
    * detected memory sharing mode.
    *
@@ -337,6 +323,21 @@ class MultiPeerNvlTransport {
    */
   DeviceSpan<Transport> getDeviceTransports();
 
+  // Cheap local check for whether multimem NVL was configured and appears
+  // usable on this rank. This does not perform the collective multimem setup;
+  // the first getMultimemNvlTransportDevice() call initializes it lazily.
+  bool hasMultimemNvlTransport() const;
+
+  /**
+   * getMultimemNvlTransportDevice - Get the lazily initialized NVLS device
+   * transport.
+   *
+   * PRECONDITION: All ranks that may use this multimem collective must call
+   * this method in the same order. The first call performs a collective
+   * eligibility check, multicast memory setup, and exchange.
+   */
+  MultimemNvlTransportDevice getMultimemNvlTransportDevice() const;
+
   /**
    * Check if fabric-based transport is supported (H100+, CUDA 12.3+).
    *
@@ -366,6 +367,10 @@ class MultiPeerNvlTransport {
   // Initialize transports array on device (both P2P and SELF transports)
   void initializeTransportsArray();
 
+  // Lazily construct and exchange the multimem NVL transport. This is a
+  // collective operation across the MultiPeerNvlTransport ranks.
+  void initializeMultimemNvlTransport() const;
+
   // ==========================================================================
   // Member variables
   // ==========================================================================
@@ -375,12 +380,11 @@ class MultiPeerNvlTransport {
   std::shared_ptr<meta::comms::IBootstrap> bootstrap_;
   const MultiPeerNvlTransportConfig config_;
 
-  // GpuMemHandler-based memory for data, state, signal, and LL128 buffers
+  // GpuMemHandler-based memory for data, signal, and LL128 buffers
   // Automatically uses fabric handles on H100+/CUDA12.3+, falls back to cudaIpc
   // dataBufferHandler_ is only allocated when external data buffers are NOT
   // used. It is allocated lazily in exchange() rather than in the constructor.
   std::unique_ptr<GpuMemHandler> dataBufferHandler_;
-  std::unique_ptr<GpuMemHandler> stateBufferHandler_;
   std::unique_ptr<GpuMemHandler> signalBufferHandler_;
   std::unique_ptr<GpuMemHandler>
       ll128BufferHandler_; // nullptr when ll128BufferSize == 0
@@ -388,6 +392,27 @@ class MultiPeerNvlTransport {
       barrierBufferHandler_; // nullptr when p2pBarrierCount == 0
   std::unique_ptr<GpuMemHandler>
       llBufferHandler_; // nullptr when llBufferSize == 0
+  mutable std::unique_ptr<MultimemNvlTransport> multimemNvlTransport_;
+  // Latched to true when we know multimem NVL cannot succeed on this comm:
+  // eligibility failed on some rank, or the multicast handle exchange() failed.
+  // Terminal -- subsequent calls throw the cached reason from
+  // `multimemNvlErrorMessage_` without re-attempting the collective. The
+  // eligibility allGather returning non-zero is intentionally NOT latched (it
+  // can be transient and is retry-safe) so callers can retry.
+  // `std::atomic` because `hasMultimemNvlTransport()` reads it on the fast path
+  // without holding `multimemInitMutex_`, while the init path stores under it.
+  mutable std::atomic<bool> multimemNvlUnavailable_{false};
+  // Preserved reason for the terminal-failure throw so debuggers see the
+  // original cause (e.g. "not eligible on all ranks") on every subsequent
+  // call, not a generic "not available".
+  mutable std::string multimemNvlErrorMessage_;
+  // Guards `initializeMultimemNvlTransport()` against concurrent callers on
+  // the same rank: only one thread performs the eligibility allGather +
+  // multimem exchange; other concurrent threads block and use the cached
+  // result. Without this, two same-rank threads could each drive an
+  // allGather while other ranks only participate once, deadlocking the
+  // collective.
+  mutable std::mutex multimemInitMutex_;
 
   // External data buffer pointers (set via setExternalDataBuffers()).
   // When set, exchange() skips data buffer allocation/exchange.
@@ -399,18 +424,18 @@ class MultiPeerNvlTransport {
   std::unique_ptr<meta::comms::DeviceBuffer> transportsDevice_;
 
   // Per-peer buffer sizes for offset calculation
+  std::size_t dataBufferSize_{0};
   std::size_t perPeerDataBufferSize_{0};
-  std::size_t perPeerChunkStateBufferSize_{0};
   std::size_t perPeerSignalBufferSize_{0};
   std::size_t perPeerLl128BufferSize_{0};
   std::size_t perPeerBarrierBufferSize_{0};
 
-  // Tile protocol state (allocated when tile_max_groups > 0)
-  std::unique_ptr<meta::comms::DeviceBuffer>
-      tileStepStateBuffer_; // not exchanged
-  std::unique_ptr<GpuMemHandler>
-      tileSignalHandler_; // 2*maxBlocks signals, exchanged
-  std::size_t perPeerTileSignalSize_{0};
+  // Per-peer NvlChannelState arrays (length = maxNumChannels per peer).
+  // The whole buffer is IPC-exchanged: the remote sender writes data_ready into
+  // this rank's local endpoint, and the remote receiver writes slot_free.
+  // Allocated when maxNumChannels > 0.
+  std::unique_ptr<GpuMemHandler> channelStateHandler_;
+  std::size_t perPeerChannelStateSize_{0};
   std::size_t perPeerLlBufferSize_{0};
 
   // Flag to track if multi-peer device arrays have been initialized

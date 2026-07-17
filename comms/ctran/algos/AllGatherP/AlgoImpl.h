@@ -1,15 +1,11 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #pragma once
-#include <memory>
 
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/algos/AllGatherP/Types.h"
+#include "comms/ctran/algos/CtranAlgo.h"
 #include "comms/ctran/utils/Checks.h"
-
-namespace ctran {
-struct CtranWin;
-}
 
 namespace ctran::allgatherp {
 
@@ -17,16 +13,10 @@ class AlgoImpl {
  public:
   PersistArgs pArgs;
 
-  // Local-NVL window + split subcomm for the windowed-capture path; null for
-  // the eager path. Freed in destroy().
-  ctran::CtranWin* nvlWin{nullptr};
-  std::shared_ptr<CtranComm> nvlComm;
-
   AlgoImpl(CtranComm* comm, cudaStream_t stream)
       : comm_(comm), stream_(stream) {};
-  ~AlgoImpl() {};
+  ~AlgoImpl();
 
-  commResult_t initialize();
   commResult_t destroy();
 
   // Execute the direct algorithm of allgatherP.
@@ -52,23 +42,6 @@ class AlgoImpl {
       const size_t count,
       const commDataType_t datatype);
 
-  // Execute the recursive-doubling algorithm of allgatherP.
-  // - Each rank copies its own chunk to every intra-node peer via NVL
-  //   CopyEngine as an initial broadcast.
-  // - Across the log2(nNodes) inter-node steps, each rank exchanges 2^step
-  //   chunks with its rail peer at distance (nNodes / 2^(step+1)) * nLocalRanks
-  //   using RDMA. Local ranks on a node stripe their IB traffic by column,
-  //   so each rail link carries an equal share of the node-level exchange.
-  // - After each inter-node step, the received chunks are broadcast across
-  //   intra-node peers via NVL CopyEngine so that every local rank holds the
-  //   union of data needed for the next step.
-  // - Requires nNodes to be a power of 2. nLocalRanks == 1 (e.g. nolocal)
-  //   skips the NVL broadcast stages.
-  commResult_t execRecursiveDoubling(
-      const void* sendbuff,
-      const size_t count,
-      const commDataType_t datatype);
-
   // Execute the streamed recursive-doubling algorithm of allgatherP.
   // - Uses the ctsrd plan on logical node IDs. Each local rank owns one rail
   //   column, so a logical node chunk maps to recvbuff[node * nLocalRanks +
@@ -88,8 +61,6 @@ class AlgoImpl {
         return "CtranAllGatherPDirect";
       case NCCL_ALLGATHER_P_ALGO::ctpipeline:
         return "CtranAllGatherPPipeline";
-      case NCCL_ALLGATHER_P_ALGO::ctrdpipeline:
-        return "CtranAllGatherPRecDbl";
       case NCCL_ALLGATHER_P_ALGO::ctsrdpipeline:
         return "CtranAllGatherPStreamedRd";
       default:
@@ -100,18 +71,30 @@ class AlgoImpl {
   // Allocate pipeSync and other internal resources.
   commResult_t initResources();
 
- private:
   // Wait till either the async initialization is done or hit async error.
-  // It is called before execution scheduling any CE copy to the stream.
+  // Called before exec schedules any CE copy to the stream, and by
+  // createPersistentRequest for the synchronous (graph-capture) init path.
   inline commResult_t waitInit() {
-    while (!pArgs.initialized.load()) {
+    while (pArgs.initState.load() != InitState::kInitialized) {
       FB_COMMCHECK(comm_->getAsyncResult());
     }
     return commSuccess;
   }
 
+ private:
   Resource resource_;
   CtranComm* comm_{nullptr};
   cudaStream_t stream_{nullptr};
 };
+
+commResult_t createPersistentRequest(
+    CtranComm* comm,
+    cudaStream_t stream,
+    void* recvbuff,
+    size_t maxRecvCount,
+    commDataType_t datatype,
+    CtranPersistentRequest** out,
+    bool waitForInit);
+
+commResult_t destroyPersistentRequest(CtranPersistentRequest* const request);
 } // namespace ctran::allgatherp

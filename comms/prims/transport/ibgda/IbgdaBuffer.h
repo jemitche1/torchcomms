@@ -8,6 +8,7 @@
 
 #include <endian.h>
 
+#include "comms/prims/core/SignalState.cuh"
 #include "comms/prims/memory/DeviceSpan.cuh"
 #include "comms/prims/transport/amd/HipHostCompat.h"
 #include "comms/prims/transport/rdma/NicConstants.h"
@@ -303,10 +304,12 @@ struct IbgdaLocalBuffer {
 
   /**
    * Create a sub-buffer at the given byte offset.
-   * Propagates all NICs' lkeys.
+   * Propagates all NICs' lkeys. A null base stays null for optional buffers.
    */
   IBGDA_HOST_DEVICE IbgdaLocalBuffer subBuffer(std::size_t offset) const {
-    return IbgdaLocalBuffer(static_cast<char*>(ptr) + offset, lkey_per_device);
+    return IbgdaLocalBuffer(
+        ptr == nullptr ? nullptr : static_cast<char*>(ptr) + offset,
+        lkey_per_device);
   }
 };
 
@@ -330,10 +333,12 @@ struct IbgdaRemoteBuffer {
 
   /**
    * Create a sub-buffer at the given byte offset.
-   * Propagates all NICs' rkeys.
+   * Propagates all NICs' rkeys. A null base stays null for optional buffers.
    */
   IBGDA_HOST_DEVICE IbgdaRemoteBuffer subBuffer(std::size_t offset) const {
-    return IbgdaRemoteBuffer(static_cast<char*>(ptr) + offset, rkey_per_device);
+    return IbgdaRemoteBuffer(
+        ptr == nullptr ? nullptr : static_cast<char*>(ptr) + offset,
+        rkey_per_device);
   }
 };
 
@@ -435,62 +440,23 @@ enum class IbSendRecvProgressStage : uint8_t {
 
 } // namespace detail
 
-/**
- * IbSendRecvState — device-side state for pipelined RDMA send/recv.
- *
- * Holds all buffer handles and config needed by send/recv.
- * All physical memory is allocated by MultipeerIbgdaTransport on the host;
- * this struct contains only pointers/handles into those allocations.
- *
- * Buffer layout:
- *   sendStaging / recvStaging: pipelineDepth * dataBufferSize bytes each.
- *     Logically divided into pipelineDepth slots of dataBufferSize bytes.
- *     For one send()/recv() call, a caller chooses active_blocks
- *     (1 <= active_blocks <= maxGroups). Each slot is then partitioned into
- *     active_blocks per-block regions:
- *       perBlockSlot = (dataBufferSize / active_blocks) & ~15ULL
- *     If max_signal_bytes is smaller than perBlockSlot, each per-block region
- *     is further subdivided into signaled sub-chunks:
- *       chunkSize = floor16(min(perBlockSlot, max_signal_bytes))
- *     state[].nextStep counts 16-byte-aligned protocol bytes, not sub-chunks,
- *     so max_signal_bytes may change between calls as long as active_blocks is
- *     unchanged.
- *
- *   signalBuf: 2 * maxGroups * sizeof(uint64_t).
- *     [0, maxGroups)             — DATA_READY (sender -> receiver)
- *     [maxGroups, 2*maxGroups)   — SLOT_FREE (receiver -> sender)
- *
- *   counterBuf: maxGroups * sizeof(uint64_t).
- *     [0, maxGroups)             — NIC_DONE counters (loopback atomic)
- *
- *   state: 2 * maxGroups ProgressSlot entries.
- *     [0, maxGroups)             — sender state slots
- *     [maxGroups, 2*maxGroups)   — receiver state slots
- *
- *     nextStep is the persistent protocol-byte cursor used by both blocking
- *     and async send/recv APIs. The active* fields describe at most one
- *     outstanding async progress operation or blocking call in that
- *     direction/group.
- *     Static transfer geometry is passed to init/progress calls and computed
- *     in registers.
- */
-struct IbSendRecvState {
-  /**
-   * Internal protocol state for one transport-owned send/recv direction.
-   *
-   * The state is indexed by direction and transport group. `nextStep` is the
-   * shared byte-stream cursor used by blocking send/recv and async init.
-   * `activeBaseStep`, `activeNextByte`, and `activeStage` track the currently
-   * initialized async operation or a blocking call in progress, if any.
-   */
-  struct ProgressSlot {
-    int64_t nextStep{0};
-    std::size_t activeNextByte{0};
-    int64_t activeBaseStep{0};
-    detail::IbSendRecvProgressStage activeStage{
-        detail::IbSendRecvProgressStage::Done};
-  };
+struct IbChannelProgress {
+  int64_t nextStep{0};
+  std::size_t activeNextByte{0};
+  std::size_t activeTailPadding{0};
+  int64_t activeBaseStep{0};
+  detail::IbSendRecvProgressStage activeStage{
+      detail::IbSendRecvProgressStage::Done};
+};
 
+inline constexpr std::size_t kSendRecvSignalSlotStride = sizeof(SignalState);
+
+IBGDA_HOST_DEVICE inline std::size_t sendRecvSignalSlotOffset(int slot) {
+  assert(slot >= 0);
+  return static_cast<std::size_t>(slot) * kSendRecvSignalSlotStride;
+}
+
+struct IbChannelLayout {
   IbgdaLocalBuffer
       sendStagingBuf; ///< Registered sendStaging (lkey for put src)
   IbgdaRemoteBuffer recvStagingBuf; ///< Peer's recvStaging (rkey for put dst)
@@ -502,10 +468,156 @@ struct IbSendRecvState {
   IbgdaRemoteBuffer remoteSignalBuf; ///< Peer's signal inbox
   IbgdaLocalBuffer localCounterBuf; ///< GPU-readable NIC_DONE counter inbox
   IbgdaLocalBuffer localCounterCompletionBuf; ///< Transport completion target
-  DeviceSpan<ProgressSlot> state; ///< Protocol cursors + async state
-  int maxGroups{0}; ///< Layout size for signal/state arrays
-  int pipelineDepth{0}; ///< Number of pipeline slots in the ring
-  std::size_t dataBufferSize{0}; ///< Size of one pipeline slot in bytes
+  int maxChannels{0}; ///< Layout size for channel-indexed resources
+  int numLanes{1}; ///< QP lanes = numNics * qpsPerConnection; each lane owns a
+                   ///< single-writer DATA_READY slot per channel
+  int pipelineDepth{0}; ///< Number of slots/chunks in one channel
+  std::size_t perChannelSize{0}; ///< Backward-compatible channel window alias
+  std::size_t perChannelBufferSize{0}; ///< Total staging bytes for one channel
+
+  __host__ __device__ std::size_t data_buffer_size() const {
+    const std::size_t perChannel =
+        perChannelBufferSize != 0 ? perChannelBufferSize : perChannelSize;
+    return perChannel * static_cast<std::size_t>(maxChannels);
+  }
+
+  IBGDA_HOST_DEVICE int dataReadySignalSlot(int channelId) const {
+    return channelId * numLanes;
+  }
+
+  IBGDA_HOST_DEVICE int slotFreeSignalSlot(int channelId) const {
+    return numLanes * maxChannels + channelId;
+  }
+
+  IBGDA_HOST_DEVICE int counterSlot(int channelId) const {
+    return channelId;
+  }
+
+  IBGDA_HOST_DEVICE IbgdaLocalBuffer localDataReadySignal(int channelId) const {
+    return localSignalBuf.subBuffer(
+        sendRecvSignalSlotOffset(dataReadySignalSlot(channelId)));
+  }
+
+  IBGDA_HOST_DEVICE IbgdaRemoteBuffer
+  remoteDataReadySignal(int channelId) const {
+    return remoteSignalBuf.subBuffer(
+        sendRecvSignalSlotOffset(dataReadySignalSlot(channelId)));
+  }
+
+  IBGDA_HOST_DEVICE IbgdaLocalBuffer localSlotFreeSignal(int channelId) const {
+    return localSignalBuf.subBuffer(
+        sendRecvSignalSlotOffset(slotFreeSignalSlot(channelId)));
+  }
+
+  IBGDA_HOST_DEVICE IbgdaRemoteBuffer
+  remoteSlotFreeSignal(int channelId) const {
+    return remoteSignalBuf.subBuffer(
+        sendRecvSignalSlotOffset(slotFreeSignalSlot(channelId)));
+  }
+
+  IBGDA_HOST_DEVICE IbgdaLocalBuffer localCounter(int channelId) const {
+    return localCounterBuf.subBuffer(
+        sendRecvSignalSlotOffset(counterSlot(channelId)));
+  }
+
+  IBGDA_HOST_DEVICE IbgdaLocalBuffer
+  localCompletionCounter(int channelId) const {
+    return localCounterCompletionBuf.subBuffer(
+        sendRecvSignalSlotOffset(counterSlot(channelId)));
+  }
+
+  IBGDA_HOST_DEVICE SignalState* localSignalState(int slot) const {
+    return signalStateAt(localSignalBuf.ptr, slot);
+  }
+
+  IBGDA_HOST_DEVICE SignalState* localCounterState(int channelId) const {
+    return signalStateAt(localCounterBuf.ptr, counterSlot(channelId));
+  }
+
+ private:
+  IBGDA_HOST_DEVICE static SignalState* signalStateAt(void* base, int slot) {
+    if (base == nullptr) {
+      return nullptr;
+    }
+    return reinterpret_cast<SignalState*>(
+        static_cast<char*>(base) + sendRecvSignalSlotOffset(slot));
+  }
 };
+
+enum class IbDirection : uint8_t {
+  Send = 0,
+  Recv = 1,
+};
+
+inline constexpr int kIbDirections = 2;
+inline constexpr int kIbMaxQpLanesPerChannelDirection = 64;
+
+struct IbQpState {
+  uint32_t cursor{0};
+  uint64_t pendingFlushLanesMask{0};
+  uint64_t lastFlushWqe[kIbMaxQpLanesPerChannelDirection]{};
+};
+
+struct IbLocalChannel {
+  IbChannelProgress sendProgress;
+  IbChannelProgress recvProgress;
+
+  // Per-lane receiver DATA_READY bookkeeping for the round-robin send/recv
+  // protocol. On per-lane backends (IBGDA) the sender round-robins each chunk's
+  // RDMA_WRITE + DATA_READY atomic-FA across `numLanes` single-writer slots:
+  // chunk i rides lane `i % numLanes`, driven by the sender's free-running
+  // `IbQpState::cursor`. The receiver reconstructs chunk i's lane by mirroring
+  // that cursor in `recvDataReadyLaneCursor` (incremented once per received
+  // chunk) and waits on that lane's own slot rather than the summed cumulative,
+  // so a fast lane's later chunk cannot mask a slow lane's not-yet-landed data.
+  // `recvLaneExpected` holds each lane's running cumulative byte target
+  // (mirrors its DATA_READY slot); a running sum is required because chunks
+  // clamp at slot / stream boundaries and are not all `chunkSize`.
+  //
+  // Reset semantics (must stay aligned with the sender across peers):
+  //  - `recvDataReadyLaneCursor` mirrors the sender's `IbQpState::cursor`.
+  //    It is free-running and only zeroed at channel (re)construction — never
+  //    by the device reset kernel. Reset it only in lock-step with that cursor;
+  //    zeroing it on a partial reset would desync the round-robin lane mapping.
+  //  - `recvLaneExpected` mirrors the DATA_READY slots; zero it whenever those
+  //    slots are zeroed (channel construction AND the device reset kernel).
+  uint64_t recvDataReadyLaneCursor{0};
+  uint64_t recvLaneExpected[kIbMaxQpLanesPerChannelDirection]{};
+
+  IbgdaLocalBuffer dataReady;
+  IbgdaLocalBuffer slotFree;
+  IbgdaLocalBuffer nicDoneWait;
+  IbgdaLocalBuffer nicDoneCompletion;
+
+  IbQpState sendQp;
+  IbQpState recvQp;
+};
+
+struct IbRemoteChannel {
+  IbgdaRemoteBuffer dataReady;
+  IbgdaRemoteBuffer slotFree;
+  IbgdaRemoteBuffer recvStaging;
+};
+
+IBGDA_HOST_DEVICE inline IbLocalChannel makeIbLocalChannel(
+    const IbChannelLayout& layout,
+    int channelId) {
+  IbLocalChannel channel{};
+  channel.dataReady = layout.localDataReadySignal(channelId);
+  channel.slotFree = layout.localSlotFreeSignal(channelId);
+  channel.nicDoneWait = layout.localCounter(channelId);
+  channel.nicDoneCompletion = layout.localCompletionCounter(channelId);
+  return channel;
+}
+
+IBGDA_HOST_DEVICE inline IbRemoteChannel makeIbRemoteChannel(
+    const IbChannelLayout& layout,
+    int channelId) {
+  return IbRemoteChannel{
+      .dataReady = layout.remoteDataReadySignal(channelId),
+      .slotFree = layout.remoteSlotFreeSignal(channelId),
+      .recvStaging = layout.recvStagingBuf,
+  };
+}
 
 } // namespace comms::prims

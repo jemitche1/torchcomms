@@ -71,28 +71,40 @@ class P2pIbrcTransportDevice {
   __host__ __device__ P2pIbrcTransportDevice(
       DeviceSpan<IbrcCmdQueueDevice> queues,
       uint32_t nics,
-      uint32_t maxGroups,
-      uint32_t qpsPerBlockPerNic,
-      DeviceSpan<IbrcBlockQpState> blockQpState,
+      uint32_t maxChannels,
+      uint32_t qpsPerConnection,
+      DeviceSpan<IbLocalChannel> localChannels,
       IbgdaRemoteBuffer ownedRemoteSignalBuf = {},
       IbgdaLocalBuffer ownedLocalSignalBuf = {},
       IbgdaLocalBuffer ownedCounterDeviceBuf = {},
       IbgdaLocalBuffer ownedCounterHostBuf = {},
       int numSignalSlots = 0,
       int numCounterSlots = 0,
-      IbSendRecvState sendRecvState = {})
+      IbChannelLayout channelLayout = {})
       : cmdQueues(queues),
         numNics(nics),
-        maxGroups_(maxGroups),
-        qpsPerBlockPerNic_(qpsPerBlockPerNic),
-        blockQpState_(blockQpState),
+        maxChannels_(maxChannels),
+        qpsPerConnection_(qpsPerConnection),
+        localChannels_(localChannels),
         ownedRemoteSignalBuf_(ownedRemoteSignalBuf),
         ownedLocalSignalBuf_(ownedLocalSignalBuf),
         ownedCounterDeviceBuf_(ownedCounterDeviceBuf),
         ownedCounterHostBuf_(ownedCounterHostBuf),
         numSignalSlots_(numSignalSlots),
         numCounterSlots_(numCounterSlots),
-        sendRecv_(sendRecvState) {}
+        channelLayout_(channelLayout) {}
+
+  // IBRC round-robins each send/recv chunk's RDMA_WRITE + DATA_READY fetch-add
+  // across per-lane command queues / QPs when numLanes > 1 (select_put_queue_id
+  // -> seq % num_qp_lanes()), and, with signalPerLane set on the send/recv
+  // path, posts each chunk's DATA_READY fetch-add into that lane's own
+  // single-writer slot (see put()). The CPU proxy drains each command queue in
+  // FIFO order and posts the data write before the signal fetch-add on the same
+  // QP, so lane L's slot advances monotonically in lane-L chunk order. The
+  // receiver therefore waits on the specific lane that carried each chunk
+  // (mirroring the sender's round-robin cursor via recvDataReadyLaneCursor; see
+  // detail::wait_recv_data_ready), which removes the cross-lane hazard where a
+  // fast lane's later chunk masks a slow lane's not-yet-landed data.
 
   __device__ void put(
       ThreadGroup& group,
@@ -223,16 +235,20 @@ class P2pIbrcTransportDevice {
     return read_counter(counter_device_slot(counterId));
   }
 
+  // Public raw put/signal/flush/fence APIs default to the Send direction.
+  // Recv-direction operations are reserved for the send/recv protocol internals
+  // that explicitly pass IbDirection::Recv.
   __device__ void signal(
       ThreadGroup& group,
       const IbgdaRemoteBuffer& signalBuf,
-      uint64_t signalVal = 1) {
+      uint64_t signalVal = 1,
+      IbDirection direction = IbDirection::Send) {
     if (group.is_leader()) {
       if (signalBuf.ptr == nullptr) {
         trap("P2pIbrcTransportDevice: signal buffer is null");
       }
       validate_group_scope(group);
-      const uint32_t queueId = control_queue_id(group.block_id);
+      const uint32_t queueId = control_queue_id(group, direction);
       const uint32_t nicId = nic_for_queue(queueId);
       IbrcDesc desc{};
       desc.signal_addr = reinterpret_cast<uint64_t>(signalBuf.ptr);
@@ -248,9 +264,10 @@ class P2pIbrcTransportDevice {
 
   __device__ void signal(
       const IbgdaRemoteBuffer& signalBuf,
-      uint64_t signalVal = 1) {
+      uint64_t signalVal = 1,
+      IbDirection direction = IbDirection::Send) {
     ThreadGroup solo = make_thread_solo();
-    signal(solo, signalBuf, signalVal);
+    signal(solo, signalBuf, signalVal, direction);
   }
 
   __device__ void put(
@@ -261,7 +278,8 @@ class P2pIbrcTransportDevice {
       const IbgdaRemoteBuffer& signalBuf,
       uint64_t signalVal = 1,
       const IbgdaLocalBuffer& counterBuf = {},
-      uint64_t counterVal = 1) {
+      uint64_t counterVal = 1,
+      bool signalPerLane = false) {
     const bool hasData = nbytes > 0;
     const bool hasSignal = signalBuf.ptr != nullptr;
     const bool hasCounter = counterBuf.ptr != nullptr;
@@ -275,7 +293,9 @@ class P2pIbrcTransportDevice {
 
     if (group.is_leader()) {
       validate_group_scope(group);
-      const uint32_t queueId = select_put_queue_id(group.block_id);
+      const uint32_t queueId = select_put_queue_id(group, IbDirection::Send);
+      // queue_for_lane encodes the lane ordinal modulo the total lane count.
+      const uint32_t laneOrdinal = queueId % num_qp_lanes();
       const uint32_t nicId = nic_for_queue(queueId);
       IbrcDesc desc{};
       desc.op = static_cast<uint16_t>(hasData ? IbrcOp::PUT : IbrcOp::SIGNAL);
@@ -290,9 +310,22 @@ class P2pIbrcTransportDevice {
       }
 
       if (hasSignal) {
-        desc.signal_addr = reinterpret_cast<uint64_t>(signalBuf.ptr);
+        // Per-lane DATA_READY: when signalPerLane is set (the send/recv path),
+        // offset the signal target by this put's lane ordinal so each QP lane
+        // fetch-adds its own single-writer slot. The receiver mirrors the same
+        // round-robin cursor and waits on that lane's slot
+        // (detail::wait_recv_data_ready). Mirrors IBGDA put_impl's per-lane
+        // effectiveSignalBuf offset. laneOrdinal == 0 (including numLanes == 1)
+        // leaves the per-channel base slot, so raw put callers
+        // (signalPerLane == false) are unchanged.
+        const IbgdaRemoteBuffer effectiveSignalBuf = signalPerLane
+            ? signalBuf.subBuffer(
+                  sendRecvSignalSlotOffset(static_cast<int>(laneOrdinal)))
+            : signalBuf;
+        desc.signal_addr = reinterpret_cast<uint64_t>(effectiveSignalBuf.ptr);
         desc.signal_value = signalVal;
-        desc.signal_rkey_device_order = signalBuf.rkey_per_device[nicId].value;
+        desc.signal_rkey_device_order =
+            effectiveSignalBuf.rkey_per_device[nicId].value;
         desc.flags |= IBRC_HAS_SIGNAL | IBRC_SIGNAL_ADD;
       }
 
@@ -427,60 +460,93 @@ class P2pIbrcTransportDevice {
     return load_acquire_system_u64(counterBuf.ptr);
   }
 
-  __device__ void flush(ThreadGroup& group) {
+  __device__ void flush(
+      ThreadGroup& group,
+      IbDirection direction = IbDirection::Send) {
     if (group.is_leader()) {
       validate_group_scope(group);
-      drain_block_queues(group.block_id);
+      drain_channel_queues(group, direction);
     }
     group.sync();
   }
 
-  __device__ void flush() {
+  __device__ void flush(IbDirection direction = IbDirection::Send) {
     ThreadGroup solo = make_thread_solo();
-    flush(solo);
+    flush(solo, direction);
   }
 
-  __device__ void fence(ThreadGroup& group) {
-    flush(group);
+  __device__ void fence(
+      ThreadGroup& group,
+      IbDirection direction = IbDirection::Send) {
+    flush(group, direction);
   }
 
-  __device__ void fence() {
-    flush();
+  __device__ void fence(IbDirection direction = IbDirection::Send) {
+    flush(direction);
   }
 
   // ===========================================================================
-  // Pipelined send/recv — delegated to the shared IbSendRecvDevice.
+  // Pipelined send/recv — delegated to shared detail helpers.
   // ===========================================================================
   //
-  // The send/recv algorithm is transport-agnostic and lives in
-  // `IbSendRecvDevice` (P2pIbTransportDeviceDecl.cuh). Each method routes every
-  // transport op through `*this`, so IBRC reuses IBGDA's send/recv unchanged.
+  // The send/recv algorithm is transport-agnostic and lives in private helpers
+  // in P2pIbTransportDeviceDecl.cuh. The protocol state is owned by this
+  // backend device; each method routes every transport op through `*this`, so
+  // IBRC reuses IBGDA's send/recv unchanged.
 
-  __host__ __device__ const IbSendRecvState& send_recv_state() const {
-    return sendRecv_.send_recv_state();
+  __device__ __forceinline__ IbLocalChannel& local_channel(uint32_t channelId) {
+    validate_channel_id(channelId);
+    return localChannels_[channelId];
+  }
+
+  __device__ __forceinline__ IbLocalChannel& local_channel(ThreadGroup& group) {
+    return local_channel(group.group_id);
+  }
+
+  __host__ __device__ IbChannelLayout& channel_layout() {
+    return channelLayout_;
+  }
+
+  __host__ __device__ const IbChannelLayout& channel_layout() const {
+    return channelLayout_;
+  }
+
+  __device__ __forceinline__ std::size_t pipeline_window() const {
+    return channelLayout_.perChannelBufferSize != 0
+        ? channelLayout_.perChannelBufferSize
+        : channelLayout_.perChannelSize;
   }
 
   __device__ __forceinline__ std::size_t pipeline_window(
       int active_blocks) const {
-    return sendRecv_.pipeline_window(active_blocks);
+    (void)active_blocks;
+    return pipeline_window();
+  }
+
+  __device__ __forceinline__ int pipeline_depth() const {
+    return channelLayout_.pipelineDepth;
+  }
+
+  __device__ __forceinline__ std::size_t pipeline_chunk() const {
+    if (channelLayout_.pipelineDepth <= 0) {
+      return 0;
+    }
+    return pipeline_window() /
+        static_cast<std::size_t>(channelLayout_.pipelineDepth);
   }
 
   __device__ __forceinline__ void init_send_progress(
       ThreadGroup& group,
       std::size_t nbytes,
-      int active_blocks = 0,
       std::size_t max_signal_bytes = 0) {
-    sendRecv_.init_send_progress(
-        group, nbytes, active_blocks, max_signal_bytes);
+    detail::init_send_progress(*this, group, nbytes, max_signal_bytes);
   }
 
   __device__ __forceinline__ void init_recv_progress(
       ThreadGroup& group,
       std::size_t nbytes,
-      int active_blocks = 0,
       std::size_t max_signal_bytes = 0) {
-    sendRecv_.init_recv_progress(
-        group, nbytes, active_blocks, max_signal_bytes);
+    detail::init_recv_progress(*this, group, nbytes, max_signal_bytes);
   }
 
   template <typename CopyOp = Memcpy, typename... Args>
@@ -488,19 +554,11 @@ class P2pIbrcTransportDevice {
       ThreadGroup& group,
       const void* __restrict__ src,
       std::size_t nbytes,
-      int active_blocks = 0,
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    return sendRecv_.progress_send_once<P2pIbrcTransportDevice, CopyOp>(
-        *this,
-        group,
-        src,
-        nbytes,
-        active_blocks,
-        max_signal_bytes,
-        timeout,
-        args...);
+    return detail::progress_send_once<P2pIbrcTransportDevice, CopyOp>(
+        *this, group, src, nbytes, max_signal_bytes, timeout, args...);
   }
 
   template <typename CopyOp = Memcpy, typename... Args>
@@ -508,19 +566,11 @@ class P2pIbrcTransportDevice {
       ThreadGroup& group,
       void* __restrict__ dst,
       std::size_t nbytes,
-      int active_blocks = 0,
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    return sendRecv_.progress_recv_once<P2pIbrcTransportDevice, CopyOp>(
-        *this,
-        group,
-        dst,
-        nbytes,
-        active_blocks,
-        max_signal_bytes,
-        timeout,
-        args...);
+    return detail::progress_recv_once<P2pIbrcTransportDevice, CopyOp>(
+        *this, group, dst, nbytes, max_signal_bytes, timeout, args...);
   }
 
   template <typename CopyOp = Memcpy, typename... Args>
@@ -528,19 +578,11 @@ class P2pIbrcTransportDevice {
       ThreadGroup& group,
       const void* __restrict__ src,
       std::size_t nbytes,
-      int active_blocks = 0,
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    sendRecv_.send<P2pIbrcTransportDevice, CopyOp>(
-        *this,
-        group,
-        src,
-        nbytes,
-        active_blocks,
-        max_signal_bytes,
-        timeout,
-        args...);
+    detail::send<P2pIbrcTransportDevice, CopyOp>(
+        *this, group, src, nbytes, max_signal_bytes, timeout, args...);
   }
 
   template <typename CopyOp = Memcpy, typename... Args>
@@ -548,19 +590,11 @@ class P2pIbrcTransportDevice {
       ThreadGroup& group,
       void* __restrict__ dst,
       std::size_t nbytes,
-      int active_blocks = 0,
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    sendRecv_.recv<P2pIbrcTransportDevice, CopyOp>(
-        *this,
-        group,
-        dst,
-        nbytes,
-        active_blocks,
-        max_signal_bytes,
-        timeout,
-        args...);
+    detail::recv<P2pIbrcTransportDevice, CopyOp>(
+        *this, group, dst, nbytes, max_signal_bytes, timeout, args...);
   }
 
   template <typename CopyOp = Memcpy, typename... Args>
@@ -569,38 +603,29 @@ class P2pIbrcTransportDevice {
       void* __restrict__ dst,
       P2pIbrcTransportDevice& fwd,
       std::size_t nbytes,
-      int active_blocks = 0,
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    sendRecv_.forward<CopyOp>(
-        *this,
-        group,
-        dst,
-        fwd.sendRecv_,
-        fwd,
-        nbytes,
-        active_blocks,
-        max_signal_bytes,
-        timeout,
-        args...);
+    detail::forward<CopyOp>(
+        *this, group, dst, fwd, nbytes, max_signal_bytes, timeout, args...);
   }
 
  private:
   __device__ __forceinline__ uint32_t num_qp_lanes() const {
-    return numNics * qpsPerBlockPerNic_;
+    return numNics * qpsPerConnection_;
   }
 
   __device__ __forceinline__ uint32_t num_qps_per_peer_per_nic() const {
-    return maxGroups_ * qpsPerBlockPerNic_;
+    return maxChannels_ * kIbDirections * qpsPerConnection_;
   }
 
-  __device__ __forceinline__ void validate_block_id(uint32_t blockId) const {
+  __device__ __forceinline__ void validate_channel_id(
+      uint32_t channelId) const {
 #if PIPES_IS_DEVICE_COMPILE
     if (blockIdx.y != 0 || blockIdx.z != 0 || blockDim.y != 1 ||
         blockDim.z != 1) {
       printf(
-          "P2pIbrcTransportDevice: block-owned QP selection currently "
+          "P2pIbrcTransportDevice: channel QP selection currently "
           "supports only 1D grids and 1D thread blocks, got "
           "blockIdx=(%u,%u,%u) blockDim=(%u,%u,%u)\n",
           blockIdx.x,
@@ -615,16 +640,16 @@ class P2pIbrcTransportDevice {
     if (cmdQueues.empty()) {
       trap("P2pIbrcTransportDevice: no command queues");
     }
-    if (numNics == 0 || qpsPerBlockPerNic_ == 0 || maxGroups_ == 0 ||
-        blockQpState_.empty() || blockId >= maxGroups_) {
+    if (numNics == 0 || qpsPerConnection_ == 0 || maxChannels_ == 0 ||
+        localChannels_.empty() || channelId >= maxChannels_) {
       printf(
-          "P2pIbrcTransportDevice: invalid block-owned QP state block_id=%u "
-          "maxGroups=%u qpsPerBlockPerNic=%u numNics=%u stateSize=%u\n",
-          blockId,
-          maxGroups_,
-          qpsPerBlockPerNic_,
+          "P2pIbrcTransportDevice: invalid channel QP state channel_id=%u "
+          "maxChannels=%u qpsPerConnection=%u numNics=%u stateSize=%u\n",
+          channelId,
+          maxChannels_,
+          qpsPerConnection_,
           numNics,
-          static_cast<unsigned>(blockQpState_.size()));
+          static_cast<unsigned>(localChannels_.size()));
       PIPES_DEVICE_TRAP();
     }
   }
@@ -634,19 +659,32 @@ class P2pIbrcTransportDevice {
     if (group.scope == SyncScope::CLUSTER) {
       trap("P2pIbrcTransportDevice: cluster-scope ThreadGroup unsupported");
     }
-    validate_block_id(group.block_id);
+    validate_channel_id(group.group_id);
   }
 
-  __device__ __forceinline__ uint32_t
-  queue_for_lane(uint32_t blockId, uint32_t laneOrdinal) const {
-    validate_block_id(blockId);
+  __device__ __forceinline__ IbQpState& qp_state(
+      uint32_t channelId,
+      IbDirection direction) const {
+    validate_channel_id(channelId);
+    auto& channel = localChannels_[channelId];
+    return direction == IbDirection::Send ? channel.sendQp : channel.recvQp;
+  }
+
+  __device__ __forceinline__ uint32_t queue_for_lane(
+      uint32_t channelId,
+      IbDirection direction,
+      uint32_t laneOrdinal) const {
+    validate_channel_id(channelId);
     const uint32_t lanes = num_qp_lanes();
     if (laneOrdinal >= lanes) {
       trap("P2pIbrcTransportDevice: lane ordinal out of range");
     }
     const uint32_t nicId = laneOrdinal % numNics;
     const uint32_t qpIndex = laneOrdinal / numNics;
-    const uint32_t qpSlot = blockId * qpsPerBlockPerNic_ + qpIndex;
+    const uint32_t directionIndex = static_cast<uint32_t>(direction);
+    const uint32_t qpSlot =
+        ((channelId * kIbDirections + directionIndex) * qpsPerConnection_) +
+        qpIndex;
     if (qpSlot >= num_qps_per_peer_per_nic()) {
       trap("P2pIbrcTransportDevice: QP slot out of range");
     }
@@ -657,19 +695,27 @@ class P2pIbrcTransportDevice {
     return queueId;
   }
 
-  __device__ __forceinline__ uint32_t control_queue_id(uint32_t blockId) const {
-    return queue_for_lane(blockId, 0);
+  __device__ __forceinline__ uint32_t
+  control_queue_id(const ThreadGroup& group, IbDirection direction) const {
+    return queue_for_lane(group.group_id, direction, 0);
   }
 
-  __device__ __forceinline__ uint32_t select_put_queue_id(uint32_t blockId) {
-    validate_block_id(blockId);
+  // Selects the command queue for one data put. The Send cursor is advanced
+  // exactly once per data put here; control ops (signal / SLOT_FREE) use
+  // control_queue_id (lane 0) and never advance it, keeping the receiver's
+  // recvDataReadyLaneCursor mirror in lock-step. `numLanes == 1` stays on lane
+  // 0.
+  __device__ __forceinline__ uint32_t
+  select_put_queue_id(const ThreadGroup& group, IbDirection direction) {
+    const uint32_t channelId = group.group_id;
+    validate_channel_id(channelId);
     const uint32_t lanes = num_qp_lanes();
     if (lanes == 1) {
-      return control_queue_id(blockId);
+      return control_queue_id(group, direction);
     }
     const uint32_t seq =
-        fetch_add_system_u32(&blockQpState_[blockId].put_rr, 1U);
-    return queue_for_lane(blockId, seq % lanes);
+        fetch_add_system_u32(&qp_state(channelId, direction).cursor, 1U);
+    return queue_for_lane(channelId, direction, seq % lanes);
   }
 
   __device__ __forceinline__ uint32_t nic_for_queue(uint32_t queueId) const {
@@ -692,19 +738,26 @@ class P2pIbrcTransportDevice {
     }
   }
 
-  __device__ void drain_block_queues(uint32_t blockId) const {
-    validate_block_id(blockId);
+  __device__ void drain_channel_queues(
+      const ThreadGroup& group,
+      IbDirection direction) const {
+    const uint32_t channelId = group.group_id;
+    validate_channel_id(channelId);
     const uint32_t lanes = num_qp_lanes();
     for (uint32_t lane = 0; lane < lanes; ++lane) {
-      drain_queue(cmdQueues[queue_for_lane(blockId, lane)]);
+      drain_queue(cmdQueues[queue_for_lane(channelId, direction, lane)]);
     }
   }
 
-  __device__ void check_block_status(uint32_t blockId) const {
-    validate_block_id(blockId);
+  __device__ void check_channel_status(uint32_t channelId) const {
+    validate_channel_id(channelId);
     const uint32_t lanes = num_qp_lanes();
-    for (uint32_t lane = 0; lane < lanes; ++lane) {
-      check_status(cmdQueues[queue_for_lane(blockId, lane)]);
+    for (uint32_t dir = 0; dir < kIbDirections; ++dir) {
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        check_status(
+            cmdQueues[queue_for_lane(
+                channelId, static_cast<IbDirection>(dir), lane)]);
+      }
     }
   }
 
@@ -759,7 +812,7 @@ class P2pIbrcTransportDevice {
     if (group.is_leader()) {
       validate_group_scope(group);
       while (load_acquire_system_u64(ptr) < expected) {
-        check_block_status(group.block_id);
+        check_channel_status(group.group_id);
         if (timeout.checkExpired()) {
           printf(
               "P2pIbrcTransportDevice: wait_%s timed out expected=%llu\n",
@@ -889,16 +942,16 @@ class P2pIbrcTransportDevice {
 
   DeviceSpan<IbrcCmdQueueDevice> cmdQueues{};
   uint32_t numNics{0};
-  uint32_t maxGroups_{0};
-  uint32_t qpsPerBlockPerNic_{0};
-  DeviceSpan<IbrcBlockQpState> blockQpState_{};
+  uint32_t maxChannels_{0};
+  uint32_t qpsPerConnection_{0};
+  DeviceSpan<IbLocalChannel> localChannels_{};
   IbgdaRemoteBuffer ownedRemoteSignalBuf_{};
   IbgdaLocalBuffer ownedLocalSignalBuf_{};
   IbgdaLocalBuffer ownedCounterDeviceBuf_{};
   IbgdaLocalBuffer ownedCounterHostBuf_{};
   int numSignalSlots_{0};
   int numCounterSlots_{0};
-  IbSendRecvDevice sendRecv_{};
+  IbChannelLayout channelLayout_{};
 };
 
 static_assert(std::is_standard_layout_v<P2pIbrcTransportDevice>);

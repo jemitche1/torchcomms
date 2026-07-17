@@ -6,6 +6,7 @@
 #include <folly/init/Init.h>
 #include <folly/logging/xlog.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -21,8 +22,6 @@ using meta::comms::BenchmarkTestFixture;
 using meta::comms::DeviceBuffer;
 
 namespace comms::prims::tests {
-
-using SendRecvConfig = MultipeerIbgdaTransportConfig::SendRecvConfig;
 
 class RecvForwardChainTest : public BenchmarkTestFixture {
  protected:
@@ -43,12 +42,9 @@ class RecvForwardChainTest : public BenchmarkTestFixture {
       int pipeline_depth = 2) {
     MultipeerIbgdaTransportConfig config{
         .cudaDevice = localRank,
-        .dataBufferSize = slot_size,
-        .sendRecv =
-            SendRecvConfig{
-                .maxGroups = max_groups,
-                .pipelineDepth = pipeline_depth,
-            },
+        .perChannelSize = slot_size / static_cast<std::size_t>(max_groups),
+        .max_num_channels = max_groups,
+        .pipelineDepth = pipeline_depth,
     };
     auto transport = std::make_unique<MultipeerIbgdaTransport>(
         globalRank, worldSize, bootstrap, config);

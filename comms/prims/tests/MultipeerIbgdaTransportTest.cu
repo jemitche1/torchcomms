@@ -311,6 +311,33 @@ void testPutOnly(
 }
 
 // =============================================================================
+// Kernel: Pipeline geometry snapshot
+// =============================================================================
+
+__global__ void pipelineGeometryKernel(
+    P2pIbTransportDevice transport,
+    uint64_t* output) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    output[0] = static_cast<uint64_t>(transport.pipeline_depth());
+    output[1] = static_cast<uint64_t>(transport.pipeline_window());
+    output[2] = static_cast<uint64_t>(transport.pipeline_chunk());
+  }
+}
+
+void testPipelineGeometry(
+    P2pIbTransportDevice transport,
+    uint64_t* output,
+    int numBlocks,
+    int blockSize) {
+  pipelineGeometryKernel<<<numBlocks, blockSize>>>(transport, output);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("Kernel launch failed: ") + cudaGetErrorString(err));
+  }
+}
+
+// =============================================================================
 // Kernel: Blocking send/recv and resumable progress send/recv
 // =============================================================================
 
@@ -326,32 +353,72 @@ __global__ void sendRecvKernel(
     P2pIbgdaTransportDevice* transport,
     void* buffer,
     std::size_t nbytes,
-    int activeBlocks,
     std::size_t maxSignalBytes,
     bool send) {
   auto group = make_block_group();
   Timeout timeout(kDefaultDeviceTimeoutCycles);
   timeout.start();
   if (send) {
-    transport->send(
-        group, buffer, nbytes, activeBlocks, maxSignalBytes, timeout);
+    transport->send(group, buffer, nbytes, maxSignalBytes, timeout);
   } else {
-    transport->recv(
-        group, buffer, nbytes, activeBlocks, maxSignalBytes, timeout);
+    transport->recv(group, buffer, nbytes, maxSignalBytes, timeout);
   }
+}
+
+__global__ void twoCallSendThenRecvKernel(
+    P2pIbTransportDevice transport,
+    const void* sendBuffer,
+    void* recvBuffer,
+    std::size_t firstBytes,
+    std::size_t secondBytes,
+    std::size_t maxSignalBytes) {
+  auto group = make_block_group();
+  Timeout timeout(kDefaultDeviceTimeoutCycles);
+  timeout.start();
+  auto* sendBytes = static_cast<const char*>(sendBuffer);
+  auto* recvBytes = static_cast<char*>(recvBuffer);
+
+  transport.send(group, sendBytes, firstBytes, maxSignalBytes, timeout);
+  transport.recv(group, recvBytes, firstBytes, maxSignalBytes, timeout);
+  transport.send(
+      group, sendBytes + firstBytes, secondBytes, maxSignalBytes, timeout);
+  transport.recv(
+      group, recvBytes + firstBytes, secondBytes, maxSignalBytes, timeout);
 }
 
 void testSendRecv(
     P2pIbgdaTransportDevice* transport,
     void* buffer,
     std::size_t nbytes,
-    int activeBlocks,
     std::size_t maxSignalBytes,
     bool send,
     int numBlocks,
     int blockSize) {
   sendRecvKernel<<<numBlocks, blockSize>>>(
-      transport, buffer, nbytes, activeBlocks, maxSignalBytes, send);
+      transport, buffer, nbytes, maxSignalBytes, send);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("Kernel launch failed: ") + cudaGetErrorString(err));
+  }
+}
+
+void testTwoCallSendThenRecv(
+    P2pIbTransportDevice transport,
+    const void* sendBuffer,
+    void* recvBuffer,
+    std::size_t firstBytes,
+    std::size_t secondBytes,
+    std::size_t maxSignalBytes,
+    int numBlocks,
+    int blockSize) {
+  twoCallSendThenRecvKernel<<<numBlocks, blockSize>>>(
+      transport,
+      sendBuffer,
+      recvBuffer,
+      firstBytes,
+      secondBytes,
+      maxSignalBytes);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(
@@ -364,22 +431,21 @@ __global__ void progressSendRecvKernel(
     P2pIbgdaTransportDevice* transport,
     void* buffer,
     std::size_t nbytes,
-    int activeBlocks,
     std::size_t maxSignalBytes,
     bool send) {
   auto group = make_block_group();
   Timeout timeout(kDefaultDeviceTimeoutCycles);
   timeout.start();
   if (send) {
-    transport->init_send_progress(group, nbytes, activeBlocks, maxSignalBytes);
+    transport->init_send_progress(group, nbytes, maxSignalBytes);
     while (transport->progress_send_once(
-               group, buffer, nbytes, activeBlocks, maxSignalBytes, timeout) !=
+               group, buffer, nbytes, maxSignalBytes, timeout) !=
            IbgdaSendRecvProgressStatus::Done) {
     }
   } else {
-    transport->init_recv_progress(group, nbytes, activeBlocks, maxSignalBytes);
+    transport->init_recv_progress(group, nbytes, maxSignalBytes);
     while (transport->progress_recv_once(
-               group, buffer, nbytes, activeBlocks, maxSignalBytes, timeout) !=
+               group, buffer, nbytes, maxSignalBytes, timeout) !=
            IbgdaSendRecvProgressStatus::Done) {
     }
   }
@@ -389,26 +455,24 @@ __global__ void progressReservationKernel(
     P2pIbgdaTransportDevice* transport,
     int64_t* output,
     std::size_t sendBytes,
-    std::size_t recvBytes,
-    int activeBlocks) {
+    std::size_t recvBytes) {
   auto group = make_block_group();
-  transport->init_send_progress(group, sendBytes, activeBlocks);
-  transport->init_recv_progress(group, recvBytes, activeBlocks);
+  transport->init_send_progress(group, sendBytes);
+  transport->init_recv_progress(group, recvBytes);
 
   if (group.is_leader()) {
-    const auto& sendRecvState = transport->send_recv_state();
-    output[0] = sendRecvState.state[group.group_id].nextStep;
-    output[1] =
-        sendRecvState.state[sendRecvState.maxGroups + group.group_id].nextStep;
+    const auto& channel = transport->local_channel(group.group_id);
+    output[0] = channel.sendProgress.nextStep;
+    output[1] = channel.recvProgress.nextStep;
   }
 }
+
 #endif
 
 void testProgressSendRecv(
     P2pIbgdaTransportDevice* transport,
     void* buffer,
     std::size_t nbytes,
-    int activeBlocks,
     std::size_t maxSignalBytes,
     bool send,
     int numBlocks,
@@ -417,7 +481,6 @@ void testProgressSendRecv(
   (void)transport;
   (void)buffer;
   (void)nbytes;
-  (void)activeBlocks;
   (void)maxSignalBytes;
   (void)send;
   (void)numBlocks;
@@ -425,12 +488,14 @@ void testProgressSendRecv(
   throw std::runtime_error("progress send/recv is NVIDIA-only");
 #else
   progressSendRecvKernel<<<numBlocks, blockSize>>>(
-      transport, buffer, nbytes, activeBlocks, maxSignalBytes, send);
+      transport, buffer, nbytes, maxSignalBytes, send);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(
         std::string("Kernel launch failed: ") + cudaGetErrorString(err));
   }
+  // The caller synchronizes immediately after this helper so runtime kernel
+  // failures are reported through the test's CUDA check rather than as skips.
 #endif
 }
 
@@ -439,7 +504,6 @@ void testProgressReservations(
     int64_t* output,
     std::size_t sendBytes,
     std::size_t recvBytes,
-    int activeBlocks,
     int numBlocks,
     int blockSize) {
 #ifdef __HIP_PLATFORM_AMD__
@@ -447,13 +511,12 @@ void testProgressReservations(
   (void)output;
   (void)sendBytes;
   (void)recvBytes;
-  (void)activeBlocks;
   (void)numBlocks;
   (void)blockSize;
   throw std::runtime_error("progress send/recv is NVIDIA-only");
 #else
   progressReservationKernel<<<numBlocks, blockSize>>>(
-      transport, output, sendBytes, recvBytes, activeBlocks);
+      transport, output, sendBytes, recvBytes);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(

@@ -8,8 +8,10 @@ and Triton kernels. Composable building blocks for collectives (allgather,
 alltoall, sendrecv) without users needing to manage staging, signals, slot
 rotation, or pipeline depth.
 
-**Target backends (all 4 share this contract):** NVLink cpp, NVLink Triton, IB
-cpp, IB Triton.
+**Target backends:** NVLink cpp, NVLink Triton, IB cpp, IB Triton. Both NVL
+and IB use fixed channel geometry chosen at host init. Callers select a
+channel with `group.group_id`; per-call arguments control transfer size and
+optional sub-chunk signaling, not staging layout.
 
 **In scope:** per-block tile send/recv with cooperative memcpy + pipelined staging.
 **Out of scope:** explicit user-visible drain (handled internally), multi-stream
@@ -22,50 +24,55 @@ cross-rank rendezvous (separate barrier primitive).
 
 The tile API reuses the existing per-peer buffer settings already present in
 each transport's config. No new `TileConfig` sub-struct is introduced — the
-three knobs the tile algorithm needs are drawn from fields that already exist
-(or are added minimally where missing).
+knobs the tile algorithm needs are drawn from the transport config.
 
 ### NVL (`MultiPeerNvlTransportConfig`)
 
-The existing config already carries all three knobs:
+The config carries the fixed-channel geometry explicitly:
 
-| Existing field | Role in tile API |
+| Field | Role in tile API |
 |---|---|
-| `data_buffer_size` | Bytes per pipeline slot, per peer, per direction. Tile staging is allocated from this. |
-| `pipeline_depth` | Number of slots in the pipeline ring. |
-| `tile_max_blocks` (renamed → `tile_max_groups`) | Upper bound on the number of groups that may call `send`/`recv`. Sizes signal pad and step state arrays. |
+| `perChannelSize` | Bytes owned by one channel in one pipeline slot. |
+| `pipelineDepth` | Number of slots in the pipeline ring. |
+| `maxNumChannels` | Number of **channels** allocated per peer. Each channel owns one fixed `perChannelSize` staging slice in every pipeline slot, plus one `NvlChannelState` for cursors + signals. |
 
-No new fields are needed on the NVL side.
+The host derives `data_buffer_size = perChannelSize * maxNumChannels` for
+the pipeline slot. Channel sizing is fixed at init.
 
-### IB (`MultipeerIbgdaTransportConfig`)
+### IB (`MultipeerIbTransportConfig`)
 
-The existing config has `data_buffer_size` but lacks explicit pipeline depth and
-tile group count. Two fields are added:
+IB uses the same fixed-channel shape. The config exposes the first-order
+geometry and derives the total staging slot size:
 
 ```cpp
-struct MultipeerIbgdaTransportConfig {
-  // ... existing fields (data_buffer_size, qpDepth, etc.) ...
+struct MultipeerIbTransportConfig {
+  // ... existing fields (qpDepth, qpsPerConnection, etc.) ...
 
-  // Number of pipeline slots for tile send/recv staging.
-  // Default 2 (double-buffered). Must be >= 1.
-  std::size_t tile_pipeline_depth{2};
+  // Raw put()/signal() buffer size. For send()/recv(), this is derived as
+  // perChannelSize * max_num_channels when perChannelSize is set.
+  std::size_t dataBufferSize{0};
 
-  // Upper bound on the number of groups calling send/recv.
-  // Sizes signal pad and step state arrays. Must be >= 1.
-  int tile_max_groups{128};
+  // Bytes owned by one channel in one pipeline slot.
+  std::size_t perChannelSize{0};
+
+  // Number of channels allocated per peer.
+  int max_num_channels{64};
+
+  // Number of pipeline slots for send/recv staging.
+  int pipelineDepth{2};
 };
 ```
 
 ### Validation (throws at construction, both transports)
 
-- `pipeline_depth` (NVL) / `tile_pipeline_depth` (IB) `>= 1`
-- `tile_max_groups >= 1`
-- `(data_buffer_size / tile_max_groups) >= 16` — per-group slot must fit at least
-  one 16-byte vectorized memcpy.
+- `pipelineDepth >= 1`
+- `maxNumChannels` / `max_num_channels >= 1`
+- per-channel size is `>= 16` and 16-byte aligned, so each channel slot fits
+  at least one 16-byte vectorized memcpy.
 
-**Defaults rationale:** matches NVL benchmarks and Triton (H100) practice. With
-`tile_max_groups=128`, `per_block_slot_size = data_buffer_size / tile_max_groups = 64 KiB`
-— a non-trivial chunk on which RDMA puts amortize NIC setup cost.
+**Defaults rationale:** NVL and IB default to channel counts that cover the
+largest NCCL P2P channel counts we expect to mirror. With
+`perChannelSize=128 KiB` and `maxNumChannels=64`, one pipeline slot is 8 MiB.
 
 ---
 
@@ -74,77 +81,93 @@ struct MultipeerIbgdaTransportConfig {
 Owned by the transport, allocated and registered at construction. **Invisible
 to users** — referenced here only for implementer reference.
 
-The NVLink and IB transports use separate tile state structs because the IB
-transport requires additional fields for NIC completion tracking and local
-send staging that NVLink does not need.
+The NVLink and IB transports use separate per-channel state structs because
+the IB transport requires additional fields for NIC completion tracking and
+local send staging that NVLink does not need.
 
-### `NvlinkTransportTileState`
+### NVL: `NvlChannelState`
+
+One `NvlChannelState` per channel per peer (array length = `maxNumChannels`).
+The host allocates the array via an IPC-shared `GpuMemHandler` so the remote
+sender / receiver can write the `data_ready` / `slot_free` signals into this
+rank's local endpoint. Cursors are local-only (remote never touches them).
 
 ```cpp
-struct NvlinkTransportTileState {
-  // Per-block step counters. Persistent across send/recv calls.
-  // Required for monotonic signal values and slot-rotation continuity.
-  DeviceSpan<int64_t> step_state;   // [2 * max_groups]
-                                    //   [0..max_groups)         = sender step per block
-                                    //   [max_groups..2*max_groups) = receiver step per block
-
-  int tile_max_groups{0};
-
-  // Signal pad (using SignalState). Receiver inbox + sender ack inbox.
-  DeviceSpan<SignalState> local_signals;   // [2 * max_groups]
-  DeviceSpan<SignalState> remote_signals;  // [2 * max_groups]
-                                           //   [0..max_groups)         = DATA_READY (sender→receiver, "tail")
-                                           //   [max_groups..2*max_groups) = SLOT_FREE (receiver→sender, "head")
+struct alignas(128) NvlChannelState {
+  int64_t send_cursor{0};  // bytes sent from this local endpoint (persistent)
+  int64_t recv_cursor{0};  // bytes received by this local endpoint (persistent)
+  SignalState data_ready;  // remote sender bumps via NVLink; local recv waits
+  SignalState slot_free;   // remote recv bumps via NVLink; local send waits
 };
 ```
 
-### `IbTransportTileState`
+Layout: cursors and pads share one cache line; each of the two signals gets
+its own 128-byte cache line to keep concurrent NVLink writes by the remote
+sender (to `data_ready`) and the remote receiver (to `slot_free`) from
+false-sharing. The signals deliberately are not packed into the cursor line:
+that would put local cursor updates and remote NVLink signal writes on the same
+hot line. `sizeof(NvlChannelState) == 384` (one cursor line + two signal lines).
+
+The device transport stores two pointers into this layout:
 
 ```cpp
-struct IbTransportTileState {
-  // Per-block step counters. Persistent across send/recv calls.
-  DeviceSpan<int64_t> step_state;   // [2 * max_groups]
-                                    //   [0..max_groups)         = sender step per block
-                                    //   [max_groups..2*max_groups) = receiver step per block
+NvlChannelState* local_channels_;   // this rank's endpoint; remote rank signals here
+NvlChannelState* remote_channels_;  // remote rank's endpoint via IPC; this rank signals here
+```
 
-  int tile_max_groups{0};
+Both arrays have length `options_.max_num_channels`. Both
+the channel index and the per-channel staging slice index are `group.group_id`.
 
-  // Signal pad. Receiver inbox + sender ack inbox.
-  DeviceSpan<uint64_t> signal_pad;  // [2 * max_groups]
-                                    //   [0..max_groups)         = DATA_READY (sender→receiver, "tail")
-                                    //   [max_groups..2*max_groups) = SLOT_FREE (receiver→sender, "head")
+### IB: `IbLocalChannel`, `IbRemoteChannel`, and `IbChannelLayout`
 
-  // NIC completion counters.
-  // Bumped by the companion-QP loopback when an RDMA put is delivered.
-  DeviceSpan<uint64_t> nic_done_counter;  // [max_groups]
+```cpp
+struct IbLocalChannel {
+  IbChannelProgress sendProgress;
+  IbChannelProgress recvProgress;
+  // Local DATA_READY, SLOT_FREE, and NIC_DONE endpoints.
+  // Local send staging and channel-owned QP state.
+};
 
-  // Local send staging buffer (registered MR for RDMA source).
-  DeviceSpan<std::byte> send_staging;  // [pipeline_depth * data_buffer_size]
+struct IbRemoteChannel {
+  // Peer DATA_READY and SLOT_FREE endpoints.
+  // Peer recv staging slice and registration handles.
+};
+
+struct IbChannelLayout {
+  std::byte* sendStaging;
+  std::byte* recvStaging;
+  DeviceSpan<IbLocalChannel> localChannels;
+  DeviceSpan<IbRemoteChannel> remoteChannels;
+  int max_num_channels;
+  int pipelineDepth;
+  std::size_t perChannelSize;
 };
 ```
 
 **Per-slot layout** (one slot is `data_buffer_size` bytes, partitioned across
-the calling blocks):
+fixed channels):
 
 ```
 slot k  (= step / chunks_per_slot % pipeline_depth):
 ┌──────────────┬──────────────┬─────┬────────────────────┐
-│ block 0 row  │ block 1 row  │ ... │ block (N-1) row    │
+│ channel 0 row│ channel 1 row│ ... │ channel (N-1) row  │
 └──────────────┴──────────────┴─────┴────────────────────┘
-   N = max_groups (the construction-time upper bound, NOT active_blocks)
-   each row = per_block_slot_size = (data_buffer_size / active_blocks) & ~15ULL
+   N = maxNumChannels / max_num_channels (fixed at init).
+   each row = per_channel_slot = per_channel_size
 ```
 
-`active_blocks` is per-call; `per_block_slot_size` is internal to the algorithm
-and never exposed to users.
+Using fewer-than-max channels wastes the unused channels' slices but does not
+change live channels' bandwidth.
 
 **Construction responsibilities (host):**
-- Allocate `step_state`, `signal_pad`, `nic_done_counter`, `send_staging`,
-  `recv_staging`.
-- IB: register MRs for staging; exchange `recv_staging` rkeys + `signal_pad`
-  rkeys with each peer.
-- NVL: P2P-enable `recv_staging` access; exchange device pointers.
-- Zero-init `step_state`, `signal_pad`, `nic_done_counter`.
+- NVL: allocate one IPC-shared `NvlChannelState[nPeers * maxNumChannels]`
+  buffer; exchange via `GpuMemHandler::exchangeMemPtrs()`. P2P-enable
+  `recv_staging` access; exchange device pointers. Zero-init the channel
+  buffer (zeros cursors and signals).
+- IB: allocate local channels, remote channel descriptors, send staging, and
+  recv staging. Register MRs for staging and signal/counter storage; exchange
+  peer channel descriptors and rkeys. Zero-init channel progress, signals, and
+  counters.
 
 **Destruction:** deregister MRs (IB), free buffers. Outstanding ops are the
 caller's responsibility (kernel must finish before the host destructor runs).
@@ -153,16 +176,18 @@ caller's responsibility (kernel must finish before the host destructor runs).
 
 ## 3. API Surface
 
-### Cpp (both transports, identical signature)
+### Cpp
+
+NVL and IB use the same call shape for blocking send/recv. Channel count is
+fixed at init.
 
 ```cpp
-class P2pIbgdaTransportDevice {
+class P2pNvlTransportDevice {
  public:
   __device__ void send(
       ThreadGroup& group,
       const void* src,
       size_t nbytes,
-      int active_blocks = 0,
       size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout());
 
@@ -170,11 +195,34 @@ class P2pIbgdaTransportDevice {
       ThreadGroup& group,
       void* dst,
       size_t nbytes,
-      int active_blocks = 0,
+      size_t max_signal_bytes = 0,
+      const Timeout& timeout = Timeout());
+
+  __device__ void forward(
+      ThreadGroup& group,
+      void* dst,
+      size_t nbytes,
+      P2pNvlTransportDevice& successor,
       size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout());
 };
-// P2pNvlTransportDevice exposes the same two methods with the same signature.
+
+class P2pIbgdaTransportDevice {
+ public:
+  __device__ void send(
+      ThreadGroup& group,
+      const void* src,
+      size_t nbytes,
+      size_t max_signal_bytes = 0,
+      const Timeout& timeout = Timeout());
+
+  __device__ void recv(
+      ThreadGroup& group,
+      void* dst,
+      size_t nbytes,
+      size_t max_signal_bytes = 0,
+      const Timeout& timeout = Timeout());
+};
 ```
 
 ### Triton (both transports, identical signature)
@@ -183,18 +231,18 @@ class P2pIbgdaTransportDevice {
 @core.extern
 def send(
     src_ptr, nbytes,
-    block_id, active_blocks,
+    block_id,
     max_signal_bytes,
     timeout_ns,
     # Constexpr handles plumbed from host transport.
-    # Bundles staging ptrs, signal pad ptrs, step state ptr, transport config values.
+    # Bundles staging pointers, channel endpoints, and transport config values.
     # Exact constexpr/runtime split is an impl-time decision.
     transport_handle: tl.constexpr,
 ):
     ...
 
 @core.extern
-def recv(dst_ptr, nbytes, block_id, active_blocks, max_signal_bytes, timeout_ns,
+def recv(dst_ptr, nbytes, block_id, max_signal_bytes, timeout_ns,
               transport_handle: tl.constexpr):
     ...
 ```
@@ -205,22 +253,21 @@ def recv(dst_ptr, nbytes, block_id, active_blocks, max_signal_bytes, timeout_ns,
 |---|---|---|---|
 | `group` (cpp) / `block_id` (Triton) | yes | — | Identifies this calling block. Slot routing uses `group.group_id` (cpp) or the `block_id` arg (Triton). |
 | `src` / `dst` | yes | — | This block's pre-sliced data pointer. Caller computes per-block offset (see `TiledBuffer`). |
-| `nbytes` | yes | — | This block's data size. May exceed `per_block_slot_size` — chunked internally over pipeline slots. |
-| `active_blocks` | no | `0` → `tile_max_groups` | Number of blocks calling `send`/`recv` concurrently. Determines `per_block_slot_size = data_buffer_size / active_blocks`. |
-| `max_signal_bytes` | no | `0` → `per_block_slot_size` | Hint for the maximum number of bytes between consecutive DATA_READY signals. The transport may signal more frequently if too many blocks share the data buffer. Capped at `per_block_slot_size` if larger (sub-slot signaling only). |
+| `nbytes` | yes | — | This block's data size. May exceed `per_channel_size` — chunked internally over pipeline slots. |
+| `max_signal_bytes` | no | `0` → `per_channel_size` | Hint for the maximum number of bytes between consecutive DATA_READY signals. Capped at `per_channel_size` if larger (sub-slot signaling only). |
 | `timeout` | no | `Timeout()` (no limit) | Per-wait timeout. Reuses `comms::prims::Timeout`. On expiry: `__trap()`. |
 
 ### Special values
 
 - **`nbytes == 0`** — block participates in convergent control flow but does no
-  copy and no signal; `step_state` does not advance. Sender and receiver MUST
+  copy and no signal; channel progress does not advance. Sender and receiver MUST
   both pass `nbytes==0` for the same `block_id` (per-block matching rule below).
-- **`max_signal_bytes > per_block_slot_size`** — silently capped to `per_block_slot_size`.
+- **`max_signal_bytes > per_channel_size`** — silently capped to `per_channel_size`.
   The protocol never signals less frequently than once per slot fill (sub-slot
   signaling only).
-- **`active_blocks > tile_max_groups`** — `__trap()`. The precondition check
-  at the top of the algorithm catches this and traps immediately rather than
-  silently aliasing staging rows.
+- **`group.group_id >= max_num_channels`** — `__trap()`. Catches a kernel
+  selecting a channel the host did not allocate, which would alias two groups
+  onto the same channel or corrupt adjacent state.
 
 ---
 
@@ -237,30 +284,32 @@ def recv(dst_ptr, nbytes, block_id, active_blocks, max_signal_bytes, timeout_ns,
    to `send` / `recv`, and `sub.group_id` (range `[0, sub.total_groups)`)
    is the slot row index.
 3. **Trap precondition (debug-mode `__trap`):**
-   `group.group_id < (active_blocks > 0 ? active_blocks : tile_max_groups)`.
-   Violating this would alias two blocks onto the same staging row and silently
-   corrupt data — trap converts that into an immediate, locatable failure.
+   - `group.group_id < max_num_channels`. The channel index is
+     `group.group_id`; selecting a channel outside the allocated range would
+     alias state or corrupt adjacent staging.
 
 ### Cross-rank coordination
 
-- For each `group_id k`: sender block_k's `(nbytes, active_blocks, max_signal_bytes)`
-  MUST equal receiver block_k's. The protocol routes data through slot row `k`
-  on both sides; mismatched values cause deadlock (receiver waits for more
+- For each `group_id k`: sender block_k's `(nbytes, max_signal_bytes)` MUST
+  equal receiver block_k's. The protocol routes data through slot row `k` on
+  both sides; mismatched values cause deadlock (receiver waits for more
   signals) or silent drop (receiver consumes too few).
 - Across blocks within the same call: `nbytes` may differ per block (uneven tile
   partitions are supported as long as both sides agree per-block).
 
-### Changing `active_blocks` between calls
+### Changing per-call sizing between calls
 
-If `active_blocks` changes between consecutive `send`/`recv` calls on the same transport, a **cross-rank barrier** is required between the two calls. Changing `active_blocks` alters `per_block_slot_size` and therefore the slot row layout; without a barrier, the receiver may still be draining the old layout while the sender begins writing the new one, corrupting staging data.
+The per-channel slot size is fixed at host init, so consecutive calls cannot
+change the staging layout. `max_signal_bytes` may vary between calls because
+progress is tracked in bytes rather than in a layout-dependent step count.
 
 ### Concurrency
 
 - **Single-stream sequential calls on the same transport are supported** —
-  internal `step_state` and `signal_pad` survive across calls; the next call
-  resumes the protocol monotonically.
+  internal channel progress and signal/counter state survive across calls; the
+  next call resumes the protocol monotonically.
 - **Multiple kernels on the same transport via different CUDA streams =
-  undefined behavior** — they would race on `step_state` and `signal_pad`.
+  undefined behavior** — they would race on channel progress and signals.
 
 ---
 
@@ -278,66 +327,84 @@ primitives are used.
 | Drain | None — no outstanding async ops after memcpy + sync | Internal drain at end: `wait_counter(nic_done_counter, step)` |
 | `send_staging` | Not used (`nullptr`) | Required (registered MR for RDMA source) |
 
-### Common precomputation (both backends)
+### Common precomputation
 
+**NVL:**
 ```text
-block_id        = group.group_id
-eff_active      = active_blocks > 0 ? active_blocks : tile_max_groups
-trap if eff_active > tile_max_groups   // signal/step_state arrays are sized to tile_max_groups
-trap if block_id >= eff_active
+channel         = group.group_id
+trap if group.total_groups > options.max_num_channels
 
-per_block_slot  = (data_buffer_size / eff_active) & ~15ULL
+per_channel_slot = options.per_channel_slot            // fixed at host init
+trap if per_channel_slot == 0
+chunk_size      = min(max_signal_bytes > 0 ? max_signal_bytes : per_channel_slot,
+                      per_channel_slot)
+chunks_per_slot = per_channel_slot / chunk_size       // sub-slot signaling factor
+total_chunks    = ceil(nbytes / chunk_size)
+
+local_ch        = local_channels_[channel]            // remote rank writes here via NVLink
+remote_ch       = remote_channels_[channel]           // this rank writes here via NVLink
+```
+
+**IB:**
+```text
+channel         = group.group_id
+trap if channel >= max_num_channels
+
+per_block_slot  = perChannelSize & ~15ULL
 trap if per_block_slot == 0
 chunk_size      = min(max_signal_bytes > 0 ? max_signal_bytes : per_block_slot,
                       per_block_slot)
 chunks_per_slot = per_block_slot / chunk_size      // sub-slot signaling factor
 total_chunks    = ceil(nbytes / chunk_size)
 
-tail_signal_id  = block_id                         // DATA_READY (sender → receiver)
-head_signal_id  = tile_max_groups + block_id         // SLOT_FREE  (receiver → sender)
+local_ch        = local_channels_[channel]
+remote_ch       = remote_channels_[channel]
 ```
 
 ### `send` (NVL)
 
+The actual implementation uses a byte-cursor (`send_cursor`) rather than a
+step counter — wait/signal values are byte positions, which lets `chunk_size`
+vary between calls without losing monotonicity.
+
 ```text
 if nbytes == 0: return
 
-step = step_state.sender[block_id]
+base_byte    = local_ch.send_cursor
+staging_off  = channel * per_channel_slot
+pipeline_bytes = per_channel_slot * pipeline_depth
 
-for s in [0, total_chunks):
-    slot_step     = s / chunks_per_slot
-    sub_step      = s % chunks_per_slot
-    slot          = slot_step % pipeline_depth
-    slot_off      = slot * data_buffer_size
-    chunk_off     = sub_step * chunk_size
-    data_off      = s * chunk_size
-    bytes_this    = min(chunk_size, nbytes - data_off)
+for data_off in [0, protocol_bytes):           // protocol_bytes = align16(nbytes)
+    stream_start    = base_byte + data_off
+    pipeline_off    = stream_start % pipeline_bytes
+    slot            = pipeline_off / per_channel_slot
+    slot_off        = slot * data_buffer_size
+    chunk_off       = pipeline_off - slot * per_channel_slot
+    copy_bytes      = min(chunk_size, protocol_bytes - data_off,
+                          per_channel_slot - chunk_off)
+    stream_end      = stream_start + copy_bytes
 
-    // (1) Backpressure: wait for receiver to free this slot.
-    //     Only at slot boundary (first sub-step) and only after the pipeline
-    //     is fully filled.
-    if sub_step == 0 and step >= chunks_per_slot * pipeline_depth:
-        local_signals[head_signal_id].wait_until(
-            group, CMP_GE,
-            step - chunks_per_slot * pipeline_depth + 1,
-            timeout)
+    // (1) Backpressure: only once the pipeline has wrapped.
+    if stream_end > pipeline_bytes:
+        local_ch.slot_free.wait_until(
+            group, CMP_GE, stream_end - pipeline_bytes, timeout)
 
-    // (2) Cooperative P2P memcpy: src chunk -> remote recv_staging via NVLink.
-    //     No local staging needed — NVLink writes go directly to the peer's
-    //     staging buffer.
+    // (2) Cooperative P2P memcpy: src chunk -> remote staging via NVLink.
     memcpy_vectorized(
         remote_recv_staging + slot_off + staging_off + chunk_off,
         src + data_off,
-        bytes_this, group)
+        valid_payload(copy_bytes, nbytes, data_off),
+        group)
 
-    // (3) Barrier + signal DATA_READY to receiver.
+    // (3) Barrier + signal DATA_READY to the remote endpoint.
     group.sync()
     if group.is_leader():
-        remote_signals[tail_signal_id].signal(SIGNAL_SET, step + 1)
+        remote_ch.data_ready.signal(SIGNAL_SET, stream_end)
 
-    step++
+    data_off += copy_bytes
 
-step_state.sender[block_id] = step
+if group.is_leader():
+    local_ch.send_cursor = base_byte + protocol_bytes
 group.sync()
 ```
 
@@ -352,40 +419,43 @@ remain.
 ```text
 if nbytes == 0: return
 
-step = step_state.receiver[block_id]
+base_byte    = local_ch.recv_cursor
+staging_off  = channel * per_channel_slot
+pipeline_bytes = per_channel_slot * pipeline_depth
 
-for s in [0, total_chunks):
-    slot_step     = s / chunks_per_slot
-    sub_step      = s % chunks_per_slot
-    slot          = slot_step % pipeline_depth
-    slot_off      = slot * data_buffer_size
-    chunk_off     = sub_step * chunk_size
-    data_off      = s * chunk_size
-    bytes_this    = min(chunk_size, nbytes - data_off)
+for data_off in [0, protocol_bytes):
+    stream_start    = base_byte + data_off
+    pipeline_off    = stream_start % pipeline_bytes
+    slot            = pipeline_off / per_channel_slot
+    slot_off        = slot * data_buffer_size
+    chunk_off       = pipeline_off - slot * per_channel_slot
+    copy_bytes      = min(chunk_size, protocol_bytes - data_off,
+                          per_channel_slot - chunk_off)
+    stream_end      = stream_start + copy_bytes
 
-    // (1) Wait for sender's DATA_READY signal.
-    local_signals[tail_signal_id].wait_until(
-        group, CMP_GE, step + 1, timeout)
+    // (1) Wait for DATA_READY from the remote endpoint.
+    local_ch.data_ready.wait_until(group, CMP_GE, stream_end, timeout)
 
     // (2) Cooperative memcpy: local recv_staging -> dst.
-    //     Sender wrote here via NVLink; we read from local memory (fast).
     memcpy_vectorized(
         dst + data_off,
         local_recv_staging + slot_off + staging_off + chunk_off,
-        bytes_this, group)
+        valid_payload(copy_bytes, nbytes, data_off),
+        group)
 
-    // (3) Barrier + conditional SLOT_FREE signal to sender.
-    //     Signal only at slot boundaries (last sub-step in a slot or the
-    //     very last step) to release the entire slot for reuse.
+    // (3) Barrier + conditional SLOT_FREE signal to peer.
+    //     Signal only at slot boundaries (chunk hits end of slot, or last
+    //     chunk overall) to release the entire slot for reuse.
     group.sync()
-    bool last_in_slot = (sub_step == chunks_per_slot - 1)
-                        or (s == total_chunks - 1)
+    last_in_slot = (chunk_off + copy_bytes == per_channel_slot) or
+                   (data_off + copy_bytes == protocol_bytes)
     if last_in_slot and group.is_leader():
-        remote_signals[head_signal_id].signal(SIGNAL_SET, step + 1)
+        remote_ch.slot_free.signal(SIGNAL_SET, stream_end)
 
-    step++
+    data_off += copy_bytes
 
-step_state.receiver[block_id] = step
+if group.is_leader():
+    local_ch.recv_cursor = base_byte + protocol_bytes
 group.sync()
 ```
 
@@ -394,7 +464,8 @@ group.sync()
 ```text
 if nbytes == 0: return
 
-step = step_state.sender[block_id]
+base_byte = local_ch.sendProgress.cursor
+pipeline_bytes = per_block_slot * pipeline_depth
 
 for s in [0, total_chunks):
     slot_step     = s / chunks_per_slot
@@ -402,15 +473,16 @@ for s in [0, total_chunks):
     slot          = slot_step % pipeline_depth
     slot_off      = slot * data_buffer_size
     chunk_off     = sub_step * chunk_size
-    staging_off   = slot_off + block_id * per_block_slot + chunk_off
+    staging_off   = slot_off + channel * per_block_slot + chunk_off
     data_off      = s * chunk_size
     bytes_this    = min(chunk_size, nbytes - data_off)
+    stream_end    = base_byte + data_off + bytes_this
 
     // (1) Wait for prior NIC use of this slot to drain (local staging is safe).
-    if step >= pipeline_depth * chunks_per_slot:
+    if stream_end > pipeline_bytes:
         wait_counter(group,
-                     nic_done_counter[block_id],
-                     step - pipeline_depth * chunks_per_slot + 1,
+                     local_ch.nic_done_counter,
+                     stream_end - pipeline_bytes,
                      timeout)
 
     // (2) Cooperative memcpy: src chunk -> local send_staging.
@@ -420,10 +492,10 @@ for s in [0, total_chunks):
     group.sync()
 
     // (3) Wait for receiver to free this slot — only at slot boundary.
-    if sub_step == 0 and step >= pipeline_depth * chunks_per_slot:
+    if sub_step == 0 and stream_end > pipeline_bytes:
         wait_signal(group,
-                    signal_pad[tile_max_groups + block_id],       // SLOT_FREE row
-                    step / chunks_per_slot - pipeline_depth + 1,
+                    local_ch.slot_free,
+                    stream_end - pipeline_bytes,
                     timeout)
 
     // (4) Fused RDMA put + remote DATA_READY signal + local NIC_DONE bump.
@@ -432,18 +504,16 @@ for s in [0, total_chunks):
             local_src     = send_staging        + staging_off,
             remote_dst    = recv_staging_remote + staging_off,
             nbytes        = bytes_this,
-            remote_signal = signal_pad_remote[block_id],       // DATA_READY row
-            signal_inc    = 1,
-            local_counter = nic_done_counter[block_id],
-            counter_inc   = 1)
+            remote_signal = remote_ch.data_ready,
+            signal_val    = stream_end,
+            local_counter = local_ch.nic_done_counter,
+            counter_val   = stream_end)
 
-    step++
-
-step_state.sender[block_id] = step
+local_ch.sendProgress.cursor = base_byte + protocol_bytes
 group.sync()
 
-// (5) Internal drain: wait for all RDMA puts on this block to complete.
-wait_counter(group, nic_done_counter[block_id], step, timeout)
+// (5) Internal drain: wait for all RDMA puts on this channel to complete.
+wait_counter(group, local_ch.nic_done_counter, base_byte + protocol_bytes, timeout)
 group.sync()
 ```
 
@@ -452,7 +522,7 @@ group.sync()
 ```text
 if nbytes == 0: return
 
-step = step_state.receiver[block_id]
+base_byte = local_ch.recvProgress.cursor
 
 for s in [0, total_chunks):
     slot_step     = s / chunks_per_slot
@@ -460,14 +530,15 @@ for s in [0, total_chunks):
     slot          = slot_step % pipeline_depth
     slot_off      = slot * data_buffer_size
     chunk_off     = sub_step * chunk_size
-    staging_off   = slot_off + block_id * per_block_slot + chunk_off
+    staging_off   = slot_off + channel * per_block_slot + chunk_off
     data_off      = s * chunk_size
     bytes_this    = min(chunk_size, nbytes - data_off)
+    stream_end    = base_byte + data_off + bytes_this
 
     // (1) Wait for sender's data.
     wait_signal(group,
-                signal_pad[block_id],                          // DATA_READY row
-                step + 1,
+                local_ch.data_ready,
+                stream_end,
                 timeout)
 
     // (2) Cooperative memcpy: local recv_staging -> dst.
@@ -480,12 +551,10 @@ for s in [0, total_chunks):
     bool last_in_slot = (sub_step == chunks_per_slot - 1)
                         or (s == total_chunks - 1)
     if last_in_slot and group.is_leader():
-        signal_remote(signal_pad_remote[tile_max_groups + block_id],  // SLOT_FREE row
-                      increment = 1)
+        signal_remote(remote_ch.slot_free,
+                      signal_val = stream_end)
 
-    step++
-
-step_state.receiver[block_id] = step
+local_ch.recvProgress.cursor = base_byte + protocol_bytes
 group.sync()
 ```
 
@@ -533,27 +602,25 @@ __global__ void bidirectional_send_recv_kernel(
         sub,
         tiles.data(),
         tiles.bytes(),
-        /*active_blocks=*/sub.total_groups,   // explicit — matches the partition size
-        /*max_signal_bytes=*/  0,                   // default = one signal per slot fill
+        /*max_signal_bytes=*/0,  // default = one signal per slot fill
         timeout);
   } else {
     transport->recv(
         sub,
         tiles.data(),
         tiles.bytes(),
-        /*active_blocks=*/sub.total_groups,
-        /*max_signal_bytes=*/  0,
+        /*max_signal_bytes=*/0,
         timeout);
   }
 }
 
 // Host side:
-MultipeerIbgdaTransportConfig cfg{
+MultipeerIbTransportConfig cfg{
     .cudaDevice = local_rank,
     // ... existing IB fields (qpDepth, etc.) ...
-    .data_buffer_size    = 8 * 1024 * 1024,
-    .tile_pipeline_depth = 2,
-    .tile_max_groups     = 64,    // we launch 128 blocks total = 64 senders + 64 receivers
+    .perChannelSize   = 128 * 1024,
+    .max_num_channels = 64, // 128 blocks total = 64 senders + 64 receivers
+    .pipelineDepth    = 2,
 };
 MultipeerIbgdaTransport transport(global_rank, world_size, bootstrap, cfg);
 transport.exchange();
@@ -564,8 +631,8 @@ bidirectional_send_recv_kernel<<<128, 256, 0, stream>>>(
 ```
 
 Notes on the example:
-- The `partition(2)` renumbers `sub.group_id` to `[0, 64)` for both senders and
-  receivers. The trap precondition is `sub.group_id < active_blocks=64`,
+- The `partition(2)` renumbers `sub.group_id` to `[0, 64)` for both senders
+  and receivers. The trap precondition is `sub.group_id < max_num_channels`,
   which is satisfied.
 - `TiledBuffer` partitions `total_bytes` evenly across the 64 sub-blocks; each
   block's `tiles.data()` is its own pre-sliced pointer, `tiles.bytes()` is its
@@ -582,8 +649,8 @@ Notes on the example:
   (step 5). May be exposed if users want to overlap NIC drain with other
   device-side work between consecutive `send` calls.
 - **Multi-stream concurrency on the same transport.** Currently undefined.
-  Would require per-stream `step_state` and `signal_pad` arenas.
-- **Per-call config overrides.** `pipeline_depth` and `data_buffer_size` are
+  Would require per-stream channel progress and signal/counter arenas.
+- **Per-call config overrides.** `pipelineDepth` and `perChannelSize` are
   construction-time only. Per-call overrides would require dynamic staging
   re-allocation.
 - **Cross-rank rendezvous.** Use a separate barrier primitive; not coupled to
