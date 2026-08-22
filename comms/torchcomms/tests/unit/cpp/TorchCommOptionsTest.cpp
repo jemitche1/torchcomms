@@ -81,6 +81,38 @@ TEST(TorchCommOptionsTest, StringToBool) {
   EXPECT_THROW(torch::comms::string_to_bool("falsey"), std::runtime_error);
 }
 
+TEST(TorchCommOptionsTest, OptionsBaseDefaults) {
+  AllGatherOptions gather;
+  EXPECT_EQ(gather.timeout, kNoTimeout);
+  EXPECT_TRUE(gather.hints.empty());
+
+  // Options with extra fields keep the shared defaults from the base.
+  SendOptions send;
+  EXPECT_EQ(send.timeout, kNoTimeout);
+  EXPECT_EQ(send.tag, 0);
+
+  RecvOptions recv;
+  EXPECT_EQ(recv.timeout, kNoTimeout);
+  EXPECT_EQ(recv.tag, 0);
+
+  // Window options share the same base defaults.
+  PutOptions put;
+  EXPECT_EQ(put.timeout, kNoTimeout);
+  EXPECT_TRUE(put.hints.empty());
+}
+
+TEST(TorchCommOptionsTest, CommOptionsGetHint) {
+  CommOptions options;
+  options.hints["enabled"] = "yes";
+  options.hints["count"] = "12";
+  options.hints["name"] = "value";
+
+  EXPECT_TRUE(options.getHint<bool>("enabled", false));
+  EXPECT_EQ(options.getHint<size_t>("count", 0), 12U);
+  EXPECT_EQ(options.getHint<std::string>("name", ""), "value");
+  EXPECT_EQ(options.getHint<size_t>("missing", 3), 3U);
+}
+
 namespace {
 constexpr const char* kBackendName = "fake_test";
 constexpr const char* kBackendEnvKey = "TORCHCOMMS_BACKEND_LIB_PATH_FAKE_TEST";
@@ -143,5 +175,38 @@ TEST_F(BackendWrapperTagTest, RecvThreadsTagToBackend) {
   EXPECT_EQ(fake->getLastRecvOptionsForTest()->tag, 456);
   EXPECT_EQ(fake->getLastRecvSrcForTest(), 2);
 }
+
+#ifdef C10D_BACKEND_HAS_WINDOW
+TEST_F(BackendWrapperTagTest, WindowOperationsDelegateToTorchComm) {
+  EXPECT_TRUE(wrapper_->supportsWindow());
+
+  auto tensor = at::ones({4}, at::kFloat);
+  auto window = wrapper_->new_window(tensor);
+  ASSERT_NE(window, nullptr);
+
+  auto putWork = window->put(
+      tensor,
+      /*dstRank=*/0,
+      /*targetOffsetNelems=*/0,
+      /*asyncOp=*/false);
+  ASSERT_NE(putWork, nullptr);
+  EXPECT_TRUE(putWork->wait());
+
+  auto signalWork = window->signal(/*peerRank=*/0, /*asyncOp=*/false);
+  ASSERT_NE(signalWork, nullptr);
+  EXPECT_TRUE(signalWork->wait());
+
+  auto waitWork = window->wait_signal(/*peerRank=*/0, /*asyncOp=*/false);
+  ASSERT_NE(waitWork, nullptr);
+  EXPECT_TRUE(waitWork->wait());
+
+  EXPECT_FALSE(window->map_remote_tensor(/*rank=*/0).defined());
+  EXPECT_EQ(
+      window->get_attr(/*peerRank=*/0).access_type,
+      c10d::WindowAccessType::UNIFIED);
+
+  EXPECT_NO_THROW(window->tensor_deregister());
+}
+#endif
 
 } // namespace torch::comms::test

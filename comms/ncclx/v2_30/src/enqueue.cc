@@ -89,7 +89,7 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
   }
 
   if (ncclShmemDynamicSize(cudaArch) > maxDynamicSmem) {
-    WARN("cudaArch %d dynamic smem %d exceeds device/fn maxSharedMem %d",
+    ERR(ncclSystemError, "cudaArch %d dynamic smem %d exceeds device/fn maxSharedMem %d",
          cudaArch, ncclShmemDynamicSize(cudaArch), maxDynamicSmem);
     return ncclSystemError;
   }
@@ -520,8 +520,9 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     // number of channels need to be setup later in ncclCollPreconnectFunc for
     // collectives. Otherwise, fallback to baseline runtime connection logic
     if (comm->lazySetupChannels && ncclx::algoCanLazySetupChannel(comm, task)) {
-      *needConnect = ncclx::algoNeedConnect(comm, task);
-      algoNeedConnect[task->algorithm] |= *needConnect;
+      const bool taskNeedConnect = ncclx::algoNeedConnect(comm, task);
+      *needConnect |= taskNeedConnect;
+      algoNeedConnect[task->algorithm] |= taskNeedConnect;
     } else if (
         comm->runtimeConn && comm->initAlgoChannels[task->algorithm] == false) {
       if (task->algorithm == NCCL_ALGO_NVLS_TREE && comm->initAlgoChannels[NCCL_ALGO_NVLS] == false && regNeedConnect == true) {
@@ -1164,11 +1165,11 @@ static ncclResult_t scheduleP2pTasksToPlan(struct ncclComm* comm, int* p2pEpoch,
 
       if (sendRank == comm->rank) {
         if (send != nullptr && recv == nullptr) {
-          WARN("Trying to send to self without a matching recv");
+          ERR(ncclInvalidUsage, "Trying to send to self without a matching recv");
           return ncclInvalidUsage;
         }
         if (send == nullptr && recv != nullptr) {
-          WARN("Trying to recv to self without a matching send");
+          ERR(ncclInvalidUsage, "Trying to recv to self without a matching send");
           return ncclInvalidUsage;
         }
       }
@@ -1744,9 +1745,9 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     CU_LAUNCH_PARAM_BUFFER_SIZE, &plan->kernelArgsSize,
     CU_LAUNCH_PARAM_END
   };
-  // CollTrace Injected code here
-  auto colltraceHandle = ncclx::colltrace::collTraceBaselineGetHandle(plan, launchStream);
-
+  // [META] Colltrace handle creation and in-kernel graph timestamp arming.
+  auto colltraceHandle = ncclx::colltrace::prepareNcclKernelColltrace(
+      plan, launchStream, comm->compCap);
 
   int driverVersion;
   NCCLCHECKGOTO(ncclCudaDriverVersion(&driverVersion), ret, do_return);
@@ -1991,6 +1992,61 @@ static ncclResult_t updateCollCostTable(
   return ncclSuccess;
 }
 
+// Channel/thread selection for a given algorithm/protocol and size. Shared by
+// topoGetAlgoInfo() and ncclQueryCollTuning() so the query cannot drift from
+// the real selection.
+static void topoGetChannelThreadCount(
+    struct ncclComm* comm, int algorithm, int protocol, size_t nBytes,
+    int* nChannels, int* nThreads
+  ) {
+  int nc = comm->nChannels;
+  int nt = comm->maxThreads[algorithm][protocol];
+  int threadThreshold = comm->threadThresholds[algorithm][protocol];
+  if (algorithm == NCCL_ALGO_COLLNET_DIRECT) {
+    // CollNet channel tuning
+    int ncSwitch = 16;
+    bool flag = true;
+    while (ncSwitch >= 1 && flag) {
+      while ((flag = nBytes < nc*nt*comm->channels[0].collnetDirect.nHeads*threadThreshold) && nc > ncSwitch) {
+        if (nc == ncSwitch+ncSwitch/2) threadThreshold /= 2;
+        nc--;
+      }
+      ncSwitch /= 2;
+    }
+  } else if (algorithm == NCCL_ALGO_NVLS || algorithm == NCCL_ALGO_NVLS_TREE) {
+    // NVLS should not need more than 16 channels to get peak BW.
+    if (comm->nNodes > 1 && algorithm == NCCL_ALGO_NVLS) {
+      nc = std::min(comm->nvlsChannels, comm->nChannels);
+    } else {
+      nc = comm->nvlsChannels;
+    }
+  } else {
+    // Ring/Tree channel tuning
+    while (nBytes < nc * nt * threadThreshold) {
+      if (nc >= 2) nc--;
+      else break;
+    }
+  }
+
+  if (algorithm != NCCL_ALGO_NVLS && algorithm != NCCL_ALGO_NVLS_TREE &&
+    algorithm != NCCL_ALGO_COLLNET_DIRECT) {
+    while (nBytes < nc * nt * threadThreshold) {
+      if (nt % 128 == 0) nt /= 2;
+      else break;
+    }
+  }
+  if (protocol == NCCL_PROTO_SIMPLE) {
+    if (algorithm == NCCL_ALGO_RING) nt += WARP_SIZE; // Extra warp for sync
+    // More threads or sync warps needed due to split thread model
+    if (algorithm == NCCL_ALGO_TREE) nt += 4*WARP_SIZE;
+  }
+  nt = nt/WARP_SIZE < 3 ? 3*WARP_SIZE : nt;
+  if (algorithm == NCCL_ALGO_TREE) nt = NCCL_MAX_NTHREADS; // Tree now uses all threads always.
+  if (algorithm == NCCL_ALGO_PAT) nt = NCCL_MAX_NTHREADS;
+  *nChannels = nc;
+  *nThreads = nt;
+}
+
 static ncclResult_t topoGetAlgoInfo(
     struct ncclComm* comm, struct ncclTaskColl* info, size_t nBytes,
     float** collCostTable, ncclSimInfo_t* simInfo
@@ -2028,56 +2084,14 @@ static ncclResult_t topoGetAlgoInfo(
     if (protoEnv) {
       snprintf(ncclProtoEnvStr, 1023, " NCCL_PROTO was set to %s.", protoEnv);
     }
-    WARN("No algorithm/protocol available for function %s with datatype %s.%s%s", ncclFuncToString(info->func), ncclDatatypeToString(info->datatype), ncclAlgoEnvStr, ncclProtoEnvStr);
+    ERR((algoEnv || protoEnv) ? ncclInvalidUsage : ncclInternalError, "No algorithm/protocol available for function %s with datatype %s.%s%s", ncclFuncToString(info->func), ncclDatatypeToString(info->datatype), ncclAlgoEnvStr, ncclProtoEnvStr);
     return (algoEnv || protoEnv) ? ncclInvalidUsage : ncclInternalError;
   }
   if (simInfo) simInfo->estimatedTime = time;
   TRACE(NCCL_COLL, "%ld Bytes -> Algo %d proto %d time %f", nBytes, info->algorithm, info->protocol, time);
 
-  int nc = comm->nChannels;
-  int nt = comm->maxThreads[info->algorithm][info->protocol];
-  int threadThreshold = comm->threadThresholds[info->algorithm][info->protocol];
-  if (info->algorithm == NCCL_ALGO_COLLNET_DIRECT) {
-    // CollNet channel tuning
-    int ncSwitch = 16;
-    bool flag = true;
-    while (ncSwitch >= 1 && flag) {
-      while ((flag = nBytes < nc*nt*comm->channels[0].collnetDirect.nHeads*threadThreshold) && nc > ncSwitch) {
-        if (nc == ncSwitch+ncSwitch/2) threadThreshold /= 2;
-        nc--;
-      }
-      ncSwitch /= 2;
-    }
-  } else if (info->algorithm == NCCL_ALGO_NVLS || info->algorithm == NCCL_ALGO_NVLS_TREE) {
-    // NVLS should not need more than 16 channels to get peak BW.
-    if (comm->nNodes > 1 && info->algorithm == NCCL_ALGO_NVLS) {
-      nc = std::min(comm->nvlsChannels, comm->nChannels);
-    } else {
-      nc = comm->nvlsChannels;
-    }
-  } else {
-    // Ring/Tree channel tuning
-    while (nBytes < nc * nt * threadThreshold) {
-      if (nc >= 2) nc--;
-      else break;
-    }
-  }
-
-  if (info->algorithm != NCCL_ALGO_NVLS && info->algorithm != NCCL_ALGO_NVLS_TREE &&
-    info->algorithm != NCCL_ALGO_COLLNET_DIRECT) {
-    while (nBytes < nc * nt * threadThreshold) {
-      if (nt % 128 == 0) nt /= 2;
-      else break;
-    }
-  }
-  if (info->protocol == NCCL_PROTO_SIMPLE) {
-    if (info->algorithm == NCCL_ALGO_RING) nt += WARP_SIZE; // Extra warp for sync
-    // More threads or sync warps needed due to split thread model
-    if (info->algorithm == NCCL_ALGO_TREE) nt += 4*WARP_SIZE;
-  }
-  nt = nt/WARP_SIZE < 3 ? 3*WARP_SIZE : nt;
-  if (info->algorithm == NCCL_ALGO_TREE) nt = NCCL_MAX_NTHREADS; // Tree now uses all threads always.
-  if (info->algorithm == NCCL_ALGO_PAT) nt = NCCL_MAX_NTHREADS;
+  int nc, nt;
+  topoGetChannelThreadCount(comm, info->algorithm, info->protocol, nBytes, &nc, &nt);
   info->nMaxChannels = nc;
   info->nWarps = nt/WARP_SIZE;
   return ncclSuccess;
@@ -2146,6 +2160,107 @@ ncclResult_t ncclGetAlgoInfo(
   return ncclSuccess;
 }
 
+__attribute__((visibility("default"))) ncclResult_t ncclQueryCollTuning(
+    ncclComm_t comm, ncclCollTuning* tuning) {
+  static_assert(NCCL_NUM_FUNCTIONS <= NCCL_TUNING_MAX_FUNCTIONS,
+      "ncclCollTuning function capacity too small");
+  static_assert(NCCL_NUM_ALGORITHMS <= NCCL_TUNING_MAX_ALGORITHMS,
+      "ncclCollTuning algorithm capacity too small");
+  static_assert(NCCL_NUM_PROTOCOLS <= NCCL_TUNING_MAX_PROTOCOLS,
+      "ncclCollTuning protocol capacity too small");
+
+  if (comm == NULL || tuning == NULL) return ncclInvalidArgument;
+
+  memset(tuning, 0, sizeof(*tuning));
+  tuning->version = NCCL_COLL_TUNING_VERSION;
+  tuning->nRanks = comm->nRanks;
+  tuning->nNodes = comm->nNodes;
+  tuning->nChannels = comm->nChannels;
+  tuning->minCompCap = comm->minCompCap;
+  tuning->maxCompCap = comm->maxCompCap;
+  tuning->numFunctions = NCCL_NUM_FUNCTIONS;
+  tuning->numAlgorithms = NCCL_NUM_ALGORITHMS;
+  tuning->numProtocols = NCCL_NUM_PROTOCOLS;
+  for (int f=0; f<NCCL_NUM_FUNCTIONS; f++) {
+    snprintf(tuning->functionNames[f], sizeof(tuning->functionNames[f]), "%s", ncclFuncStr[f]);
+  }
+  for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
+    snprintf(tuning->algorithmNames[a], sizeof(tuning->algorithmNames[a]), "%s", ncclAlgoStr[a]);
+  }
+  for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
+    snprintf(tuning->protocolNames[p], sizeof(tuning->protocolNames[p]), "%s", ncclProtoStr[p]);
+  }
+  for (int f=0; f<NCCL_NUM_FUNCTIONS; f++) {
+    for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
+      for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
+        tuning->bandwidths[f][a][p] = comm->bandwidths[f][a][p];
+        tuning->latencies[f][a][p] = comm->latencies[f][a][p];
+      }
+    }
+  }
+  for (int s=0; s<NCCL_TUNING_SIZE_POINTS; s++) {
+    tuning->messageSizes[s] = (uint64_t)1 << s;
+  }
+
+  for (int f=0; f<NCCL_NUM_FUNCTIONS; f++) {
+    // A synthetic float32 sum task: datatype and op only feed the collnet/nvls
+    // support checks and the fp8 relegation, none of which should shape the
+    // reported baseline.
+    struct ncclTaskColl info = {};
+    info.func = (ncclFunc_t)f;
+    info.datatype = ncclFloat32;
+    info.opHost = ncclSum;
+    info.opDev.op = ncclDevSum;
+    int collNetSupport = 0;
+    NCCLCHECK(ncclGetCollNetSupport(comm, &info, &collNetSupport));
+    int nvlsSupport = comm->nvlsSupport &&
+        (ncclNvlsSupported(info.opDev.op, info.datatype) || info.func == ncclFuncAllGather);
+    for (int s=0; s<NCCL_TUNING_SIZE_POINTS; s++) {
+      size_t nBytes = (size_t)1 << s;
+      float collCostTable[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
+      initCollCostTable((float**)collCostTable);
+      NCCLCHECK(updateCollCostTable(
+          comm, &info, nBytes, collNetSupport, nvlsSupport, /*numPipeOps=*/1,
+          (float**)collCostTable));
+      int pluginNc = 0;
+      if (comm->tuner != NULL) {
+        NCCLCHECK(comm->tuner->getCollInfo(
+            comm->tunerContext, info.func, nBytes, /*numPipeOps=*/1,
+            (float**)collCostTable, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS,
+            /*regBuff=*/0, &pluginNc));
+      }
+      float minTime = FLT_MAX;
+      int algorithm = -1, protocol = -1;
+      for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
+        for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
+          if (collCostTable[a][p] == NCCL_ALGO_PROTO_IGNORE) continue;
+          if (collCostTable[a][p] >= 0.0 && collCostTable[a][p] < minTime) {
+            algorithm = a;
+            protocol = p;
+            minTime = collCostTable[a][p];
+          }
+        }
+      }
+      ncclCollTuningEntry* entry = &tuning->bestBySize[f][s];
+      if (algorithm < 0) {
+        entry->algorithm = -1;
+        entry->protocol = -1;
+        entry->timeUs = -1.0f;
+        continue;
+      }
+      int nc, nt;
+      topoGetChannelThreadCount(comm, algorithm, protocol, nBytes, &nc, &nt);
+      if (pluginNc != 0) nc = pluginNc;
+      entry->algorithm = (int8_t)algorithm;
+      entry->protocol = (int8_t)protocol;
+      entry->nChannels = (int16_t)nc;
+      entry->nThreads = (int16_t)nt;
+      entry->timeUs = minTime;
+    }
+  }
+  return ncclSuccess;
+}
+
 static ncclResult_t calcCollChunking(
     struct ncclComm* comm, struct ncclTaskColl* info, int nChannels, size_t nBytes,
     /*outputs*/uint32_t* outChunkSize, uint32_t* outDirectFlags, struct ncclProxyOp* proxyOp
@@ -2184,7 +2299,7 @@ static ncclResult_t calcCollChunking(
       ncclPatternRingTwice;
     break;
   default:
-    WARN("Unknown pattern for collective %d algorithm %d", info->func, info->algorithm);
+    ERR(ncclInternalError, "Unknown pattern for collective %d algorithm %d", info->func, info->algorithm);
     return ncclInternalError;
   }
 
@@ -2309,7 +2424,7 @@ static ncclResult_t calcCollChunking(
     nstepsPerLoop = 1; nchunksPerLoop = comm->channels[0].nvls.nHeads;
     break;
   default:
-    WARN("Unknown pattern %d", pattern);
+    ERR(ncclInternalError, "Unknown pattern %d", pattern);
     return ncclInternalError;
   }
 
@@ -2375,7 +2490,7 @@ static ncclResult_t calcCollChunking(
         proxyOp->loopOffset = 0;
       }
     } else {
-      WARN("Net registration invalid algorithm %s", ncclAlgoToString(info->algorithm));
+      ERR(ncclInternalError, "Net registration invalid algorithm %s", ncclAlgoToString(info->algorithm));
       return ncclInternalError;
     }
 
@@ -2423,7 +2538,7 @@ static ncclResult_t calcCollChunking(
   case ncclPatternSend:
   case ncclPatternRecv:
   default:
-    WARN("Unknown pattern %d", pattern);
+    ERR(ncclInternalError, "Unknown pattern %d", pattern);
     return ncclInternalError;
   }
 
@@ -2516,7 +2631,7 @@ static ncclResult_t hostToDevRedOp(
     int ix = int(ncclUserRedOpMangle(comm, op)) - int(ncclNumOps);
     ncclUserRedOp *user = &comm->userRedOps[ix];
     if (datatype != user->datatype) {
-      WARN("Data type supplied to user-created ncclRedOp_t does not match type "
+      ERR(ncclInvalidArgument, "Data type supplied to user-created ncclRedOp_t does not match type "
            "given to reduction operation");
       return ncclInvalidArgument;
     }
@@ -2536,7 +2651,7 @@ static ncclResult_t ncclPlannerSetCapturingGraph(struct ncclComm* comm, struct n
         struct ncclCudaGraph graph;
         NCCLCHECK(ncclCudaGetCapturingGraph(&graph, info->stream, comm->config.graphUsageMode));
         if (planner->streams != nullptr && !ncclCudaGraphSame(planner->capturingGraph, graph)) {
-          WARN("Streams given to a communicator within a NCCL group must either be all uncaptured or all captured by the same graph.");
+          ERR(ncclInvalidUsage, "Streams given to a communicator within a NCCL group must either be all uncaptured or all captured by the same graph.");
           return ncclInvalidUsage;
         }
         planner->capturingGraph = graph; // C++ struct assignment
@@ -2780,33 +2895,33 @@ static ncclResult_t rmaTaskAppend(
   void const* srcBuff = info->sendbuff;
 
   if (!comm->hostRmaSupport) {
-    WARN("One sided RMA: host RMA is not supported in this communicator.");
+    ERR(ncclInvalidArgument, "One sided RMA: host RMA is not supported in this communicator.");
     return ncclInvalidArgument;
   }
 
   int driverVersion;
   NCCLCHECK(ncclCudaDriverVersion(&driverVersion));
   if (driverVersion < 12050) {
-    WARN("One-sided RMA requires CUDA driver 12.5 or later (found %d.%d).",
+    ERR(ncclInvalidUsage, "One-sided RMA requires CUDA driver 12.5 or later (found %d.%d).",
       driverVersion / 1000, (driverVersion % 1000) / 10);
     return ncclInvalidUsage;
   }
 
   // Check if context is valid (must be 0 for now)
   if (info->ctx != 0) {
-    WARN("Context %d is invalid (must be 0)", info->ctx);
+    ERR(ncclInvalidArgument, "Context %d is invalid (must be 0)", info->ctx);
     return ncclInvalidArgument;
   }
 
   // Check if signal index is valid (must be 0 for now)
   if (info->sigIdx != 0) {
-    WARN("Signal index %d is invalid (must be 0)", info->sigIdx);
+    ERR(ncclInvalidArgument, "Signal index %d is invalid (must be 0)", info->sigIdx);
     return ncclInvalidArgument;
   }
 
   // Check if flags is valid
   if (info->flags != 0) {
-    WARN("Flags %u is invalid (must be 0)", info->flags);
+    ERR(ncclInvalidArgument, "Flags %u is invalid (must be 0)", info->flags);
     return ncclInvalidArgument;
   }
 
@@ -2818,7 +2933,7 @@ static ncclResult_t rmaTaskAppend(
   if (info->coll == ncclFuncPutSignal) {
     // Validate peer window with detailed debugging
     if (info->peerWin == NULL) {
-      WARN("ncclPutSignal: peerWin is NULL");
+      ERR(ncclInvalidArgument, "ncclPutSignal: peerWin is NULL");
       return ncclInvalidArgument;
     }
 
@@ -2828,12 +2943,12 @@ static ncclResult_t rmaTaskAppend(
 
     // Validate source buffer and window
     if (srcBuff == NULL) {
-      WARN("ncclPutSignal: srcBuff is NULL");
+      ERR(ncclInvalidArgument, "ncclPutSignal: srcBuff is NULL");
       return ncclInvalidArgument;
     }
     NCCLCHECK(ncclDevrFindWindow(comm, srcBuff, &srcWinHost));
     if (srcWinHost == NULL || !(srcWinHost->winFlags & NCCL_WIN_COLL_SYMMETRIC)) {
-      WARN("ncclPutSignal: srcWinHost is not in a valid symmetric window");
+      ERR(ncclInvalidArgument, "ncclPutSignal: srcWinHost is not in a valid symmetric window");
       return ncclInvalidArgument;
     }
     srcWinOffset = (char*)srcBuff - (char*)srcWinHost->userPtr;
@@ -2842,39 +2957,39 @@ static ncclResult_t rmaTaskAppend(
     bool hasSysmemSegment = ncclDevrWindowHasSysmemSegment(srcWinHost) || ncclDevrWindowHasSysmemSegment(peerWinHost);
 
     if (isMultiSegment) {
-      WARN("ncclPutSignal currently does not support VAs backed by multiple physical cuMem segments");
+      ERR(ncclInvalidArgument, "ncclPutSignal currently does not support VAs backed by multiple physical cuMem segments");
       return ncclInvalidArgument;
     }
     if (hasSysmemSegment) {
-      WARN("ncclPutSignal currently does not support VAs with host-backed cuMem segments");
+      ERR(ncclInvalidArgument, "ncclPutSignal currently does not support VAs with host-backed cuMem segments");
       return ncclInvalidArgument;
     }
   }
   else if (info->coll == ncclFuncSignal) {
     // Check if count is valid
     if (info->count != 0) {
-      WARN("ncclSignal: count must be 0");
+      ERR(ncclInvalidArgument, "ncclSignal: count must be 0");
       return ncclInvalidArgument;
     }
   }
   else if (info->coll == ncclFuncWaitSignal) {
     // Check if signalDescs is valid
     if (info->signalDescs == NULL || info->nDesc == 0) {
-      WARN("ncclWaitSignal: invalid arguments");
+      ERR(ncclInvalidArgument, "ncclWaitSignal: invalid arguments");
       return ncclInvalidArgument;
     }
     // Validate each descriptor
     for (int i = 0; i < info->nDesc; i++) {
       if (info->signalDescs[i].opCnt <= 0) {
-        WARN("ncclWaitSignal: descriptor %d has invalid opCnt %d", i, info->signalDescs[i].opCnt);
+        ERR(ncclInvalidArgument, "ncclWaitSignal: descriptor %d has invalid opCnt %d", i, info->signalDescs[i].opCnt);
         return ncclInvalidArgument;
       }
       if (info->signalDescs[i].sigIdx != 0) {
-        WARN("ncclWaitSignal: descriptor %d has invalid sigIdx %d (must be 0)", i, info->signalDescs[i].sigIdx);
+        ERR(ncclInvalidArgument, "ncclWaitSignal: descriptor %d has invalid sigIdx %d (must be 0)", i, info->signalDescs[i].sigIdx);
         return ncclInvalidArgument;
       }
       if (info->signalDescs[i].ctx != 0) {
-        WARN("ncclWaitSignal: descriptor %d has invalid context %d (must be 0)",
+        ERR(ncclInvalidArgument, "ncclWaitSignal: descriptor %d has invalid context %d (must be 0)",
              i, info->signalDescs[i].ctx);
         return ncclInvalidArgument;
       }
@@ -3001,7 +3116,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
 
     if (info->datatype == ncclFloat8e4m3 || info->datatype == ncclFloat8e5m2) {
       if (comm->minCompCap < 90 && info->coll != ncclFuncAllGather && info->coll != ncclFuncBroadcast && info->coll != ncclFuncAlltoAll && info->coll != ncclFuncScatter && info->coll != ncclFuncGather) {
-        WARN("FP8 reduction support begins with sm90 capable devices.");
+        ERR(ncclInvalidArgument, "FP8 reduction support begins with sm90 capable devices.");
         return ncclInvalidArgument;
       }
     }
@@ -3089,7 +3204,7 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
   ncclResult_t ret = CommCheck(info->comm, info->opName, "comm");
   if (ret != ncclSuccess) return ncclGroupErrCheck(ret);
   if (info->comm->revokedFlag) {
-    WARN("%s: communicator was revoked", info->opName);
+    ERR(ncclInvalidUsage, "%s: communicator was revoked", info->opName);
     return ncclGroupErrCheck(ncclInvalidUsage);
   }
   // Profiler - If a group API event has already started, update the profilerGroupDepth so that the depth
@@ -3176,7 +3291,7 @@ ncclResult_t ncclRedOpCreatePreMulSum(ncclRedOp_t *op, void *scalar, ncclDataTyp
 NCCL_API(ncclResult_t, ncclRedOpDestroy, ncclRedOp_t op, ncclComm_t comm);
 ncclResult_t ncclRedOpDestroy(ncclRedOp_t op, ncclComm_t comm) {
   if (0 <= int(op) && int(op) < int(ncclNumOps)) {
-    WARN("ncclRedOpDestroy : operator is a NCCL builtin.");
+    ERR(ncclInvalidArgument, "ncclRedOpDestroy : operator is a NCCL builtin.");
     return ncclInvalidArgument;
   }
   // int(ncclMaxRedOp) < int(op) will always be false due to the sizes of
@@ -3184,17 +3299,17 @@ ncclResult_t ncclRedOpDestroy(ncclRedOp_t op, ncclComm_t comm) {
   // just as a reminder.
   // coverity[result_independent_of_operands]
   if (int(op) < 0 || int(ncclMaxRedOp) < int(op)) {
-    WARN("ncclRedOpDestroy :  operator is garbage.");
+    ERR(ncclInvalidArgument, "ncclRedOpDestroy :  operator is garbage.");
     return ncclInvalidArgument;
   }
   if (comm == NULL) {
-    WARN("ncclRedOpDestroy : invalid communicator passed.");
+    ERR(ncclInvalidArgument, "ncclRedOpDestroy : invalid communicator passed.");
     return ncclInvalidArgument;
   }
 
   int ix = int(ncclUserRedOpMangle(comm, op)) - int(ncclNumOps);
   if (comm->userRedOpCapacity <= ix || comm->userRedOps[ix].freeNext != -1) {
-    WARN("ncclRedOpDestroy : operator unknown to this communicator.");
+    ERR(ncclInvalidArgument, "ncclRedOpDestroy : operator unknown to this communicator.");
     return ncclInvalidArgument;
   }
   // push to free list

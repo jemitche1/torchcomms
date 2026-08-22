@@ -16,6 +16,7 @@
 #include "comms/ctran/algos/CtranAlgo.h"
 #include "comms/ctran/algos/common/GpeRing.h"
 #include "comms/ctran/gpe/CtranGpe.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/CtranPerf.h"
 #include "comms/ctran/utils/CudaGraphUtils.h"
 #include "comms/utils/cvars/nccl_cvars.h"
@@ -150,6 +151,14 @@ commResult_t ctranAllToAll(
         allToAllAlgoName(algo));
   }
 
+  // Window-aware persistent path: the recvbuff lives in a registered symmetric
+  // window; reuse (or lazily build) a window-cached persistent AllToAllP
+  // request. Capture-safe without being a graph-aware algo.
+  if (algo == NCCL_ALLTOALL_ALGO::ctwin) {
+    return ctranAllToAllCtwin(
+        sendbuff, recvbuff, count, datatype, comm, stream, algo);
+  }
+
   // TODO: alltoallKerns perform poorly on HCM due to lack of NVL connection
   // between some GPUs We need detect topology and switch to use IB transport in
   // such a case
@@ -182,7 +191,8 @@ bool ctranAllToAllSupport(
     commDataType_t datatype,
     CtranComm* comm,
     enum NCCL_ALLTOALL_ALGO algo,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    void* recvbuff) {
   // Currently there is only one ctran algo for alltoall, but we pass algo as a
   // parameter for future extension and consistency across collectives.
   // Currently just return false if algo is set to orig
@@ -191,6 +201,14 @@ bool ctranAllToAllSupport(
   }
 
   const auto statex = comm->statex_.get();
+
+  // Window-aware persistent algo: recvbuff must sit in a symmetric AllToAllP
+  // window. Dormant (false) until a caller passes recvbuff.
+  if (algo == NCCL_ALLTOALL_ALGO::ctwin) {
+    const size_t recvBytes = count * statex->nRanks() * commTypeSize(datatype);
+    return checkCtranAllToAllCtwinSupport(
+        comm, recvbuff, recvBytes, algo, nullptr);
+  }
 
   // Cudagraph-aware algo requires an active CUDA graph capture on the stream.
   if (isGraphAwareAlgo(algo)) {
@@ -202,7 +220,7 @@ bool ctranAllToAllSupport(
         ctran::utils::cudagraph::getStreamCaptureInfo(stream, captureInfo);
     if (err != cudaSuccess ||
         captureInfo.status != cudaStreamCaptureStatusActive) {
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO,
           COLL,
           "AllToAll {}: not in capture mode. "
@@ -239,6 +257,8 @@ bool ctranAllToAllSupport(
 // IB support will be added in a follow-up via IBGDA (not CPU proxy).
 // ============================================================================
 
+bool ctranDeviceAllToAllvSupport(CtranComm* comm);
+
 commResult_t ctranDeviceAllToAllv(
     const void* sendbuff,
     void* recvbuff,
@@ -250,6 +270,13 @@ commResult_t ctranDeviceAllToAllv(
     int64_t sendcountsMultiplier,
     int64_t recvcountsMultiplier,
     const std::unordered_map<std::string, std::string>& hints) {
+  if (!ctranDeviceAllToAllvSupport(comm)) {
+    CTRAN_ERR(
+        commInvalidArgument,
+        "DeviceAllToAllvPipes requires an initialized NVLink-only communicator");
+    return commInvalidArgument;
+  }
+
   auto opCount = comm->ctran_->getOpCount();
 
   KernelConfig config = KernelConfig(
@@ -263,7 +290,7 @@ commResult_t ctranDeviceAllToAllv(
   ctran::device_alltoallv_pipes::CollectiveConfig collConfig(
       comm->statex_->nLocalRanks(), &hints);
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       COLL,
       "DeviceAllToAllvPipes: opCount {} numBlocks {} numThreads {} "
@@ -298,6 +325,12 @@ commResult_t ctranDeviceAllToAllv(
       ? ncclKernelDeviceAllToAllvPipes<PipeProtocol::LL128>
       : ncclKernelDeviceAllToAllvPipes<PipeProtocol::Simple>;
 
+  // This NVLink-only device kernel does not use the GPE flag mechanism and does
+  // not construct a ColltraceEventScope, so do not arm an in-kernel colltrace
+  // record for it — otherwise the reused config's default emit flags would
+  // create a record that never receives its start/end and stays in-flight.
+  config.colltraceEmitStart = false;
+  config.colltraceEmitEnd = false;
   FB_COMMCHECK(comm->ctran_->gpe->submit(
       std::move(opGroup), nullptr, config, reinterpret_cast<void*>(kernel)));
 
@@ -316,8 +349,8 @@ bool ctranDeviceAllToAllvSupport(CtranComm* comm) {
 
   // NVLink domain only: verify ALL peers are reachable via NVLink (or self).
   // Reject communicators with any IB-only peers to prevent silent data loss.
-  // Use host-side API — getMultiPeerTransportsPtr() returns a device pointer
-  // that cannot be dereferenced on the host.
+  // Use host-side API — getMultiPeerTransportsPtr(peers) returns a device
+  // pointer that cannot be dereferenced on the host.
   const auto statex = comm->statex_.get();
   for (int rank = 0; rank < statex->nRanks(); rank++) {
     auto type = comm->multiPeerTransport_->get_transport_type(rank);

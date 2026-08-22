@@ -24,8 +24,10 @@ using ctran::algos::PersistPlanKey;
 using ctran::allgather::ctsrd::createPersistPlan;
 using ctran::allgather::ctsrd::PersistPlan;
 using ctran::allgather::ctsrd::Plan;
+using ctran::allgather::ctsrd::common::exchangeCtrl;
+using ctran::allgather::ctsrd::common::progressSteps;
 using ctran::allgather::ctsrd::common::resolveFwdPeers;
-using ctran::allgather::ctsrd::common::runExchangeAndProgress;
+using ctran::allgather::ctsrd::common::waitCtrl;
 using ctran::allgatherp::AlgoImpl;
 using ctran::allgatherp::PersistArgs;
 using ctran::allgatherp::Resource;
@@ -159,25 +161,40 @@ commResult_t gpeFn(const std::vector<std::unique_ptr<struct OpElem>>& opGroup) {
       recvPlan,
       sendPlan);
 
-  FB_COMMCHECK(runExchangeAndProgress(ctx, nodeId, profiler));
+  resetPipeEnd(*resource, comm);
+
+  CTRAN_PROFILER_IF(
+      profiler, profiler->startEvent(ctran::ProfilerEvent::ALGO_CTRL));
+  FB_COMMCHECK(exchangeCtrl(ctx));
+  CTRAN_PROFILER_IF(
+      profiler, profiler->endEvent(ctran::ProfilerEvent::ALGO_CTRL));
+
+  CTRAN_PROFILER_IF(
+      profiler, profiler->startEvent(ctran::ProfilerEvent::ALGO_DATA));
+  FB_COMMCHECK(progressSteps(ctx, nodeId));
+  waitPipeEnd(*resource, comm);
+  CTRAN_PROFILER_IF(
+      profiler, profiler->endEvent(ctran::ProfilerEvent::ALGO_DATA));
+
+  FB_COMMCHECK(waitCtrl(ctx));
 
   return commSuccess;
 }
 } // namespace
 
 namespace ctran::allgatherp {
-extern __global__ void ncclKernelAllGatherPPipeStart(
+extern __global__ void ncclKernelAllGatherPSrdPipeStart(
     ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState);
-extern __global__ void ncclKernelAllGatherPPipeSync(
+extern __global__ void ncclKernelAllGatherPSrdPipeSync(
     ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     PipeSyncKernArgs args);
-extern __global__ void ncclKernelAllGatherPPipeEnd(
+extern __global__ void ncclKernelAllGatherPSrdPipeEnd(
     ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     PipeEndKernArgs args);
-extern __global__ void ncclKernelAllGatherPPipe(
+extern __global__ void ncclKernelAllGatherPStreamedRd(
     ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState);
 
@@ -245,6 +262,12 @@ commResult_t AlgoImpl::execStreamedRecursiveDoubling(
   config.numThreads = 1;
   config.args.devState_d = ctran->algo->getDevState();
 
+  // In-kernel colltrace grouping across the Srd multi-kernel collective
+  // (SrdPipeStart..SrdPipeSync..SrdPipeEnd): the begin kernel emits the start
+  // boundary and opens the group; the end kernel emits the end. Set explicitly
+  // per submit because the reused KernelConfig defaults its emit flags to true.
+  bool colltraceGroupOpen = false;
+
   // The streamed GPE path sources every outgoing chunk from recvbuff, including
   // the local rank's own chunk. Keep the copy stream-ordered before PipeStart.
   FB_COMMCHECK(copyToSelf(
@@ -267,21 +290,35 @@ commResult_t AlgoImpl::execStreamedRecursiveDoubling(
     opGroup.push_back(std::move(op));
 
     if (nLocalRanks > 1) {
+      // Multi-kernel begin: emit the start boundary and open the group; the
+      // SrdPipeEnd kernel below reuses this record and emits the end.
+      config.colltraceEmitStart = true;
+      config.colltraceEmitEnd = false;
+      colltraceGroupOpen = true;
       FB_COMMCHECK(ctran->gpe->submit(
           std::move(opGroup),
           gpeFn,
           config,
-          reinterpret_cast<void*>(ncclKernelAllGatherPPipeStart)));
+          reinterpret_cast<void*>(ncclKernelAllGatherPSrdPipeStart)));
     } else {
+      // Single-kernel collective: emit both boundaries explicitly rather than
+      // relying on the reused config's KernelConfig defaults.
+      config.colltraceEmitStart = true;
+      config.colltraceEmitEnd = true;
       FB_COMMCHECK(ctran->gpe->submit(
           std::move(opGroup),
           gpeFn,
           config,
-          reinterpret_cast<void*>(ncclKernelAllGatherPPipe)));
+          reinterpret_cast<void*>(ncclKernelAllGatherPStreamedRd)));
     }
   }
 
   if (nLocalRanks > 1) {
+    // The own-chunk barrier (cross-iteration WAR guard) is folded into
+    // ncclKernelAllGatherPSrdPipeStart, saving a separate ncclKernelNvlBarrier
+    // launch. PipeStart is only submitted when nNodes > 1, so the single-node
+    // case must still emit the standalone barrier here: exactly one of the two
+    // must emit it.
     FB_COMMCHECK(nvlCeBcast(
         comm_,
         sendbuff,
@@ -289,7 +326,9 @@ commResult_t AlgoImpl::execStreamedRecursiveDoubling(
         myRank * sendSize,
         pArgs.remoteRecvBuffs,
         pArgs.remoteAccessKeys,
-        stream_));
+        stream_,
+        /*barrier=*/nNodes == 1,
+        pArgs.mcWrite));
 
     for (int step = 0; step < recvPlan.nSteps(); step++) {
       PipeSyncKernArgs syncArgs = {
@@ -297,17 +336,30 @@ commResult_t AlgoImpl::execStreamedRecursiveDoubling(
           .pipeSync = resource_.pipeSync,
       };
       config.algoArgs = reinterpret_cast<void*>(&syncArgs);
+      // Interior kernel: emits neither boundary and reuses the begin kernel's
+      // record. Overwrite the values leaked from the reused `config`.
+      config.colltraceEmitStart = false;
+      config.colltraceEmitEnd = false;
       FB_COMMCHECK(ctran->gpe->submit(
           {},
           nullptr,
           config,
-          reinterpret_cast<void*>(ncclKernelAllGatherPPipeSync)));
+          reinterpret_cast<void*>(ncclKernelAllGatherPSrdPipeSync)));
 
       int chunkIndex = 0;
       for (const auto node : recvPlan.chunks(step)) {
         const auto offset =
             (static_cast<size_t>(node) * nLocalRanks + localRank) * sendSize;
         auto srcPtr = ctran::allgatherp::getPtr(pArgs.recvbuff, offset);
+        // The per-step barrier fires once per step (first chunk) and only paces
+        // the N-1 unicast writes' incast, so it is always kept on that path.
+        // The multicast write is a single switch-fanned store with no incast to
+        // pace, so NCCL_CTRAN_AGP_SKIP_MC_INTRA_BARRIER can drop it there as a
+        // perf A/B. Correctness holds either way via the pre-loop own-chunk
+        // barrier (cross-iteration WAR) + PipeEnd, with disjoint per-rank rail
+        // columns.
+        const bool skipBarrier =
+            pArgs.mcWrite && NCCL_CTRAN_AGP_SKIP_MC_INTRA_BARRIER;
         FB_COMMCHECK(nvlCeBcast(
             comm_,
             srcPtr,
@@ -316,7 +368,8 @@ commResult_t AlgoImpl::execStreamedRecursiveDoubling(
             pArgs.remoteRecvBuffs,
             pArgs.remoteAccessKeys,
             stream_,
-            chunkIndex++ == 0));
+            chunkIndex++ == 0 && !skipBarrier,
+            pArgs.mcWrite));
       }
     }
 
@@ -324,11 +377,22 @@ commResult_t AlgoImpl::execStreamedRecursiveDoubling(
         .pipeSync = resource_.pipeSync,
     };
     config.algoArgs = reinterpret_cast<void*>(&endArgs);
+    if (colltraceGroupOpen) {
+      // Multi-kernel end: close the group opened by SrdPipeStart and emit only
+      // the end boundary.
+      config.colltraceEmitStart = false;
+      config.colltraceEmitEnd = true;
+    } else {
+      // No inter-node begin ran (nNodes == 1), so this end kernel represents
+      // the whole intra-node collective: emit both boundaries.
+      config.colltraceEmitStart = true;
+      config.colltraceEmitEnd = true;
+    }
     FB_COMMCHECK(ctran->gpe->submit(
         {},
         nullptr,
         config,
-        reinterpret_cast<void*>(ncclKernelAllGatherPPipeEnd)));
+        reinterpret_cast<void*>(ncclKernelAllGatherPSrdPipeEnd)));
   }
 
   return commSuccess;

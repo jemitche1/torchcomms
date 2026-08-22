@@ -6,10 +6,13 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include <fmt/format.h>
 
+#include "comms/common/CollectiveStats.h"
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/algos/AllGather/Types.h"
 #include "comms/ctran/algos/AllReduce/Types.h"
@@ -18,6 +21,7 @@
 #include "comms/ctran/algos/CtranAlgoDev.h"
 #include "comms/ctran/algos/ReduceScatter/Types.h"
 #include "comms/ctran/algos/SendRecv/Types.h"
+#include "comms/ctran/algos/common/AlgoShortName.h"
 #include "comms/ctran/algos/common/GpeKernelSync.h"
 #include "comms/ctran/algos/common/GpeRing.h"
 #include "comms/ctran/gpe/CtranGpeDev.h"
@@ -282,6 +286,8 @@ struct KernelConfig {
   } type;
   unsigned int numBlocks{1};
   unsigned int numThreads{1};
+  // Occupancy for the stats bucket; the GPE has no kernel pointer of its own.
+  unsigned int blocksPerSM{0};
 
   cudaStream_t stream;
   CtranKernelArgs args;
@@ -310,10 +316,29 @@ struct KernelConfig {
   // Dynamic shared memory size override. 0 = use sizeof(CtranAlgoDeviceState).
   size_t dynamicSharedMemBytes{0};
 
+  // The size the kernel is launched with. Anything reasoning about the launch
+  // (occupancy, the opt-in shared memory limit) must agree with it.
+  size_t launchSharedMemBytes() const {
+    return dynamicSharedMemBytes > 0 ? dynamicSharedMemBytes
+                                     : sizeof(CtranAlgoDeviceState);
+  }
+
   // Experimental: allows one-sided communications, waitSignal and
   // multiWaitSignal, to run in parallel with other kernels when
   // launched on a single GPE thread.
   bool canConcurrent{false};
+
+  // In-kernel colltrace: on the graph-capture path (sm_90+), the collective
+  // kernel writes its own start/end timestamps into the colltrace ring so one
+  // logical collective maps to one CollTrace record. A single-kernel collective
+  // emits both boundaries (the defaults). A multi-kernel collective (e.g. the
+  // AllGatherP pipeline) sets these per kernel: the begin kernel emits the
+  // start and opens the record, interior kernels emit neither (and reuse the
+  // record), and the end kernel emits the end. A kernel owns the record iff it
+  // emits the start; interior/end kernels reuse the begin kernel's. Off the
+  // in-kernel path (eager, pre-sm_90, HIP) these are ignored.
+  bool colltraceEmitStart{true};
+  bool colltraceEmitEnd{true};
 
  public:
   KernelConfig(
@@ -344,6 +369,109 @@ struct fmt::formatter<KernelConfig::KernelType> : fmt::formatter<int> {
     return fmt::formatter<int>::format(static_cast<int>(status), ctx);
   }
 };
+
+inline const char* ctranCollectiveOpName(OpElem::opType t) {
+  switch (t) {
+    case OpElem::ALLGATHER:
+      return "allgather";
+    case OpElem::ALLGATHERP_INIT:
+      return "allgatherp_init";
+    case OpElem::ALLGATHERP:
+      return "allgatherp";
+    case OpElem::ALLREDUCE:
+      return "allreduce";
+    case OpElem::SEND:
+      return "send";
+    case OpElem::RECV:
+      return "recv";
+    case OpElem::ALLTOALL:
+      return "alltoall";
+    case OpElem::ALLTOALLP:
+      return "alltoallp";
+    case OpElem::ALLTOALLV:
+      return "alltoallv";
+    case OpElem::DEVICE_ALLTOALLV:
+      return "device_alltoallv";
+    case OpElem::ALLTOALLV_DEDUP:
+      return "alltoallv_dedup";
+    case OpElem::BROADCAST:
+      return "broadcast";
+    case OpElem::REDUCESCATTER:
+      return "reducescatter";
+    case OpElem::PUTNOTIFY:
+      return "putnotify";
+    case OpElem::WAITNOTIFY:
+      return "waitnotify";
+    case OpElem::PUTSIGNAL:
+      return "putsignal";
+    case OpElem::WAITSIGNAL:
+      return "waitsignal";
+    case OpElem::SIGNAL:
+      return "signal";
+    case OpElem::GET:
+      return "get";
+  }
+  return "unknown";
+}
+
+// Bytes moved by a single op; 0 for the variable-size and one-sided ops,
+// whose extent is not on the OpElem. Those share a "<op>.<algo>.0" bucket.
+inline size_t ctranCollectiveMsgSize(const OpElem& op) {
+  switch (op.type) {
+    case OpElem::ALLGATHER:
+      return op.allgather.sendcount * commTypeSize(op.allgather.datatype);
+    case OpElem::ALLREDUCE:
+      return op.allreduce.count * commTypeSize(op.allreduce.datatype);
+    case OpElem::REDUCESCATTER:
+      return op.reducescatter.recvcount *
+          commTypeSize(op.reducescatter.datatype);
+    case OpElem::ALLTOALL:
+      return op.alltoall.count * commTypeSize(op.alltoall.datatype);
+    case OpElem::SEND:
+      return op.send.count * commTypeSize(op.send.datatype);
+    case OpElem::RECV:
+      return op.recv.count * commTypeSize(op.recv.datatype);
+    case OpElem::BROADCAST:
+      return op.broadcast.count * commTypeSize(op.broadcast.datatype);
+    default:
+      return 0;
+  }
+}
+
+struct CtranCollectiveStatsKey {
+  std::string collective;
+  // "<collective>.<algo>.<bytes>", e.g. "allreduce.ctring.1048576".
+  std::string key;
+  // Captured at submit; the GPE thread has no KernelConfig.
+  uint32_t numBlocks{0};
+  uint32_t blockSize{0};
+  uint32_t blocksPerSM{0};
+};
+
+// Built once at submit and cached on the cmd: the GPE thread re-runs on every
+// graph replay, and the key is identical across replays.
+// A grouped submit is attributed to opGroup.front() and timed as a whole.
+inline CtranCollectiveStatsKey ctranCollectiveStatsKey(
+    const std::vector<std::unique_ptr<struct OpElem>>& opGroup,
+    const KernelConfig& kernelConfig) {
+  if (opGroup.empty()) {
+    return {};
+  }
+  const auto& op = *opGroup.front();
+  const char* collective = ctranCollectiveOpName(op.type);
+  const std::string_view algoName = kernelConfig.algoName;
+  return {
+      collective,
+      fmt::format(
+          "{}.{}.{}",
+          collective,
+          algoName.empty() ? std::string_view{"unknown"}
+                           : ctran::algoShortName(algoName),
+          ctranCollectiveMsgSize(op)),
+      kernelConfig.numBlocks,
+      kernelConfig.numThreads,
+      kernelConfig.blocksPerSM};
+}
 
 class CtranGpe {
  public:
@@ -414,6 +542,8 @@ class CtranGpe {
   // The mapper enforces this by clearing its per-peer host-transport
   // cache in setAtDestruction() before gpe is torn down.
   GpeKernelSyncPool* gpeKernelSyncPool();
+
+  comms::CollectiveStatsMap getAndClearCollectiveStats();
 
  private:
   class Impl;

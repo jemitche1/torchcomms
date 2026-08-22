@@ -2,9 +2,12 @@
 
 #pragma once
 
+#include <cassert>
+
 #include "comms/utils/colltrace/CollRecord.h"
 #include "comms/utils/colltrace/CollTraceHandle.h"
 #include "comms/utils/colltrace/CollWaitEvent.h"
+#include "comms/utils/colltrace/GraphCudaWaitEvent.h"
 #include "comms/utils/commSpecs.h"
 
 namespace meta::comms::colltrace {
@@ -56,7 +59,34 @@ class GraphCollTraceHandle : public ICollTraceHandle {
     return folly::Unit{};
   }
 
+  ColltraceDeviceHandle getColltraceDeviceHandle() noexcept override {
+    auto* graphWaitEvent = graphWaitEvent_();
+    if (graphWaitEvent == nullptr || !graphWaitEvent->hasRingBuffer()) {
+      return {};
+    }
+    // emitStart/emitEnd are set by the arming code (armInKernelColltrace /
+    // armBaselineInKernelColltrace) per the kernel's role; initialize them
+    // explicitly here since ColltraceDeviceHandle has no default member
+    // initializers (for __shared__ compatibility).
+    return {
+        .collId = graphWaitEvent->getCollId(),
+        .emitStart = false,
+        .emitEnd = false,
+        .ring = graphWaitEvent->deviceHandle()};
+  }
+
  private:
+  // waitEvent_ is always a GraphCudaWaitEvent for this handle (constructed by
+  // CollTrace::recordGraphCollectiveImpl), or null after invalidate(). This is
+  // on the submit hot path, so static_cast avoids RTTI; the debug-only assert
+  // catches any future violation of that invariant.
+  GraphCudaWaitEvent* graphWaitEvent_() const {
+    assert(
+        waitEvent_ == nullptr ||
+        dynamic_cast<GraphCudaWaitEvent*>(waitEvent_) != nullptr);
+    return static_cast<GraphCudaWaitEvent*>(waitEvent_);
+  }
+
   ICollWaitEvent* waitEvent_;
   std::shared_ptr<ICollRecord> record_;
 };

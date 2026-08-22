@@ -519,8 +519,9 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     // number of channels need to be setup later in ncclCollPreconnectFunc for
     // collectives. Otherwise, fallback to baseline runtime connection logic
     if (comm->lazySetupChannels && ncclx::algoCanLazySetupChannel(comm, task)) {
-      *needConnect = ncclx::algoNeedConnect(comm, task);
-      algoNeedConnect[task->algorithm] |= *needConnect;
+      const bool taskNeedConnect = ncclx::algoNeedConnect(comm, task);
+      *needConnect |= taskNeedConnect;
+      algoNeedConnect[task->algorithm] |= taskNeedConnect;
     } else if (
         comm->runtimeConn && comm->initAlgoChannels[task->algorithm] == false) {
       if (task->algorithm == NCCL_ALGO_NVLS_TREE && comm->initAlgoChannels[NCCL_ALGO_NVLS] == false && regNeedConnect == true) {
@@ -1740,9 +1741,9 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     CU_LAUNCH_PARAM_BUFFER_SIZE, &plan->kernelArgsSize,
     CU_LAUNCH_PARAM_END
   };
-  // CollTrace Injected code here
-  auto colltraceHandle = ncclx::colltrace::collTraceBaselineGetHandle(plan, launchStream);
-
+  // [META] Colltrace handle creation and in-kernel graph timestamp arming.
+  auto colltraceHandle = ncclx::colltrace::prepareNcclKernelColltrace(
+      plan, launchStream, comm->compCap);
 
   int driverVersion;
   NCCLCHECKGOTO(ncclCudaDriverVersion(&driverVersion), ret, do_return);

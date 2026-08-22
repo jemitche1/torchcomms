@@ -4,6 +4,7 @@
 
 #include <fmt/format.h>
 #include <folly/FileUtil.h>
+#include <folly/ScopeGuard.h>
 #include <folly/logging/LogMessage.h>
 #include <folly/testing/TestUtil.h>
 #include <gmock/gmock.h>
@@ -13,9 +14,12 @@
 #include "comms/utils/cvars/nccl_cvars.h"
 #include "comms/utils/logger/Logger.h"
 #include "comms/utils/logger/LoggingFormat.h"
+#include "meta/NcclxChecks.h"
 
 #include "debug.h" // @manual
 #include "param.h" // @manual
+
+extern "C" void ncclResetDebugInitInternal();
 
 namespace {
 void inline checkStringHasLogging(
@@ -51,7 +55,26 @@ class NcclLoggerTest : public ::testing::Test {
     ncclDebugLevel = -1;
     initNcclLogger();
   }
+
+  void initLegacyLogging() {
+    NcclLogger::init(
+        {.contextName = "comms.ncclx",
+         .logPrefix = "NCCL",
+         .logFilePath =
+             meta::comms::logger::parseDebugFile(NCCL_DEBUG_FILE.c_str()),
+         .logLevel = meta::comms::logger::loggerLevelToFollyLogLevel(
+             meta::comms::logger::getLoggerDebugLevel(NCCL_DEBUG)),
+         .threadContextFn = []() {
+           int cudaDev = -1;
+           (void)cudaGetDevice(&cudaDev);
+           return cudaDev;
+         }});
+  }
 };
+
+TEST_F(NcclLoggerTest, LegacyCloseIsSafeWhenNotInitialized) {
+  NcclLogger::close();
+}
 
 // Just for remembering the test format. Current test format example:
 // P1783645719
@@ -64,6 +87,7 @@ TEST_F(NcclLoggerTest, LogDisplay) {
   // auto fileGuard = EnvRAII(NCCL_DEBUG_FILE, std::string{"/tmp/debug.test3"});
 
   initLogging();
+  initLegacyLogging();
   NcclLogger::init(
       // TODO: Change the context name when ctran is refactored out of NCCLX
       // Otherwise the logging will no longer work as intended.
@@ -87,9 +111,49 @@ TEST_F(NcclLoggerTest, LogDisplay) {
 
   INFO(NCCL_ALL, "%s", TestStr.c_str());
   WARN("%s", TestStr.c_str());
-  ERR("%s", TestStr.c_str());
+  ERR(ncclInternalError, "%s", TestStr.c_str());
 
   finishLogging();
+}
+
+TEST_F(NcclLoggerTest, NcclxChecksPreserveResultsAndSingleEvaluation) {
+  auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"INFO"});
+  ncclResetDebugInitInternal();
+  initLogging();
+  auto loggingGuard = folly::makeGuard([&] { finishLogging(); });
+
+  int commEvaluations = 0;
+  EXPECT_NO_THROW(NCCLX_COMMCHECKTHROW((++commEvaluations, commSuccess)));
+  EXPECT_NO_THROW(NCCLX_COMMCHECKTHROW((++commEvaluations, commInProgress)));
+  EXPECT_THROW(
+      NCCLX_COMMCHECKTHROW((++commEvaluations, commInternalError)),
+      std::runtime_error);
+  EXPECT_EQ(commEvaluations, 3);
+
+  int messageEvaluations = 0;
+  EXPECT_THROW(
+      NCCLX_ERRORTHROW(
+          commInvalidUsage, "NCCLX error {}", ++messageEvaluations),
+      std::runtime_error);
+  EXPECT_EQ(messageEvaluations, 1);
+
+  int cudaEvaluations = 0;
+  EXPECT_NO_THROW(NCCLX_CUDACHECKTHROW((++cudaEvaluations, cudaSuccess)));
+  EXPECT_THROW(
+      NCCLX_CUDACHECKTHROW((++cudaEvaluations, cudaErrorInvalidValue)),
+      std::runtime_error);
+  EXPECT_EQ(cudaEvaluations, 2);
+
+  auto expectedCheck = [](cudaError_t error) -> meta::comms::CommsMaybeVoid {
+    NCCLX_CUDA_CHECK_EXPECTED(error);
+    return folly::unit;
+  };
+  EXPECT_TRUE(expectedCheck(cudaSuccess).hasValue());
+  const auto expectedError = expectedCheck(cudaErrorInvalidValue);
+  ASSERT_TRUE(expectedError.hasError());
+  EXPECT_EQ(expectedError.error().errorCode, commUnhandledCudaError);
+  EXPECT_THAT(
+      expectedError.error().message, testing::HasSubstr("CUDA error in"));
 }
 
 TEST_F(NcclLoggerTest, GetLastCommsErrorTest) {
@@ -119,7 +183,7 @@ TEST_F(NcclLoggerTest, GetLastCommsErrorTest) {
 
   // Log an error message - should update last error
   std::string errorMsg = "ERROR MESSAGE";
-  ERR("%s", errorMsg.c_str());
+  ERR(ncclInternalError, "%s", errorMsg.c_str());
   sleep(1);
   lastError = meta::comms::logger::getLastCommsError();
   EXPECT_THAT(lastError, ::testing::HasSubstr(errorMsg));
@@ -127,10 +191,18 @@ TEST_F(NcclLoggerTest, GetLastCommsErrorTest) {
 
   // Log another error message - should update to the new error
   std::string errorMsg2 = "SECOND ERROR MESSAGE";
-  ERR("%s", errorMsg2.c_str());
+  ERR(ncclInternalError, "%s", errorMsg2.c_str());
   sleep(1);
   lastError = meta::comms::logger::getLastCommsError();
   EXPECT_THAT(lastError, ::testing::HasSubstr(errorMsg2));
+  EXPECT_THAT(lastError, ::testing::HasSubstr("NCCL Stack trace:"));
+
+  constexpr std::string_view spdlogErrorMsg = "SPDLOG ERROR MESSAGE";
+  NCCLX_LOG(ERR, "{}", spdlogErrorMsg);
+  meta::comms::logger::getSpdlogLogger(ncclx::logging::kNcclxLoggerName)
+      .flush();
+  lastError = meta::comms::logger::getLastCommsError();
+  EXPECT_THAT(lastError, ::testing::HasSubstr(spdlogErrorMsg));
   EXPECT_THAT(lastError, ::testing::HasSubstr("NCCL Stack trace:"));
 
   // Log info and warn - last error should remain unchanged
@@ -138,7 +210,7 @@ TEST_F(NcclLoggerTest, GetLastCommsErrorTest) {
   WARN("Another warn");
   sleep(1);
   lastError = meta::comms::logger::getLastCommsError();
-  EXPECT_THAT(lastError, ::testing::HasSubstr(errorMsg2));
+  EXPECT_THAT(lastError, ::testing::HasSubstr(spdlogErrorMsg));
 
   finishLogging();
 }
@@ -152,7 +224,7 @@ TEST_F(NcclLoggerTest, GetLastCommsErrorMultilineTest) {
 
   // Log a multiline error message
   std::string multilineError = "First line\nSecond line\nThird line";
-  ERR("%s", multilineError.c_str());
+  ERR(ncclInternalError, "%s", multilineError.c_str());
   sleep(1);
 
   auto lastError = meta::comms::logger::getLastCommsError();
@@ -170,7 +242,7 @@ TEST_F(NcclLoggerTest, GetLastCommsErrorLongMessageTest) {
 
   // Create a long error message (but within the 1024 char buffer)
   std::string longError(500, 'X');
-  ERR("%s", longError.c_str());
+  ERR(ncclInternalError, "%s", longError.c_str());
   sleep(1);
 
   auto lastError = meta::comms::logger::getLastCommsError();
@@ -184,6 +256,7 @@ TEST_F(NcclLoggerTest, GetLastCommsErrorLongMessageTestXLOG) {
   ncclResetDebugInit();
 
   initLogging();
+  initLegacyLogging();
 
   // Create a long error message (but within the 1024 char buffer)
   std::string longError(500, 'X');
@@ -202,10 +275,15 @@ TEST_F(NcclLoggerTest, WarnLogTest) {
   ncclResetDebugInit();
 
   initLogging();
+  auto& spdlogLogger =
+      meta::comms::logger::getSpdlogLogger(ncclx::logging::kNcclxLoggerName);
+  EXPECT_TRUE(spdlogLogger.should_log(spdlog::level::err));
+  EXPECT_TRUE(spdlogLogger.should_log(spdlog::level::warn));
+  EXPECT_FALSE(spdlogLogger.should_log(spdlog::level::info));
   std::string TestStr = "TESTING";
 
   testing::internal::CaptureStdout();
-  ERR("%s", TestStr.c_str());
+  ERR(ncclInternalError, "%s", TestStr.c_str());
   sleep(1);
   std::string output = testing::internal::GetCapturedStdout();
   checkStringHasLogging(output, TestStr, "ERROR");
@@ -225,16 +303,99 @@ TEST_F(NcclLoggerTest, WarnLogTest) {
   finishLogging();
 }
 
+TEST_F(NcclLoggerTest, SpdlogFirstNDoesNotConsumeWhileDisabled) {
+  auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"WARN"});
+
+  initLogging();
+  auto& logger =
+      meta::comms::logger::getSpdlogLogger(ncclx::logging::kNcclxLoggerName);
+  auto logFirstN = [](int value) {
+    NCCLX_LOG_FIRST_N(WARN, 2, "NCCLX FIRST N {}", value);
+  };
+
+  testing::internal::CaptureStdout();
+  logger.set_level(spdlog::level::err);
+  logFirstN(0);
+  logFirstN(1);
+  logger.set_level(spdlog::level::warn);
+  logFirstN(2);
+  logFirstN(3);
+  logFirstN(4);
+  logger.flush();
+  const auto output = testing::internal::GetCapturedStdout();
+
+  EXPECT_THAT(output, testing::Not(testing::HasSubstr("NCCLX FIRST N 0")));
+  EXPECT_THAT(output, testing::Not(testing::HasSubstr("NCCLX FIRST N 1")));
+  EXPECT_THAT(output, testing::HasSubstr("NCCLX FIRST N 2"));
+  EXPECT_THAT(output, testing::HasSubstr("NCCLX FIRST N 3"));
+  EXPECT_THAT(output, testing::Not(testing::HasSubstr("NCCLX FIRST N 4")));
+
+  finishLogging();
+}
+
+TEST_F(NcclLoggerTest, SpdlogIfPreservesLevelAndSubsystemGates) {
+  auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"INFO"});
+  auto asyncGuard = EnvRAII(NCCL_DEBUG_LOGGING_ASYNC, false);
+
+  initLogging();
+  auto& logger =
+      meta::comms::logger::getSpdlogLogger(ncclx::logging::kNcclxLoggerName);
+  int filteredConditionEvaluations = 0;
+  int fatalConditionEvaluations = 0;
+  int conditionEvaluations = 0;
+  int argumentEvaluations = 0;
+  auto logIf = [&] {
+    NCCLX_LOG_IF(
+        INFO,
+        ++conditionEvaluations == 1,
+        "NCCLX IF {}",
+        ++argumentEvaluations);
+  };
+
+  testing::internal::CaptureStdout();
+  logger.set_level(spdlog::level::off);
+  NCCLX_LOG_IF(DBG, ++filteredConditionEvaluations, "FILTERED DBG");
+  NCCLX_LOG_IF(WARN, ++filteredConditionEvaluations, "FILTERED WARN");
+  NCCLX_LOG_IF(ERR, ++filteredConditionEvaluations, "FILTERED ERR");
+  NCCLX_LOG_IF(CRITICAL, ++filteredConditionEvaluations, "FILTERED CRITICAL");
+  NCCLX_LOG_IF(FATAL, ++fatalConditionEvaluations == 0, "DISABLED FATAL");
+  logger.set_level(spdlog::level::warn);
+  logIf();
+  logger.set_level(spdlog::level::info);
+  logIf();
+  logIf();
+
+  meta::comms::logger::setSubSystemMask(meta::comms::logger::SubSystem::ENV);
+  NCCLX_LOG_SUBSYS(INFO, ENV, "NCCLX ENABLED SUBSYSTEM");
+  NCCLX_LOG_SUBSYS(INFO, COLL, "NCCLX DISABLED SUBSYSTEM");
+  logger.flush();
+  const auto output = testing::internal::GetCapturedStdout();
+
+  EXPECT_EQ(filteredConditionEvaluations, 0);
+  EXPECT_EQ(fatalConditionEvaluations, 1);
+  EXPECT_EQ(conditionEvaluations, 2);
+  EXPECT_EQ(argumentEvaluations, 1);
+  EXPECT_THAT(output, testing::HasSubstr("NCCLX IF 1"));
+  EXPECT_THAT(output, testing::HasSubstr("NCCLX ENABLED SUBSYSTEM"));
+  EXPECT_THAT(
+      output, testing::Not(testing::HasSubstr("NCCLX DISABLED SUBSYSTEM")));
+
+  finishLogging();
+}
+
 TEST_F(NcclLoggerTest, InfoLogTest) {
   auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"INFO"});
   setenv("NCCL_DEBUG", "INFO", 1);
   ncclResetDebugInit();
 
   initLogging();
+  EXPECT_FALSE(
+      meta::comms::logger::getSpdlogLogger(ncclx::logging::kNcclxLoggerName)
+          .should_log(spdlog::level::debug));
   std::string TestStr = "TESTING";
 
   testing::internal::CaptureStdout();
-  ERR("%s", TestStr.c_str());
+  ERR(ncclInternalError, "%s", TestStr.c_str());
   sleep(1);
   std::string output = testing::internal::GetCapturedStdout();
   checkStringHasLogging(output, TestStr, "ERROR");
@@ -250,6 +411,87 @@ TEST_F(NcclLoggerTest, InfoLogTest) {
   sleep(1);
   output = testing::internal::GetCapturedStdout();
   checkStringHasLogging(output, TestStr, "INFO");
+
+  finishLogging();
+}
+
+TEST_F(NcclLoggerTest, PluginDebugBridgePreservesSourceMetadata) {
+  auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"INFO"});
+  auto asyncGuard = EnvRAII(NCCL_DEBUG_LOGGING_ASYNC, false);
+  setenv("NCCL_DEBUG", "INFO", 1);
+  ncclResetDebugInitInternal();
+
+  initLogging();
+  constexpr std::string_view message = "PLUGIN DEBUG BRIDGE";
+
+  testing::internal::CaptureStdout();
+  ncclDebugLog(
+      NCCL_LOG_INFO,
+      NCCL_ALL,
+      "transport/plugin.cc:pluginFunc",
+      321,
+      "%s",
+      message.data());
+  auto& logger =
+      meta::comms::logger::getSpdlogLogger(ncclx::logging::kNcclxLoggerName);
+  logger.flush();
+  const auto output = testing::internal::GetCapturedStdout();
+
+  checkStringHasLogging(output, message, "INFO");
+  EXPECT_THAT(output, testing::HasSubstr("plugin.cc:pluginFunc:321]"));
+
+  finishLogging();
+}
+
+TEST_F(NcclLoggerTest, MetaDebugBridgePreservesTraceAndSourceMetadata) {
+  auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"TRACE"});
+  auto asyncGuard = EnvRAII(NCCL_DEBUG_LOGGING_ASYNC, false);
+  setenv("NCCL_DEBUG", "TRACE", 1);
+  ncclResetDebugInitInternal();
+
+  initLogging();
+  constexpr std::string_view message = "META DEBUG BRIDGE";
+
+  testing::internal::CaptureStdout();
+  ncclMetaDebugLog(
+      NCCL_LOG_TRACE,
+      NCCL_ALL,
+      "source.cc",
+      "sourceFunction",
+      654,
+      "%s",
+      message.data());
+  auto& logger =
+      meta::comms::logger::getSpdlogLogger(ncclx::logging::kNcclxLoggerName);
+  logger.flush();
+  const auto output = testing::internal::GetCapturedStdout();
+
+  checkStringHasLogging(output, message, "VERBOSE");
+  EXPECT_THAT(output, testing::HasSubstr("source.cc:654]"));
+
+  finishLogging();
+}
+
+TEST_F(NcclLoggerTest, SpdlogDebugMatchesLegacyDbg2) {
+  auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"TRACE"});
+  auto asyncGuard = EnvRAII(NCCL_DEBUG_LOGGING_ASYNC, false);
+
+  initLogging();
+  initLegacyLogging();
+  auto& logger =
+      meta::comms::logger::getSpdlogLogger(ncclx::logging::kNcclxLoggerName);
+  EXPECT_TRUE(logger.should_log(spdlog::level::debug));
+
+  constexpr std::string_view legacyMessage = "LEGACY DBG2 MESSAGE";
+  constexpr std::string_view spdlogMessage = "SPDLOG DEBUG MESSAGE";
+  testing::internal::CaptureStdout();
+  XLOGF(DBG2, "{}", legacyMessage);
+  NCCLX_LOG(DBG, "{}", spdlogMessage);
+  logger.flush();
+  const auto output = testing::internal::GetCapturedStdout();
+
+  checkStringHasLogging(output, legacyMessage, "VERBOSE");
+  checkStringHasLogging(output, spdlogMessage, "VERBOSE");
 
   finishLogging();
 }
@@ -325,13 +567,22 @@ TEST_F(NcclLoggerTest, DebugFileLoggingTest) {
   setenv("NCCL_DEBUG", "INFO", 1);
   auto debugFileGuard = EnvRAII(NCCL_DEBUG_FILE, tempFile.string());
   setenv("NCCL_DEBUG_FILE", tempFile.c_str(), 1);
+  // EnvRAII only restores the NCCL_DEBUG_FILE cvar, not the raw OS env var. The
+  // tempFile lives in a TemporaryDirectory that is deleted at test end, so the
+  // OS env var must be unset on scope exit (even on the ASSERT_TRUE
+  // early-return below) or a later test's ncclCvarInit() would reload this
+  // stale path and NcclLogger would fail to open the deleted file.
+  auto debugFileEnvGuard =
+      folly::makeGuard([]() { unsetenv("NCCL_DEBUG_FILE"); });
   ncclResetDebugInit();
   initLogging();
+  initLegacyLogging();
 
   INFO(NCCL_ALL, "Trigger DebugInit");
 
   constexpr std::string_view TestStr = "RAW TESTING";
   constexpr std::string_view TestStr2 = "TESTING";
+  constexpr std::string_view SpdlogTestStr = "SPDLOG TESTING";
 
   testing::internal::CaptureStderr();
 
@@ -341,7 +592,15 @@ TEST_F(NcclLoggerTest, DebugFileLoggingTest) {
 
   INFO(NCCL_ALL, "%s", TestStr2.data());
   WARN("%s", TestStr2.data());
-  ERR("%s", TestStr2.data());
+  ERR(ncclInternalError, "%s", TestStr2.data());
+
+  NCCLX_LOG(INFO, "{}", SpdlogTestStr);
+  NCCLX_LOG(WARN, "{}", SpdlogTestStr);
+  NCCLX_LOG(ERR, "{}", SpdlogTestStr);
+  auto& spdlogLogger =
+      meta::comms::logger::getSpdlogLogger(ncclx::logging::kNcclxLoggerName);
+  EXPECT_EQ(spdlogLogger.usesAsyncLogging(), NCCL_DEBUG_LOGGING_ASYNC);
+  spdlogLogger.flush();
 
   auto stderrOutput = testing::internal::GetCapturedStderr();
 
@@ -355,6 +614,9 @@ TEST_F(NcclLoggerTest, DebugFileLoggingTest) {
     EXPECT_THAT(
         fileContents,
         testing::HasSubstr(fmt::format("NCCL {} {}", level, TestStr2)));
+    EXPECT_THAT(
+        fileContents,
+        testing::HasSubstr(fmt::format("NCCL {} {}", level, SpdlogTestStr)));
     if (level != "INFO") {
       // When logging to file, we should also log to stderr for WARN and ERROR
       EXPECT_THAT(
@@ -363,6 +625,9 @@ TEST_F(NcclLoggerTest, DebugFileLoggingTest) {
       EXPECT_THAT(
           stderrOutput,
           testing::HasSubstr(fmt::format("NCCL {} {}", level, TestStr2)));
+      EXPECT_THAT(
+          stderrOutput,
+          testing::HasSubstr(fmt::format("NCCL {} {}", level, SpdlogTestStr)));
     }
   }
 }
@@ -376,7 +641,7 @@ TEST_F(NcclLoggerTest, AppendErrorToStackTest) {
 
   // Log an error message first
   std::string errorMsg = "Base error message";
-  ERR("%s", errorMsg.c_str());
+  ERR(ncclInternalError, "%s", errorMsg.c_str());
   sleep(1);
 
   // Append stack frames
@@ -403,7 +668,7 @@ TEST_F(NcclLoggerTest, AppendErrorToStackOrderTest) {
 
   // Log an error message first
   std::string errorMsg = "Error for stack order test";
-  ERR("%s", errorMsg.c_str());
+  ERR(ncclInternalError, "%s", errorMsg.c_str());
   sleep(1);
 
   // Append stack frames in specific order
@@ -437,7 +702,7 @@ TEST_F(NcclLoggerTest, GetLastCommsErrorWithMultipleStackFrames) {
 
   // Log an error
   std::string errorMsg = "Critical error occurred";
-  ERR("%s", errorMsg.c_str());
+  ERR(ncclInternalError, "%s", errorMsg.c_str());
   sleep(1);
 
   // Add detailed stack trace
@@ -478,7 +743,7 @@ TEST_F(NcclLoggerTest, GetLastCommsErrorEmptyStackTrace) {
 
   // Log an error without adding any stack frames
   std::string errorMsg = "Simple error without stack";
-  ERR("%s", errorMsg.c_str());
+  ERR(ncclInternalError, "%s", errorMsg.c_str());
   sleep(1);
 
   auto lastError = meta::comms::logger::getLastCommsError();
@@ -490,178 +755,109 @@ TEST_F(NcclLoggerTest, GetLastCommsErrorEmptyStackTrace) {
   finishLogging();
 }
 
-TEST_F(NcclLoggerTest, WarnWithScubaAppendsToStackTrace) {
+// The following tests assert v2_30-only error behavior: plain ERR routes to the
+// Scuba error record, and WARN no longer contributes to the error stack. Older
+// ncclx versions keep the legacy behavior, so gate these tests to v2_30+.
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 0)
+
+TEST_F(NcclLoggerTest, WarnDoesNotContributeToErrorStack) {
   auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"INFO"});
   setenv("NCCL_DEBUG", "INFO", 1);
   ncclResetDebugInit();
 
   initLogging();
 
-  // Log an error first to set the error message
-  std::string errorMsg = "Initial error";
-  ERR("%s", errorMsg.c_str());
+  // An ERR sets the last error message.
+  const std::string errorMsg = "Initial error";
+  ERR(ncclInternalError, "%s", errorMsg.c_str());
   sleep(1);
 
-  // Use WARN_WITH_SCUBA to append to stack trace
-  WARN_WITH_SCUBA("Stack trace entry 1 from WARN_WITH_SCUBA");
-  WARN_WITH_SCUBA("Stack trace entry 2 from WARN_WITH_SCUBA");
+  // WARN is a propagator and must no longer append to the error stack.
+  const std::string warnMsg = "Propagator WARN should not be recorded";
+  WARN("%s", warnMsg.c_str());
+  sleep(1);
 
-  auto lastError = meta::comms::logger::getLastCommsError();
-  std::string errorStr(lastError);
-
+  const std::string errorStr(meta::comms::logger::getLastCommsError());
   EXPECT_THAT(errorStr, ::testing::HasSubstr(errorMsg));
   EXPECT_THAT(errorStr, ::testing::HasSubstr("NCCL Stack trace:"));
-  EXPECT_THAT(
-      errorStr,
-      ::testing::HasSubstr("Stack trace entry 1 from WARN_WITH_SCUBA"));
-  EXPECT_THAT(
-      errorStr,
-      ::testing::HasSubstr("Stack trace entry 2 from WARN_WITH_SCUBA"));
+  EXPECT_THAT(errorStr, ::testing::Not(::testing::HasSubstr(warnMsg)));
 
   finishLogging();
 }
 
-TEST_F(NcclLoggerTest, ErrWithScubaAppendsToStackTrace) {
+TEST_F(NcclLoggerTest, SecondErrorUpdatesLastError) {
   auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"INFO"});
   setenv("NCCL_DEBUG", "INFO", 1);
   ncclResetDebugInit();
 
   initLogging();
 
-  // Use ERR_WITH_SCUBA which should both log error and append to stack
-  ERR_WITH_SCUBA("Primary error from ERR_WITH_SCUBA");
+  ERR(ncclInternalError, "Base error message");
+  sleep(1);
+  ERR(ncclInternalError, "Newer error message");
   sleep(1);
 
-  // Add more stack frames
-  WARN_WITH_SCUBA("Additional context from WARN_WITH_SCUBA");
-  WARN_WITH_SCUBA("More context details");
-
-  auto lastError = meta::comms::logger::getLastCommsError();
-  std::string errorStr(lastError);
-
-  EXPECT_THAT(
-      errorStr, ::testing::HasSubstr("Primary error from ERR_WITH_SCUBA"));
-  EXPECT_THAT(errorStr, ::testing::HasSubstr("NCCL Stack trace:"));
-  EXPECT_THAT(
-      errorStr,
-      ::testing::HasSubstr("Additional context from WARN_WITH_SCUBA"));
-  EXPECT_THAT(errorStr, ::testing::HasSubstr("More context details"));
+  const std::string errorStr(meta::comms::logger::getLastCommsError());
+  EXPECT_THAT(errorStr, ::testing::HasSubstr("Newer error message"));
 
   finishLogging();
 }
 
-TEST_F(NcclLoggerTest, ScubaStackTraceOrder) {
+TEST_F(NcclLoggerTest, WarnNotAppendedButDirectAppendIs) {
   auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"INFO"});
   setenv("NCCL_DEBUG", "INFO", 1);
   ncclResetDebugInit();
 
   initLogging();
 
-  // Log an error
-  ERR("Base error message");
+  ERR(ncclInternalError, "Error occurred in operation");
   sleep(1);
 
-  // Use WARN_WITH_SCUBA in sequence
-  WARN_WITH_SCUBA("Frame A");
-  WARN_WITH_SCUBA("Frame B");
-  WARN_WITH_SCUBA("Frame C");
-
-  auto lastError = meta::comms::logger::getLastCommsError();
-  std::string errorStr(lastError);
-
-  // Verify the frames appear in order
-  size_t posA = errorStr.find("Frame A");
-  size_t posB = errorStr.find("Frame B");
-  size_t posC = errorStr.find("Frame C");
-
-  EXPECT_NE(posA, std::string::npos);
-  EXPECT_NE(posB, std::string::npos);
-  EXPECT_NE(posC, std::string::npos);
-  EXPECT_LT(posA, posB);
-  EXPECT_LT(posB, posC);
-
-  finishLogging();
-}
-
-TEST_F(NcclLoggerTest, MixedScubaAndDirectStackAppend) {
-  auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"INFO"});
-  setenv("NCCL_DEBUG", "INFO", 1);
-  ncclResetDebugInit();
-
-  initLogging();
-
-  // Log an error
-  ERR("Error occurred in operation");
+  // WARN must not appear in the error stack; direct appends still do.
+  WARN("This WARN must not appear in the error stack");
+  meta::comms::logger::appendErrorToStack("Direct append frame");
   sleep(1);
 
-  // Mix WARN_WITH_SCUBA and direct appendErrorToStack calls
-  WARN_WITH_SCUBA("From WARN_WITH_SCUBA 1");
-  meta::comms::logger::appendErrorToStack("From appendErrorToStack 1");
-  WARN_WITH_SCUBA("From WARN_WITH_SCUBA 2");
-  meta::comms::logger::appendErrorToStack("From appendErrorToStack 2");
-
-  auto lastError = meta::comms::logger::getLastCommsError();
-  std::string errorStr(lastError);
-
+  const std::string errorStr(meta::comms::logger::getLastCommsError());
   EXPECT_THAT(errorStr, ::testing::HasSubstr("Error occurred in operation"));
-  EXPECT_THAT(errorStr, ::testing::HasSubstr("From WARN_WITH_SCUBA 1"));
-  EXPECT_THAT(errorStr, ::testing::HasSubstr("From appendErrorToStack 1"));
-  EXPECT_THAT(errorStr, ::testing::HasSubstr("From WARN_WITH_SCUBA 2"));
-  EXPECT_THAT(errorStr, ::testing::HasSubstr("From appendErrorToStack 2"));
-
-  // Verify order is maintained
-  size_t pos1 = errorStr.find("From WARN_WITH_SCUBA 1");
-  size_t pos2 = errorStr.find("From appendErrorToStack 1");
-  size_t pos3 = errorStr.find("From WARN_WITH_SCUBA 2");
-  size_t pos4 = errorStr.find("From appendErrorToStack 2");
-
-  EXPECT_LT(pos1, pos2);
-  EXPECT_LT(pos2, pos3);
-  EXPECT_LT(pos3, pos4);
+  EXPECT_THAT(errorStr, ::testing::HasSubstr("Direct append frame"));
+  EXPECT_THAT(
+      errorStr,
+      ::testing::Not(::testing::HasSubstr("This WARN must not appear")));
 
   finishLogging();
 }
 
-TEST_F(NcclLoggerTest, ScubaStackTraceWithMultipleErrors) {
+TEST_F(NcclLoggerTest, SecondErrorUpdatesMessageKeepsAppendedStack) {
   auto debugGuard = EnvRAII(NCCL_DEBUG, std::string{"INFO"});
   setenv("NCCL_DEBUG", "INFO", 1);
   ncclResetDebugInit();
 
   initLogging();
 
-  // First error with stack
-  ERR("First error");
+  // First error with an appended stack frame.
+  ERR(ncclInternalError, "First error");
   sleep(1);
-  WARN_WITH_SCUBA("Stack for first error");
+  meta::comms::logger::appendErrorToStack("Stack for first error");
 
-  auto lastError1 = meta::comms::logger::getLastCommsError();
-  std::string errorStr1(lastError1);
+  const std::string errorStr1(meta::comms::logger::getLastCommsError());
   EXPECT_THAT(errorStr1, ::testing::HasSubstr("First error"));
   EXPECT_THAT(errorStr1, ::testing::HasSubstr("Stack for first error"));
 
-  // Second error should update the message but stack remains
-  ERR("Second error");
+  // A newer error updates the message; the appended stack remains.
+  ERR(ncclInternalError, "Second error");
   sleep(1);
 
-  auto lastError2 = meta::comms::logger::getLastCommsError();
-  std::string errorStr2(lastError2);
+  const std::string errorStr2(meta::comms::logger::getLastCommsError());
   EXPECT_THAT(errorStr2, ::testing::HasSubstr("Second error"));
-  // The old stack should still be there
   EXPECT_THAT(errorStr2, ::testing::HasSubstr("Stack for first error"));
-
-  // Add more stack for second error
-  WARN_WITH_SCUBA("Stack for second error");
-
-  auto lastError3 = meta::comms::logger::getLastCommsError();
-  std::string errorStr3(lastError3);
-  EXPECT_THAT(errorStr3, ::testing::HasSubstr("Second error"));
-  EXPECT_THAT(errorStr3, ::testing::HasSubstr("Stack for first error"));
-  EXPECT_THAT(errorStr3, ::testing::HasSubstr("Stack for second error"));
 
   finishLogging();
 }
 
-TEST_F(NcclLoggerTest, TestUtilsLogHandler) {
+#endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 0)
+
+TEST_F(NcclLoggerTest, PreservesSharedUtilsLogHandler) {
   ncclResetDebugInit();
 
   ncclCvarInit();
@@ -710,7 +906,7 @@ TEST_F(NcclLoggerTest, TestUtilsLogHandler) {
 
   INFO(NCCL_ALL, "%s", TestStr.c_str());
   WARN("%s", TestStr.c_str());
-  ERR("%s", TestStr.c_str());
+  ERR(ncclInternalError, "%s", TestStr.c_str());
 
   finishLogging();
 }

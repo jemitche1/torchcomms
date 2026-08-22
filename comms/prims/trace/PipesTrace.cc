@@ -4,14 +4,17 @@
 
 #include <pthread.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <utility>
 
+#include <fmt/format.h>
+
 #include "comms/utils/hrdw_ring_buffer/GpuClockCalibration.h"
-#include "comms/utils/logger/LogUtils.h"
 
 namespace comms::prims {
 namespace {
@@ -43,11 +46,176 @@ const char* pipesTraceEventTypeName(uint8_t type) {
       return "ib_forward_begin";
     case Type::kIbForwardEnd:
       return "ib_forward_end";
+    case Type::kAllReducePhase1Begin:
+      return "allreduce_phase1_begin";
+    case Type::kAllReducePhase1End:
+      return "allreduce_phase1_end";
+    case Type::kAllReducePhase2Begin:
+      return "allreduce_phase2_begin";
+    case Type::kAllReducePhase2End:
+      return "allreduce_phase2_end";
+    case Type::kAllReducePhase3Begin:
+      return "allreduce_phase3_begin";
+    case Type::kAllReducePhase3End:
+      return "allreduce_phase3_end";
+    case Type::kAllReduceRingReduceScatterBegin:
+      return "allreduce_ring_rs_begin";
+    case Type::kAllReduceRingReduceScatterEnd:
+      return "allreduce_ring_rs_end";
+    case Type::kAllReduceRingAllGatherBegin:
+      return "allreduce_ring_ag_begin";
+    case Type::kAllReduceRingAllGatherEnd:
+      return "allreduce_ring_ag_end";
+    case Type::kAllReduceSendSyncBegin:
+      return "allreduce_send_sync_begin";
+    case Type::kAllReduceSendSyncEnd:
+      return "allreduce_send_sync_end";
+    case Type::kAllReduceSlotPrepareBegin:
+      return "allreduce_slot_prepare_begin";
+    case Type::kAllReduceSlotPrepareEnd:
+      return "allreduce_slot_prepare_end";
+    case Type::kAllReduceWqeSubmitBegin:
+      return "allreduce_wqe_submit_begin";
+    case Type::kAllReduceWqeSubmitEnd:
+      return "allreduce_wqe_submit_end";
+    case Type::kAllReduceDataReadyWaitBegin:
+      return "allreduce_data_ready_wait_begin";
+    case Type::kAllReduceDataReadyWaitEnd:
+      return "allreduce_data_ready_wait_end";
+    case Type::kAllReduceReduceCopyBegin:
+      return "allreduce_reduce_copy_begin";
+    case Type::kAllReduceReduceCopyEnd:
+      return "allreduce_reduce_copy_end";
+    case Type::kAllReduceDrainBegin:
+      return "allreduce_drain_begin";
+    case Type::kAllReduceDrainEnd:
+      return "allreduce_drain_end";
+    case Type::kAllReduceBookkeepingBegin:
+      return "allreduce_bookkeeping_begin";
+    case Type::kAllReduceBookkeepingEnd:
+      return "allreduce_bookkeeping_end";
+    case Type::kAllReduceLocalCompletionWaitBegin:
+      return "allreduce_local_completion_wait_begin";
+    case Type::kAllReduceLocalCompletionWaitEnd:
+      return "allreduce_local_completion_wait_end";
+    case Type::kAllReduceRemoteSlotFreeWaitBegin:
+      return "allreduce_remote_slot_free_wait_begin";
+    case Type::kAllReduceRemoteSlotFreeWaitEnd:
+      return "allreduce_remote_slot_free_wait_end";
+    case Type::kAllReduceStageCopyBegin:
+      return "allreduce_stage_copy_begin";
+    case Type::kAllReduceStageCopyEnd:
+      return "allreduce_stage_copy_end";
+    case Type::kAllReducePathStaged:
+      return "allreduce_path_staged";
+    case Type::kAllReducePathRegisteredProgress:
+      return "allreduce_path_registered_progress";
+    case Type::kAllReduceTreeSchedulerIdleBegin:
+      return "allreduce_tree_scheduler_idle_begin";
+    case Type::kAllReduceTreeSchedulerIdleEnd:
+      return "allreduce_tree_scheduler_idle_end";
   }
   return "unknown";
 }
 
+bool isFineAllReduceEvent(uint8_t type) {
+  using Type = PipesTraceEventType;
+  return type >= static_cast<uint8_t>(Type::kAllReduceRingReduceScatterBegin) &&
+      type <= static_cast<uint8_t>(Type::kAllReduceTreeSchedulerIdleEnd);
+}
+
+const char* allReducePhaseName(uint32_t phase) {
+  using Phase = PipesTraceAllReducePhase;
+  switch (static_cast<Phase>(phase)) {
+    case Phase::RingReduceScatter:
+      return "ring_reduce_scatter";
+    case Phase::RingAllGather:
+      return "ring_all_gather";
+    case Phase::TreeReduce:
+      return "tree_reduce";
+    case Phase::TreeBroadcast:
+      return "tree_broadcast";
+  }
+  return "unknown";
+}
+
+const char* allReduceRoleName(uint32_t role) {
+  using Role = PipesTraceAllReduceRole;
+  switch (static_cast<Role>(role)) {
+    case Role::Send:
+      return "send";
+    case Role::RecvCopy:
+      return "recv_copy";
+    case Role::RecvReduce:
+      return "recv_reduce";
+    case Role::ForwardCopy:
+      return "forward_copy";
+    case Role::ForwardReduce:
+      return "forward_reduce";
+    case Role::Scheduler:
+      return "scheduler";
+    case Role::Envelope:
+      return "envelope";
+    case Role::Reserved:
+      return "reserved";
+  }
+  return "unknown";
+}
+
+uint64_t allocatePipesTraceSessionId() {
+  static std::atomic<uint64_t> nextPipesTraceSessionId{1};
+  return nextPipesTraceSessionId.fetch_add(1, std::memory_order_relaxed);
+}
+
+void emitWarning(
+    const PipesTrace::WarningCallback& warningCallback,
+    std::string_view message) noexcept {
+  try {
+    if (warningCallback) {
+      warningCallback(message);
+      return;
+    }
+  } catch (...) {
+    /*
+     * The callback may have emitted before throwing. Falling back can
+     * duplicate that warning, but suppressing the fallback could lose the
+     * diagnostic.
+     */
+  }
+
+  flockfile(stderr);
+  std::fputs("Prims trace warning: ", stderr);
+  std::fwrite(message.data(), sizeof(char), message.size(), stderr);
+  std::fputc('\n', stderr);
+  std::fflush(stderr);
+  funlockfile(stderr);
+}
+
+template <typename... Args>
+void emitFormattedWarning(
+    const PipesTrace::WarningCallback& warningCallback,
+    fmt::format_string<Args...> format,
+    Args&&... args) noexcept {
+  try {
+    emitWarning(
+        warningCallback, fmt::format(format, std::forward<Args>(args)...));
+  } catch (...) {
+    emitWarning(warningCallback, "Prims trace warning formatting failed");
+  }
+}
+
+void emitExceptionWarning(
+    const PipesTrace::WarningCallback& warningCallback,
+    const char* prefix,
+    const std::exception& ex) noexcept {
+  emitFormattedWarning(warningCallback, "{}: {}", prefix, ex.what());
+}
+
 } // namespace
+
+PipesTrace::PipesTrace(WarningCallback warningCallback)
+    : warningCallback_(std::move(warningCallback)),
+      sessionId_(allocatePipesTraceSessionId()) {}
 
 PipesTrace::~PipesTrace() {
   // CTRAN teardown relies on the same lifetime contract as other comm-owned
@@ -60,21 +228,26 @@ PipesTrace::~PipesTrace() {
   try {
     drain();
   } catch (const std::exception& ex) {
-    CLOGF(WARN, "Prims trace final drain failed: {}", ex.what());
+    emitExceptionWarning(
+        warningCallback_, "Prims trace final drain failed", ex);
   } catch (...) {
-    CLOGF(WARN, "Prims trace final drain failed with unknown exception");
+    emitWarning(
+        warningCallback_,
+        "Prims trace final drain failed with unknown exception");
   }
 }
 
-uint32_t PipesTrace::normalizeRingSize(uint64_t ringSize) {
+uint32_t PipesTrace::normalizeRingSize(
+    uint64_t ringSize,
+    const WarningCallback& warningCallback) {
   if (ringSize == 0) {
     return 0;
   }
 
   constexpr uint64_t kMaxRingEntries = 1ULL << 31;
   if (ringSize > kMaxRingEntries) {
-    CLOGF(
-        WARN,
+    emitFormattedWarning(
+        warningCallback,
         "Prims trace clamps ring size {} to {}",
         ringSize,
         kMaxRingEntries);
@@ -86,44 +259,85 @@ uint32_t PipesTrace::normalizeRingSize(uint64_t ringSize) {
 void PipesTrace::ensure(
     uint32_t ringSize,
     std::chrono::milliseconds pollInterval,
-    EventCallback eventCallback) {
+    EventCallback eventCallback,
+    uint32_t rank) {
   if (ringSize == 0) {
     return;
   }
 
-  std::lock_guard<std::mutex> lock(drainMutex_);
-  if (buffer_ != nullptr && reader_ != nullptr) {
-    if (buffer_->size() < ringSize) {
-      CLOGF(
-          WARN,
-          "Prims trace keeps existing ring_size={} despite requested_ring_size={} because device handles may be in flight",
-          buffer_->size(),
-          ringSize);
+  enum class EnsureOutcome {
+    NoChange,
+    Initialized,
+    ExistingRingTooSmall,
+    AllocationFailure,
+  };
+  struct EnsureResult {
+    EnsureOutcome outcome{EnsureOutcome::NoChange};
+    uint32_t ringSize{0};
+  };
+  EnsureResult result;
+  {
+    std::lock_guard<std::mutex> lock(drainMutex_);
+    rank_ = rank;
+    if (buffer_ != nullptr && reader_ != nullptr) {
+      if (buffer_->size() < ringSize) {
+        result = {
+            .outcome = EnsureOutcome::ExistingRingTooSmall,
+            .ringSize = buffer_->size()};
+      }
+    } else {
+      reader_.reset();
+      buffer_ = std::make_unique<Buffer>(ringSize);
+      if (!buffer_->valid()) {
+        buffer_.reset();
+        result.outcome = EnsureOutcome::AllocationFailure;
+      } else {
+        reader_ = std::make_unique<Reader>(*buffer_);
+        ::hrdw_ring_buffer::GlobaltimerCalibration::get();
+        // Set before starting the poller; the poll thread reads pollInterval_
+        // only after this store and it is never mutated again for this ring.
+        pollInterval_ = pollInterval;
+        eventCallback_ = std::move(eventCallback);
+        startPollThread();
+        result = {
+            .outcome = EnsureOutcome::Initialized, .ringSize = buffer_->size()};
+      }
     }
-    return;
   }
 
-  reader_.reset();
-  buffer_ = std::make_unique<Buffer>(ringSize);
-  if (!buffer_->valid()) {
-    CLOGF(
-        WARN, "Prims trace failed to allocate ring with {} entries", ringSize);
-    buffer_.reset();
-    return;
+  switch (result.outcome) {
+    case EnsureOutcome::NoChange:
+      return;
+    case EnsureOutcome::Initialized:
+      /*
+       * Successful initialization and trace records remain an unsuppressed,
+       * parseable stderr stream; the injected callback is warning-only.
+       */
+      flockfile(stderr);
+      std::fprintf(
+          stderr,
+          "Prims trace buffer ready trace_session=%llu rank=%u ring_size=%u poll_interval_ms=%lld\n",
+          static_cast<unsigned long long>(sessionId_),
+          static_cast<unsigned int>(rank),
+          static_cast<unsigned int>(result.ringSize),
+          static_cast<long long>(pollInterval.count()));
+      std::fflush(stderr);
+      funlockfile(stderr);
+      return;
+    case EnsureOutcome::ExistingRingTooSmall:
+      emitFormattedWarning(
+          warningCallback_,
+          "Prims trace keeps existing ring_size={} despite requested_ring_size={} because device handles may be in flight",
+          result.ringSize,
+          ringSize);
+      return;
+    case EnsureOutcome::AllocationFailure:
+      emitFormattedWarning(
+          warningCallback_,
+          "Prims trace failed to allocate ring with {} entries",
+          ringSize);
+      return;
   }
-
-  reader_ = std::make_unique<Reader>(*buffer_);
-  ::hrdw_ring_buffer::GlobaltimerCalibration::get();
-  // Set before starting the poller; the poll thread reads pollInterval_ only
-  // after this store and it is never mutated again for this ring.
-  pollInterval_ = pollInterval;
-  eventCallback_ = std::move(eventCallback);
-  startPollThread();
-  CLOGF(
-      INFO,
-      "Prims trace buffer ready ring_size={} poll_interval_ms={}",
-      buffer_->size(),
-      static_cast<long long>(pollInterval_.count()));
 }
 
 PipesTraceHandle PipesTrace::deviceHandle() const {
@@ -155,6 +369,7 @@ void PipesTrace::drain() {
       batch.entries.push_back(PendingLogEntry{entry, slot});
     });
     batch.entriesLost = result.entriesLost;
+    batch.rank = rank_;
   }
   logBatch(batch);
 }
@@ -169,22 +384,57 @@ void PipesTrace::logBatch(const PendingLogBatch& batch) const {
             wallTime.time_since_epoch())
             .count();
     const auto& event = entry.data;
-    CLOGF(
-        INFO,
-        "Prims trace event={} step={} rank={} detail={} slot={} wall_time_ns={}",
+    if (isFineAllReduceEvent(event.type)) {
+      const uint32_t packed = event.step;
+      const uint32_t phase =
+          (packed >> kPipesTracePhaseShift) & kPipesTracePhaseMask;
+      const uint32_t role =
+          (packed >> kPipesTraceRoleShift) & kPipesTraceRoleMask;
+      std::fprintf(
+          stderr,
+          "Prims fine trace schema_version=%u trace_session=%llu event=%s rank=%u op_tag=%u phase=%s dependency_step=%u block=%u lane=%u chunk_tag=%u role=%s peer=%u qp_lane=%u bytes=%u slot=%llu wall_time_ns=%lld\n",
+          kPipesTraceFineSchemaVersion,
+          static_cast<unsigned long long>(sessionId_),
+          pipesTraceEventTypeName(event.type),
+          static_cast<unsigned int>(batch.rank),
+          (packed >> kPipesTraceOpTagShift) & kPipesTraceOpTagMask,
+          allReducePhaseName(phase),
+          (packed >> kPipesTraceDependencyStepShift) &
+              kPipesTraceDependencyStepMask,
+          (packed >> kPipesTraceBlockShift) & kPipesTraceBlockMask,
+          (packed >> kPipesTraceLaneShift) & kPipesTraceLaneMask,
+          (packed >> kPipesTraceChunkShift) & kPipesTraceChunkMask,
+          allReduceRoleName(role),
+          static_cast<unsigned int>(event.rank),
+          (packed >> kPipesTraceQpLaneShift) & kPipesTraceQpLaneMask,
+          static_cast<unsigned int>(event.detail) * kPipesTraceBytesQuantum,
+          static_cast<unsigned long long>(pendingEntry.slot),
+          static_cast<long long>(wallTimeNs));
+      if (eventCallback_ != nullptr) {
+        eventCallback_(event, pendingEntry.slot);
+      }
+      continue;
+    }
+    std::fprintf(
+        stderr,
+        "Prims trace event=%s step=%u rank=%u detail=%u slot=%llu wall_time_ns=%lld\n",
         pipesTraceEventTypeName(event.type),
         event.step,
-        static_cast<int>(event.rank),
+        static_cast<unsigned int>(event.rank),
         event.detail,
-        pendingEntry.slot,
-        wallTimeNs);
+        static_cast<unsigned long long>(pendingEntry.slot),
+        static_cast<long long>(wallTimeNs));
     if (eventCallback_ != nullptr) {
       eventCallback_(event, pendingEntry.slot);
     }
   }
 
   if (batch.entriesLost != 0) {
-    CLOGF(WARN, "Prims trace lost {} entries", batch.entriesLost);
+    emitFormattedWarning(
+        warningCallback_, "Prims trace lost {} entries", batch.entriesLost);
+  }
+  if (!batch.entries.empty()) {
+    std::fflush(stderr);
   }
 }
 
@@ -202,9 +452,12 @@ void PipesTrace::pollLoop() {
     try {
       drain();
     } catch (const std::exception& ex) {
-      CLOGF(WARN, "Prims trace poll drain failed: {}", ex.what());
+      emitExceptionWarning(
+          warningCallback_, "Prims trace poll drain failed", ex);
     } catch (...) {
-      CLOGF(WARN, "Prims trace poll drain failed with unknown exception");
+      emitWarning(
+          warningCallback_,
+          "Prims trace poll drain failed with unknown exception");
     }
   }
 }

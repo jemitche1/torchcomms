@@ -8,9 +8,9 @@
 #include <vector>
 
 #include "comms/ctran/backends/ib/CtranIbVc.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/utils/StrUtils.h"
 #include "comms/utils/commSpecs.h"
-#include "comms/utils/logger/LogUtils.h"
 
 namespace ctran::ib {
 
@@ -43,8 +43,8 @@ commResult_t VcState::setupAndPublishVc(
     const std::vector<std::string>& remoteVcIdentifiers,
     int peerRank) {
   if (vcs.empty() || vcs.size() != remoteVcIdentifiers.size()) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInternalError,
         "CTRAN-IB: setupAndPublishVc called with vcs.size()={} remoteVcIdentifiers.size()={} for peerRank {} in pimpl {} commHash {:x} commDesc {}",
         vcs.size(),
         remoteVcIdentifiers.size(),
@@ -57,17 +57,19 @@ commResult_t VcState::setupAndPublishVc(
 
   // Setup each VC under its own per-VC lock. The VC is not yet exposed
   // to local rank; the lock is taken to follow VC thread-safety semantics.
+  // Use return-style propagation (not throw) so that failures such as
+  // NCCL_CTRAN_IB_ENABLE_OOO_RQ fail-closed surface as commSystemError to
+  // the caller
   for (size_t i = 0; i < vcs.size(); ++i) {
     const std::lock_guard<std::mutex> lock(vcs[i]->mutex);
-    FB_COMMCHECKTHROW_EX(
-        vcs[i]->setupVc((void*)remoteVcIdentifiers[i].data()), *logData_);
+    FB_COMMCHECK(vcs[i]->setupVc((void*)remoteVcIdentifiers[i].data()));
   }
 
   {
     auto locked = vcStateMaps_.wlock();
     if (locked->rankToVcs.find(peerRank) != locked->rankToVcs.end()) {
-      CLOGF(
-          ERR,
+      CTRAN_ERR(
+          commInternalError,
           "CTRAN-IB: VirtualConnection (VC) already exists for peerRank {} in pimpl {} commHash {:x}, commDesc {}. It likely indicates a COMM bug.",
           peerRank,
           owner_,
@@ -111,7 +113,7 @@ commResult_t VcState::setupAndPublishVc(
 
     // Log each established VC while we still own a stable reference.
     for (const auto& vc : vcs) {
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO,
           INIT,
           "CTRAN-IB: Established connection: commHash {:x}, commDesc {}, "
@@ -150,8 +152,8 @@ commResult_t VcState::checkAndInsertQpToVcMap(
     QpUniqueId& qpId,
     std::shared_ptr<CtranIbVirtualConn>& vc) {
   if (map.find(qpId) != map.end()) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInternalError,
         "CTRAN-IB: QP {} on device {} already exists in pimpl {} commHash {:x}, commDesc {}. It likely indicates a COMM bug.",
         qpId.first,
         qpId.second,

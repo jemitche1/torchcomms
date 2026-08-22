@@ -10,8 +10,8 @@
 
 #include "comms/ctran/utils/CtranAvlTree.h"
 #include "comms/ctran/utils/CtranAvlTreeElem.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/ExtUtils.h"
-#include "comms/utils/logger/LogUtils.h"
 
 CtranAvlTree::~CtranAvlTree() {
   if (this->root_) {
@@ -48,8 +48,8 @@ commResult_t CtranAvlTree::remove(void* hdl) {
 
   auto it = handles_.find(hdl);
   if (it == handles_.end()) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInvalidUsage,
         "CTRAN-AVL-TREE: Trying to remove hdl {} while the handle is not in the cache, likely double freeing",
         (void*)hdl);
     return commInvalidUsage;
@@ -79,10 +79,9 @@ commResult_t CtranAvlTree::remove(void* hdl) {
   return commSuccess;
 }
 
-void* CtranAvlTree::search(const void* addr_, std::size_t len) const {
-  uintptr_t addr = reinterpret_cast<uintptr_t>(const_cast<void*>(addr_));
-  std::lock_guard<std::mutex> lock(this->mutex_);
-
+CtranAvlTree::TreeElem* CtranAvlTree::searchElemLocked(
+    uintptr_t addr,
+    std::size_t len) const {
   // First try to search in AVL tree
   CtranAvlTree::TreeElem* r = this->root_;
   while (r) {
@@ -108,6 +107,19 @@ void* CtranAvlTree::search(const void* addr_, std::size_t len) const {
     }
   }
   return r;
+}
+
+void* CtranAvlTree::search(const void* addr_, std::size_t len) const {
+  uintptr_t addr = reinterpret_cast<uintptr_t>(const_cast<void*>(addr_));
+  std::lock_guard<std::mutex> lock(this->mutex_);
+  return this->searchElemLocked(addr, len);
+}
+
+void* CtranAvlTree::searchVal(const void* addr_, std::size_t len) const {
+  uintptr_t addr = reinterpret_cast<uintptr_t>(const_cast<void*>(addr_));
+  std::lock_guard<std::mutex> lock(this->mutex_);
+  CtranAvlTree::TreeElem* r = this->searchElemLocked(addr, len);
+  return r != nullptr ? r->val : nullptr;
 }
 
 void* CtranAvlTree::lookup(void* hdl) const {

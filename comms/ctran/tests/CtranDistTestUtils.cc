@@ -25,13 +25,6 @@ void CtranDistEnvironment::SetUp() {
   setenv("NCCL_CTRAN_ENABLE", "1", 0);
   setenv("NCCL_COLLTRACE", "trace", 0);
 
-#ifdef NCCL_COMM_STATE_DEBUG_TOPO_NOLOCAL
-  setenv("NCCL_COMM_STATE_DEBUG_TOPO", "nolocal", 1);
-#endif
-#ifdef NCCL_COMM_STATE_DEBUG_TOPO_VNODE
-  setenv("NCCL_COMM_STATE_DEBUG_TOPO", "vnode", 1);
-#endif
-
 #if defined(TEST_ENABLE_FASTINIT)
   setenv("NCCL_FASTINIT_MODE", "ring_hybrid", 1);
 #else
@@ -77,16 +70,31 @@ void CtranDistTestFixture::SetUp(const CtranEnvs& envs) {
 
   setenv("RANK", std::to_string(globalRank).c_str(), 1);
 
-#ifdef NCCL_COMM_STATE_DEBUG_TOPO_NOLOCAL
-  enableNolocal = true;
-#endif
-
   if (globalRank == 0) {
     XLOG(DBG) << "Testing with NCCL_COMM_STATE_DEBUG_TOPO="
               << (isNolocalTopo() ? "nolocal" : "default");
   }
 
   stream.emplace(cudaStreamNonBlocking);
+}
+
+void CtranDistTestFixture::assertExpectedTopology(CtranComm* comm) const {
+  const char* topo = getenv("NCCL_COMM_STATE_DEBUG_TOPO");
+  if (topo == nullptr) {
+    return; // default topology: no cross-config invariant to assert
+  }
+  const std::string mode{topo};
+  if (mode == "nolocal") {
+    EXPECT_EQ(comm->statex_->nLocalRanks(), 1);
+    EXPECT_EQ(comm->statex_->nNodes(), numRanks);
+  } else if (mode == "vnode") {
+    const char* nlr = getenv("NCCL_COMM_STATE_DEBUG_TOPO_VNODE_NLOCALRANKS");
+    const int vnodeNLocalRanks = nlr ? std::atoi(nlr) : 2; // cvar default
+    EXPECT_EQ(comm->statex_->nLocalRanks(), vnodeNLocalRanks);
+    EXPECT_EQ(
+        comm->statex_->nNodes(),
+        (numRanks + vnodeNLocalRanks - 1) / vnodeNLocalRanks);
+  }
 }
 
 void CtranDistTestFixture::TearDown() {
@@ -106,14 +114,16 @@ void CtranDistTestFixture::TearDown() {
 }
 
 std::unique_ptr<CtranComm> CtranDistTestFixture::makeCtranComm(
-    bool ibLazyConnect) {
+    bool noLocal,
+    bool ibLazyConnect,
+    bool tmpbufEagerAlloc) {
   const std::string uuid{"0"};
   uint64_t commHash =
       ctran::utils::getHash(uuid.data(), static_cast<int>(uuid.size()));
   std::string commDesc = fmt::format("CtranTestComm-{}", globalRank);
 
-  auto comm =
-      std::make_unique<CtranComm>(ctran::utils::createAbort(/*enabled=*/false));
+  auto comm = std::make_unique<CtranComm>(
+      comms::fault_tolerance::createAbort(/*enabled=*/false));
   comm->logMetaData_.commId = 0;
   comm->logMetaData_.commHash = commHash;
   comm->logMetaData_.commDesc = commDesc;
@@ -136,7 +146,8 @@ std::unique_ptr<CtranComm> CtranDistTestFixture::makeCtranComm(
       commHash,
       rankTopologies,
       commRanksToWorldRanks,
-      commDesc);
+      commDesc,
+      noLocal);
 
   // Create global bootstrap (MPI or TcpStore depending on env)
   std::unique_ptr<meta::comms::IBootstrap> commBootstrap(
@@ -146,15 +157,20 @@ std::unique_ptr<CtranComm> CtranDistTestFixture::makeCtranComm(
   // (nolocal, vnode, vClique) are applied inside setRankStatesTopologies.
   comm->statex_->initRankStatesTopology(commBootstrap.get());
 
+  // Verify the runtime topology matches the debug-topo env override (if any),
+  // so nolocal/vnode configs cannot silently run the real topology.
+  assertExpectedTopology(comm.get());
+
   comm->bootstrap_ = std::make_unique<ctran::testing::CtranTestBootstrap>(
       std::move(commBootstrap));
 
   comm->config_.commDesc = comm->statex_->commDesc().c_str();
-  // Set lazy IB connect on the per-comm config BEFORE ctranInit, which builds
-  // the Pipes transport from pipesConfig. The NCCL_CTRAN_IBGDA_LAZY_CONNECT env
-  // only feeds lazy via NcclxConfig, which this default-ctranConfig path does
-  // not go through, so tests must set it here explicitly.
-  comm->config_.pipesConfig.ibLazyConnect = ibLazyConnect;
+  // Preserve the compatibility setting through the standalone Ctran path.
+  // Peer materialization remains on demand for either value.
+  comm->config_.primsConfig.ibLazyConnect = ibLazyConnect;
+  // Consumed during ctranInit (inside CtranAlgo's ctor), so must be set on the
+  // comm before ctranInit runs.
+  comm->tmpbufEagerAlloc_ = tmpbufEagerAlloc;
 
   COMMCHECK_TEST(ctranInit(comm.get()));
   CHECK(ctranInitialized(comm.get())) << "Ctran not initialized";

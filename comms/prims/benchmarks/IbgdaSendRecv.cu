@@ -1,5 +1,7 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+#include "comms/prims/benchmarks/IbgdaSendRecv.h"
+
 #include "comms/prims/benchmarks/IbgdaSendRecv.cuh"
 
 #include <algorithm>
@@ -8,13 +10,24 @@
 #include "comms/prims/core/ThreadGroup.cuh"
 #include "comms/prims/core/TiledBuffer.cuh"
 #include "comms/prims/core/Timeout.cuh"
+#include "comms/prims/transport/P2pIbTransportProgressImpl.cuh"
+#ifndef __HIP_PLATFORM_AMD__
+#include "comms/prims/transport/ibgda/IbgdaWarpProxy.cuh"
+#endif
 
 namespace comms::prims::benchmark {
 
 namespace {
 
-__device__ __forceinline__ std::size_t benchmark_align_protocol_bytes(
-    std::size_t nbytes) {
+#ifndef __HIP_PLATFORM_AMD__
+constexpr uint32_t kWarpProxyWorkerThreads = 512;
+constexpr uint32_t kWarpProxyBlockThreads =
+    kWarpProxyWorkerThreads + comms::device::kWarpSize;
+using BenchmarkWarpProxy = IbgdaWarpProxy<kWarpProxyWorkerThreads>;
+#endif
+
+__device__ __forceinline__
+    std::size_t benchmark_align_protocol_bytes(std::size_t nbytes) {
   return (nbytes + 15ULL) & ~15ULL;
 }
 
@@ -267,6 +280,42 @@ __global__ void __launch_bounds__(512, 1) ibgda_recv_kernel(
   }
 }
 
+#ifndef __HIP_PLATFORM_AMD__
+template <bool IsSend>
+__global__ void __launch_bounds__(kWarpProxyBlockThreads, 1)
+    ibgda_warp_proxy_kernel(
+        P2pIbgdaTransportDevice* transport,
+        char* buffer,
+        std::size_t totalBytes,
+        std::size_t maxSignalBytes,
+        uint32_t queueDepth,
+        Timeout timeout) {
+  timeout.start();
+  auto block = make_block_group();
+  __shared__ BenchmarkWarpProxy::SharedState sharedState;
+  BenchmarkWarpProxy::run(
+      sharedState,
+      block,
+      BenchmarkWarpProxy::Config{.queueDepth = queueDepth},
+      timeout,
+      [&](auto& ops) {
+        auto& workers = ops.group();
+        const std::size_t sectionBytes = section_bytes(transport, totalBytes);
+        for (std::size_t offset = 0; offset < totalBytes;
+             offset += sectionBytes) {
+          const std::size_t bytes = min(sectionBytes, totalBytes - offset);
+          TiledBuffer<char> tiles(buffer + offset, bytes, workers);
+          if constexpr (IsSend) {
+            ops.send(*transport, tiles.data(), tiles.bytes(), maxSignalBytes);
+          } else {
+            ops.recv(*transport, tiles.data(), tiles.bytes(), maxSignalBytes);
+          }
+        }
+      });
+}
+
+#endif
+
 void launch_ibgda_send(
     P2pIbgdaTransportDevice* transport,
     char* src,
@@ -283,6 +332,38 @@ void launch_ibgda_send(
   }
 }
 
+void launch_ibgda_warp_proxy_send(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes,
+    Timeout timeout,
+    uint32_t queueDepth) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)src;
+  (void)nbytes;
+  (void)numBlocks;
+  (void)stream;
+  (void)maxSignalBytes;
+  (void)timeout;
+  (void)queueDepth;
+  printf("[PIPES] warp-proxy send benchmark is NVIDIA-only\n");
+#else
+  ibgda_warp_proxy_kernel<true>
+      <<<numBlocks, kWarpProxyBlockThreads, 0, stream>>>(
+          transport, src, nbytes, maxSignalBytes, queueDepth, timeout);
+  const cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf(
+        "[PIPES] warp-proxy send kernel launch failed: %s\n",
+        cudaGetErrorString(err));
+  }
+#endif
+}
+
 void launch_ibgda_recv(
     P2pIbgdaTransportDevice* transport,
     char* dst,
@@ -297,6 +378,166 @@ void launch_ibgda_recv(
   if (err != cudaSuccess) {
     printf("[PIPES] recv kernel launch failed: %s\n", cudaGetErrorString(err));
   }
+}
+
+// ==========================================================================
+// Low-latency (LL) protocol benchmark kernels. Mirror the Simple send/recv
+// kernels above but dispatch to the transport's send<LL>/recv<LL> (data+inline
+// flag, 2x wire, no DATA_READY wait; Memcpy only). Section sizing is identical:
+// the pipelined LL loop maps each payload section onto the wire ring
+// internally.
+// ==========================================================================
+__global__ void __launch_bounds__(512, 1) ibgda_send_recv_ll_kernel(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    char* dst,
+    std::size_t totalBytes,
+    int numBlocks,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+  auto group = make_block_group();
+
+  auto [role, sub] = group.partition(2);
+  const bool isSender = (role == 0);
+
+  const std::size_t sectionBytes = section_bytes(transport, totalBytes);
+  const std::size_t totalSections = totalBytes / sectionBytes;
+
+  for (std::size_t s = 0; s < totalSections; ++s) {
+    const std::size_t offset = s * sectionBytes;
+    if (isSender) {
+      TiledBuffer<char> tiles(src + offset, sectionBytes, sub);
+      transport->send<Memcpy, protocol::LL>(
+          sub, tiles.data(), tiles.bytes(), maxSignalBytes, timeout);
+    } else {
+      TiledBuffer<char> tiles(dst + offset, sectionBytes, sub);
+      transport->recv<Memcpy, protocol::LL>(
+          sub, tiles.data(), tiles.bytes(), maxSignalBytes, timeout);
+    }
+  }
+}
+
+void launch_ibgda_send_recv_ll(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    char* dst,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+  ibgda_send_recv_ll_kernel<<<2 * numBlocks, 512, 0, stream>>>(
+      transport, src, dst, nbytes, numBlocks, maxSignalBytes, timeout);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf(
+        "[PIPES] send/recv LL kernel launch failed: %s\n",
+        cudaGetErrorString(err));
+  }
+}
+
+__global__ void __launch_bounds__(512, 1) ibgda_send_ll_kernel(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t totalBytes,
+    int numBlocks,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+  auto group = make_block_group();
+
+  const std::size_t sectionBytes = section_bytes(transport, totalBytes);
+  const std::size_t totalSections = totalBytes / sectionBytes;
+
+  for (std::size_t s = 0; s < totalSections; ++s) {
+    TiledBuffer<char> tiles(src + s * sectionBytes, sectionBytes, group);
+    transport->send<Memcpy, protocol::LL>(
+        group, tiles.data(), tiles.bytes(), maxSignalBytes, timeout);
+  }
+}
+
+__global__ void __launch_bounds__(512, 1) ibgda_recv_ll_kernel(
+    P2pIbgdaTransportDevice* transport,
+    char* dst,
+    std::size_t totalBytes,
+    int numBlocks,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+  auto group = make_block_group();
+
+  const std::size_t sectionBytes = section_bytes(transport, totalBytes);
+  const std::size_t totalSections = totalBytes / sectionBytes;
+
+  for (std::size_t s = 0; s < totalSections; ++s) {
+    TiledBuffer<char> tiles(dst + s * sectionBytes, sectionBytes, group);
+    transport->recv<Memcpy, protocol::LL>(
+        group, tiles.data(), tiles.bytes(), maxSignalBytes, timeout);
+  }
+}
+
+void launch_ibgda_send_ll(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+  ibgda_send_ll_kernel<<<numBlocks, 512, 0, stream>>>(
+      transport, src, nbytes, numBlocks, maxSignalBytes, timeout);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf(
+        "[PIPES] send LL kernel launch failed: %s\n", cudaGetErrorString(err));
+  }
+}
+
+void launch_ibgda_recv_ll(
+    P2pIbgdaTransportDevice* transport,
+    char* dst,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+  ibgda_recv_ll_kernel<<<numBlocks, 512, 0, stream>>>(
+      transport, dst, nbytes, numBlocks, maxSignalBytes, timeout);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf(
+        "[PIPES] recv LL kernel launch failed: %s\n", cudaGetErrorString(err));
+  }
+}
+
+void launch_ibgda_warp_proxy_recv(
+    P2pIbgdaTransportDevice* transport,
+    char* dst,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes,
+    Timeout timeout,
+    uint32_t queueDepth) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)dst;
+  (void)nbytes;
+  (void)numBlocks;
+  (void)stream;
+  (void)maxSignalBytes;
+  (void)timeout;
+  (void)queueDepth;
+  printf("[PIPES] warp-proxy recv benchmark is NVIDIA-only\n");
+#else
+  ibgda_warp_proxy_kernel<false>
+      <<<numBlocks, kWarpProxyBlockThreads, 0, stream>>>(
+          transport, dst, nbytes, maxSignalBytes, queueDepth, timeout);
+  const cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf(
+        "[PIPES] warp-proxy recv kernel launch failed: %s\n",
+        cudaGetErrorString(err));
+  }
+#endif
 }
 
 __global__ void __launch_bounds__(512, 1) ibgda_drain_send_recv_kernel(
@@ -319,9 +560,10 @@ __global__ void __launch_bounds__(512, 1) ibgda_drain_send_recv_kernel(
   if (expectedBytes == 0) {
     return;
   }
-  auto& channel = transport->local_channel(static_cast<uint32_t>(groupId));
-  transport->wait_counter(group, channel.nicDoneWait, expectedBytes, timeout);
-  transport->wait_signal(group, channel.slotFree, expectedBytes, timeout);
+  auto& protoSlot = transport->local_channel_slot<protocol::Simple>(
+      static_cast<uint32_t>(groupId));
+  transport->wait_counter(group, protoSlot.nicDoneWait, expectedBytes, timeout);
+  transport->wait_signal(group, protoSlot.slotFree, expectedBytes, timeout);
 }
 
 void launch_ibgda_drain_send_recv(
@@ -360,17 +602,23 @@ __global__ void __launch_bounds__(256, 1) ibgda_reset_send_recv_kernel(
     if (SignalState* signal = layout.localSignalState(static_cast<int>(slot))) {
       signal->signal_ = 0;
     }
-    if (slot < static_cast<uint32_t>(maxGroups)) {
+    if (slot < static_cast<uint32_t>(layout.numChannels)) {
       auto& channel = transport->local_channel(slot);
-      channel.sendProgress = IbChannelProgress{};
-      channel.recvProgress = IbChannelProgress{};
-      // Zero the per-lane receiver DATA_READY expectations so they stay aligned
-      // with the DATA_READY slots zeroed above. recvDataReadyLaneCursor is
-      // deliberately NOT reset here: it mirrors the sender's free-running
-      // IbQpState::cursor, which this kernel also leaves untouched, so zeroing
-      // it would desync the round-robin lane mapping on the next stream.
-      for (int lane = 0; lane < kIbMaxQpLanesPerChannelDirection; ++lane) {
-        channel.recvLaneExpected[lane] = 0;
+      // Every protocol slot on this channel: the signal region zeroed above
+      // spans all of them.
+      for (int protoSlot = 0; protoSlot < kNumProtoSlots; ++protoSlot) {
+        auto& proto = channel.protos[protoSlot];
+        proto.sendProgress = IbChannelProgress{};
+        proto.recvProgress = IbChannelProgress{};
+        // Zero the per-lane receiver DATA_READY expectations so they stay
+        // aligned with the DATA_READY slots zeroed above.
+        // recvDataReadyLaneCursor is deliberately NOT reset here: it mirrors
+        // the channel-shared sendQp.cursor, which this kernel also leaves
+        // untouched, so zeroing it would desync the round-robin lane mapping
+        // on the next stream.
+        for (int lane = 0; lane < kIbMaxQpLanesPerChannelDirection; ++lane) {
+          proto.recvLaneExpected[lane] = 0;
+        }
       }
     }
   }
@@ -408,7 +656,8 @@ __global__ void __launch_bounds__(512, 1) ibgda_progress_send_kernel(
     std::size_t totalBytes,
     int numBlocks,
     std::size_t maxSignalBytes,
-    Timeout timeout) {
+    Timeout timeout,
+    bool waitForSlotFree) {
   auto group = make_block_group();
 
   const std::size_t sectionBytes = section_bytes(transport, totalBytes);
@@ -422,6 +671,50 @@ __global__ void __launch_bounds__(512, 1) ibgda_progress_send_kernel(
            IbgdaSendRecvProgressStatus::Done) {
     }
   }
+
+  if (waitForSlotFree) {
+    auto& protoSlot = transport->local_channel_slot<protocol::Simple>(group);
+    transport->wait_signal(
+        group,
+        protoSlot.slotFree,
+        static_cast<uint64_t>(protoSlot.sendProgress.nextStep),
+        timeout);
+  }
+}
+
+__global__ void __launch_bounds__(512, 1) ibgda_registered_progress_send_kernel(
+    P2pIbgdaTransportDevice* transport,
+    IbgdaLocalBuffer src,
+    std::size_t totalBytes,
+    int numBlocks,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+  auto group = make_block_group();
+
+  auto status = IbgdaRegisteredSendProgressStatus::Waiting;
+  const std::size_t sectionBytes = section_bytes(transport, totalBytes);
+  const std::size_t totalSections = totalBytes / sectionBytes;
+  for (std::size_t s = 0; s < totalSections; ++s) {
+    const auto section = src.subBuffer(s * sectionBytes);
+    transport->init_registered_send_progress(
+        group, sectionBytes, maxSignalBytes);
+    status = IbgdaRegisteredSendProgressStatus::Waiting;
+    while (status != IbgdaRegisteredSendProgressStatus::Posted &&
+           status != IbgdaRegisteredSendProgressStatus::Drained) {
+      status = transport->progress_registered_send_once(
+          group, section, sectionBytes, maxSignalBytes, timeout);
+    }
+  }
+  while (status != IbgdaRegisteredSendProgressStatus::Drained) {
+    status = transport->progress_registered_send_drain_once(group, timeout);
+  }
+
+  auto& protoSlot = transport->local_channel_slot<protocol::Simple>(group);
+  transport->wait_signal(
+      group,
+      protoSlot.slotFree,
+      static_cast<uint64_t>(protoSlot.sendProgress.nextStep),
+      timeout);
 }
 
 __global__ void __launch_bounds__(512, 1) ibgda_progress_recv_kernel(
@@ -466,11 +759,69 @@ void launch_ibgda_progress_send(
   printf("[PIPES] progress send benchmark is NVIDIA-only\n");
 #else
   ibgda_progress_send_kernel<<<numBlocks, 512, 0, stream>>>(
-      transport, src, nbytes, numBlocks, maxSignalBytes, timeout);
+      transport, src, nbytes, numBlocks, maxSignalBytes, timeout, false);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     printf(
         "[PIPES] progress send kernel launch failed: %s\n",
+        cudaGetErrorString(err));
+  }
+#endif
+}
+
+void launch_ibgda_progress_send_complete(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)src;
+  (void)nbytes;
+  (void)numBlocks;
+  (void)stream;
+  (void)maxSignalBytes;
+  (void)timeout;
+  printf("[PIPES] progress send benchmark is NVIDIA-only\n");
+#else
+  ibgda_progress_send_kernel<<<numBlocks, 512, 0, stream>>>(
+      transport, src, nbytes, numBlocks, maxSignalBytes, timeout, true);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf(
+        "[PIPES] progress send kernel launch failed: %s\n",
+        cudaGetErrorString(err));
+  }
+#endif
+}
+
+void launch_ibgda_registered_progress_send(
+    P2pIbgdaTransportDevice* transport,
+    const IbgdaLocalBuffer& src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)src;
+  (void)nbytes;
+  (void)numBlocks;
+  (void)stream;
+  (void)maxSignalBytes;
+  (void)timeout;
+  printf("[PIPES] registered progress send benchmark is NVIDIA-only\n");
+#else
+  ibgda_registered_progress_send_kernel<<<numBlocks, 512, 0, stream>>>(
+      transport, src, nbytes, numBlocks, maxSignalBytes, timeout);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf(
+        "[PIPES] registered progress send kernel launch failed: %s\n",
         cudaGetErrorString(err));
   }
 #endif
@@ -505,6 +856,119 @@ void launch_ibgda_progress_recv(
 #endif
 }
 
+// ==========================================================================
+// LL resumable-progress benchmark kernels. Mirror the Simple progress
+// send/recv kernels above but drive the LL protocol: init/progress are
+// templated on protocol::LL so the reservation, wire geometry, and readiness
+// poll all use the data+inline-flag format (2x wire, no DATA_READY). Memcpy
+// only.
+// ==========================================================================
+#ifndef __HIP_PLATFORM_AMD__
+__global__ void __launch_bounds__(512, 1) ibgda_progress_send_ll_kernel(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t totalBytes,
+    int numBlocks,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+  auto group = make_block_group();
+
+  const std::size_t sectionBytes = section_bytes(transport, totalBytes);
+  const std::size_t totalSections = totalBytes / sectionBytes;
+
+  for (std::size_t s = 0; s < totalSections; ++s) {
+    TiledBuffer<char> tiles(src + s * sectionBytes, sectionBytes, group);
+    transport->init_send_progress<protocol::LL>(
+        group, tiles.bytes(), maxSignalBytes);
+    while (transport->progress_send_once<Memcpy, protocol::LL>(
+               group, tiles.data(), tiles.bytes(), maxSignalBytes, timeout) !=
+           IbgdaSendRecvProgressStatus::Done) {
+    }
+  }
+}
+
+__global__ void __launch_bounds__(512, 1) ibgda_progress_recv_ll_kernel(
+    P2pIbgdaTransportDevice* transport,
+    char* dst,
+    std::size_t totalBytes,
+    int numBlocks,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+  auto group = make_block_group();
+
+  const std::size_t sectionBytes = section_bytes(transport, totalBytes);
+  const std::size_t totalSections = totalBytes / sectionBytes;
+
+  for (std::size_t s = 0; s < totalSections; ++s) {
+    TiledBuffer<char> tiles(dst + s * sectionBytes, sectionBytes, group);
+    transport->init_recv_progress<protocol::LL>(
+        group, tiles.bytes(), maxSignalBytes);
+    while (transport->progress_recv_once<Memcpy, protocol::LL>(
+               group, tiles.data(), tiles.bytes(), maxSignalBytes, timeout) !=
+           IbgdaSendRecvProgressStatus::Done) {
+    }
+  }
+}
+#endif
+
+void launch_ibgda_progress_send_ll(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)src;
+  (void)nbytes;
+  (void)numBlocks;
+  (void)stream;
+  (void)maxSignalBytes;
+  (void)timeout;
+  printf("[PIPES] progress send LL benchmark is NVIDIA-only\n");
+#else
+  ibgda_progress_send_ll_kernel<<<numBlocks, 512, 0, stream>>>(
+      transport, src, nbytes, numBlocks, maxSignalBytes, timeout);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf(
+        "[PIPES] progress send LL kernel launch failed: %s\n",
+        cudaGetErrorString(err));
+  }
+#endif
+}
+
+void launch_ibgda_progress_recv_ll(
+    P2pIbgdaTransportDevice* transport,
+    char* dst,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)dst;
+  (void)nbytes;
+  (void)numBlocks;
+  (void)stream;
+  (void)maxSignalBytes;
+  (void)timeout;
+  printf("[PIPES] progress recv LL benchmark is NVIDIA-only\n");
+#else
+  ibgda_progress_recv_ll_kernel<<<numBlocks, 512, 0, stream>>>(
+      transport, dst, nbytes, numBlocks, maxSignalBytes, timeout);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf(
+        "[PIPES] progress recv LL kernel launch failed: %s\n",
+        cudaGetErrorString(err));
+  }
+#endif
+}
+
 __global__ void ibgda_snapshot_step_state_kernel(
     P2pIbgdaTransportDevice* transport,
     int64_t* dst,
@@ -512,12 +976,14 @@ __global__ void ibgda_snapshot_step_state_kernel(
   const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < count) {
     const auto& layout = transport->channel_layout();
-    const auto maxChannels = static_cast<uint32_t>(layout.maxChannels);
-    if (idx < maxChannels) {
-      dst[idx] = transport->local_channel(idx).sendProgress.nextStep;
+    const auto numChannels = static_cast<uint32_t>(layout.numChannels);
+    if (idx < numChannels) {
+      dst[idx] = transport->local_channel_slot<protocol::Simple>(idx)
+                     .sendProgress.nextStep;
     } else {
       dst[idx] =
-          transport->local_channel(idx - maxChannels).recvProgress.nextStep;
+          transport->local_channel_slot<protocol::Simple>(idx - numChannels)
+              .recvProgress.nextStep;
     }
   }
 }

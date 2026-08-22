@@ -14,15 +14,18 @@
 #include "comms/ctran/gpe/CtranGpe.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/regcache/RegCache.h"
+#include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/LogInit.h"
+#include "comms/ctran/window/CtranWin.h"
 
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 // Import "commGroupDepth" from CommGroupUtils.h
 #include "comms/ctran/utils/CommGroupUtils.h"
 
 #if defined(ENABLE_PRIMS)
+#include "comms/ctran/algos/common/OrderedWorkStreamGuard.h"
 #include "comms/prims/trace/PipesTrace.h"
 #include "comms/prims/transport/MultiPeerDeviceHandle.cuh"
 #include "comms/prims/transport/MultiPeerTransport.h"
@@ -61,7 +64,9 @@ commResult_t Ctran::commRegister(void* buff, size_t size, void** handle) {
   commResult_t res = commSuccess;
 
   if (!this->mapper) {
-    CLOGF(ERR, "Ctran mapper is not initialized, skip commRegister");
+    CTRAN_ERR(
+        commInternalError,
+        "Ctran mapper is not initialized, skip commRegister");
     return commInternalError;
   } else if (NCCL_CTRAN_REGISTER != NCCL_CTRAN_REGISTER::none) {
     return this->mapper->regMem(buff, size, handle);
@@ -74,7 +79,9 @@ commResult_t Ctran::commDeregister(void* handle) {
   commResult_t res = commSuccess;
 
   if (!this->mapper) {
-    CLOGF(ERR, "Ctran mapper is not initialized, skip commDeregister");
+    CTRAN_ERR(
+        commInternalError,
+        "Ctran mapper is not initialized, skip commDeregister");
     return commInternalError;
   } else if (NCCL_CTRAN_REGISTER != NCCL_CTRAN_REGISTER::none) {
     return this->mapper->deregMem(handle);
@@ -112,12 +119,6 @@ uint64_t Ctran::getCtranOpCount() const {
 }
 
 #if defined(ENABLE_PRIMS)
-comms::prims::Transport* CtranComm::getMultiPeerTransportsPtr() const {
-  if (!multiPeerTransport_) {
-    return nullptr;
-  }
-  return multiPeerTransport_->get_device_handle().transports.data();
-}
 comms::prims::Transport* CtranComm::getMultiPeerTransportsPtr(
     const std::vector<int>& peers) {
   if (!multiPeerTransport_) {
@@ -126,9 +127,6 @@ comms::prims::Transport* CtranComm::getMultiPeerTransportsPtr(
   return multiPeerTransport_->get_device_handle(peers).transports.data();
 }
 #else
-comms::prims::Transport* CtranComm::getMultiPeerTransportsPtr() const {
-  return nullptr;
-}
 comms::prims::Transport* CtranComm::getMultiPeerTransportsPtr(
     const std::vector<int>& /*peers*/) {
   return nullptr;
@@ -180,7 +178,7 @@ commResult_t ctranInit(
     comm->ctran_ = std::make_shared<Ctran>(
         comm, std::move(reporter), std::move(gpeReporter));
   } catch (std::exception& e) {
-    CLOGF(ERR, "Ctran initialization failed: {}", e.what());
+    CTRAN_LOG(ERR, "Ctran initialization failed: {}", e.what());
     return commInternalError;
   }
 
@@ -226,10 +224,22 @@ CtranComm::CtranComm(std::shared_ptr<Abort> abort, ctranConfig commConfig)
 void CtranComm::destroy() {
   cudagraphDeferredCleanup.runAll();
 
+  // Free the lazily-allocated small-message AllReduce-ring staging buffers.
+  if (smallMsgStageSrc_ != nullptr) {
+    FB_CUDACHECKIGNORE(cudaFree(smallMsgStageSrc_));
+    smallMsgStageSrc_ = nullptr;
+  }
+  if (smallMsgStageDst_ != nullptr) {
+    FB_CUDACHECKIGNORE(cudaFree(smallMsgStageDst_));
+    smallMsgStageDst_ = nullptr;
+  }
+  smallMsgStageBytes_ = 0;
+
   // All smart pointers are automatically de-initialized, but we want to
   // ensure they do so in a specific order. Therefore, we manually handle
   // their de-initialization here.
 #if defined(ENABLE_PRIMS)
+  primsOrderedWorkStreamGuard_.reset();
   pipesTrace_.reset();
   // Must be destroyed before ctran_ (which owns SharedResource staging
   // buffers used as external data buffers) and before bootstrap_ (since
@@ -281,7 +291,8 @@ commResult_t globalRegisterWithPtr(
 
   auto regCache = RegCache::getInstance();
   if (!regCache) {
-    CLOGF(ERR, "globalRegisterWithPtr: RegCache not available");
+    CTRAN_ERR(
+        commInternalError, "globalRegisterWithPtr: RegCache not available");
     return commInternalError;
   }
 
@@ -297,7 +308,8 @@ globalDeregisterWithPtr(void* buff, size_t size, bool skipRemRelease) {
 
   auto regCache = RegCache::getInstance();
   if (!regCache) {
-    CLOGF(ERR, "globalDeregisterWithPtr: RegCache not available");
+    CTRAN_ERR(
+        commInternalError, "globalDeregisterWithPtr: RegCache not available");
     return commInternalError;
   }
 

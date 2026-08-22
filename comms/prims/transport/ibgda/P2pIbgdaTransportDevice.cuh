@@ -31,6 +31,7 @@
 #include "comms/prims/core/Timeout.cuh"
 #include "comms/prims/memory/DeviceSpan.cuh"
 #include "comms/prims/transport/P2pIbTransportDeviceDecl.cuh"
+#include "comms/prims/transport/P2pIbTransportDeviceImpl.cuh"
 #include "comms/prims/transport/ibgda/IbgdaBuffer.h"
 
 namespace comms::prims {
@@ -43,7 +44,7 @@ inline constexpr uint64_t kDefaultDeviceTimeoutCycles = 10'000'000'000ULL;
 // is intentionally available across all `comms/prims` device headers.
 //
 // `IbgdaSendRecvProgressStatus` and the pipelined send/recv algorithm live in
-// private shared helpers in P2pIbTransportDeviceDecl.cuh; backend-owned
+// private shared helpers in P2pIbTransportDeviceImpl.cuh; backend-owned
 // `channelLayout_` carries the actual protocol state.
 
 // Slot-id bounds checks for the slot-index API. Catches both
@@ -105,6 +106,8 @@ struct NicDeviceIbgdaResources {
  *     Threads in the group coordinate the operation; callers that want the
  *     transport to shard a larger buffer should use put_cooperative().
  *     Signal/counter/flush are leader-only with group.sync().
+ *     The returned ticket carries data only in the leader thread. A later
+ *     group-scope wait_local() consumes that leader's ticket collectively.
  *
  *   Thread-scope: put(...) — single thread calls.
  *     QP selection uses the caller's physical blockIdx.x. Implemented as a
@@ -140,7 +143,8 @@ struct NicDeviceIbgdaResources {
  * the same QP, so the signal covers that put. A standalone signal uses the
  * block's control lane and does not cover earlier round-robined puts unless
  * the caller explicitly calls fence()/flush() first.
- * put() returns void — completion via wait_signal/wait_counter/flush.
+ * put() returns a local-completion frontier. Callers may ignore it and use an
+ * optional counter or flush instead.
  *
  * Two API layers:
  *   1. Slot-index API: resolve owned buffers by slot index, then forward
@@ -242,8 +246,8 @@ class P2pIbgdaTransportDevice {
    *                    the counter. Bounds-checked against numCounterSlots_.
    * @param counterVal  Value added to the local counter slot.
    */
-  __device__ void put(
-      ThreadGroup& group,
+  __device__ IbLocalCompletionTicket
+  put(ThreadGroup& group,
       const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
       std::size_t nbytes,
@@ -255,7 +259,8 @@ class P2pIbgdaTransportDevice {
         (signalId >= 0) ? remote_signal_slot(signalId) : IbgdaRemoteBuffer{};
     IbgdaLocalBuffer ctrSlot =
         (counterId >= 0) ? counter_slot(counterId) : IbgdaLocalBuffer{};
-    put(group,
+    return put(
+        group,
         localBuf,
         remoteBuf,
         nbytes,
@@ -304,8 +309,8 @@ class P2pIbgdaTransportDevice {
    * use the group-scope APIs because the solo group id is not a channel id.
    * Args match the group-scope overload.
    */
-  __device__ void put(
-      const IbgdaLocalBuffer& localBuf,
+  __device__ IbLocalCompletionTicket
+  put(const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
       std::size_t nbytes,
       int signalId = -1,
@@ -313,7 +318,8 @@ class P2pIbgdaTransportDevice {
       int counterId = -1,
       uint64_t counterVal = 1) {
     ThreadGroup solo = make_thread_solo();
-    put(solo,
+    return put(
+        solo,
         localBuf,
         remoteBuf,
         nbytes,
@@ -477,7 +483,8 @@ class P2pIbgdaTransportDevice {
    * larger user buffer. Use put_cooperative() for the convenience behavior that
    * splits the provided range across the group.
    *
-   * Returns void; completion is observed via wait_signal/wait_counter/flush.
+   * Returns a local-completion frontier. Callers may ignore it and use the
+   * optional counter or flush APIs instead.
    *
    * NOTE: signalBuf is intentionally NOT defaulted, even though `= {}` would
    * mean "no signal". Defaulting it would make put(group, local, remote, n)
@@ -497,8 +504,8 @@ class P2pIbgdaTransportDevice {
    *                   WQE through the companion QP.
    * @param counterVal Value added to *counterBuf.
    */
-  __device__ void put(
-      ThreadGroup& group,
+  __device__ IbLocalCompletionTicket
+  put(ThreadGroup& group,
       const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
       std::size_t nbytes,
@@ -507,7 +514,7 @@ class P2pIbgdaTransportDevice {
       const IbgdaLocalBuffer& counterBuf = {},
       uint64_t counterVal = 1,
       bool signalPerLane = false) {
-    put_impl(
+    return put_impl(
         group,
         localBuf,
         remoteBuf,
@@ -526,8 +533,8 @@ class P2pIbgdaTransportDevice {
    *
    * signalBuf intentionally not defaulted (see group-scope sibling above).
    */
-  __device__ void put(
-      const IbgdaLocalBuffer& localBuf,
+  __device__ IbLocalCompletionTicket
+  put(const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
       std::size_t nbytes,
       const IbgdaRemoteBuffer& signalBuf,
@@ -535,7 +542,8 @@ class P2pIbgdaTransportDevice {
       const IbgdaLocalBuffer& counterBuf = {},
       uint64_t counterVal = 1) {
     ThreadGroup solo = make_thread_solo();
-    put(solo,
+    return put(
+        solo,
         localBuf,
         remoteBuf,
         nbytes,
@@ -662,6 +670,55 @@ class P2pIbgdaTransportDevice {
     wait_counter_impl(group, counterBuf, expected, timeout);
   }
 
+  __device__ void wait_local(
+      ThreadGroup& group,
+      const IbLocalCompletionTicket& ticket,
+      const Timeout& timeout = Timeout()) {
+    if (group.is_leader()) {
+      IbgdaLane lane = lane_from_ordinal(
+          group.group_id, IbDirection::Send, ticket.completionId);
+      wait_local_on_qp(lane.qp, ticket.value, timeout);
+    }
+    group.sync();
+  }
+
+  __device__ __forceinline__ bool is_local_completion_ready(
+      uint32_t channelId,
+      const IbLocalCompletionTicket& ticket) {
+    IbgdaLane lane =
+        lane_from_ordinal(channelId, IbDirection::Send, ticket.completionId);
+    const int status = doca_gpu_dev_verbs_poll_one_cq_at<
+        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+        doca_gpu_dev_verbs_qp_get_cq_sq(lane.qp), ticket.value);
+    if (status == 0) {
+      return true;
+    }
+    if (status == EBUSY) {
+      return false;
+    }
+    printf(
+        "P2pIbgdaTransportDevice: local completion failed lane=%u "
+        "ticket=%llu status=%d\n",
+        ticket.completionId,
+        static_cast<unsigned long long>(ticket.value),
+        status);
+    PIPES_DEVICE_TRAP();
+    return false;
+  }
+
+  __device__ __forceinline__ void wait_local_completion(
+      uint32_t channelId,
+      const IbLocalCompletionTicket& ticket,
+      const Timeout& timeout) {
+    IbgdaLane lane =
+        lane_from_ordinal(channelId, IbDirection::Send, ticket.completionId);
+    wait_local_on_qp(lane.qp, ticket.value, timeout);
+  }
+
+  __device__ __forceinline__ uint32_t send_completion_lane_count() const {
+    return num_qp_lanes();
+  }
+
   /** wait_counter (thread-scope) - Single-thread variant. */
   __device__ void wait_counter(
       const IbgdaLocalBuffer& counterBuf,
@@ -685,18 +742,19 @@ class P2pIbgdaTransportDevice {
    */
   __device__ void flush(
       ThreadGroup& group,
-      IbDirection direction = IbDirection::Send) {
+      IbDirection direction = IbDirection::Send,
+      const Timeout& timeout = Timeout()) {
     if (group.is_leader()) {
       validate_group_scope(group);
-      drain_flush_lanes(group, direction);
+      drain_flush_lanes(group, direction, timeout);
     }
     group.sync();
   }
 
   /** flush (thread-scope) - Single-thread variant. */
-  __device__ void flush() {
+  __device__ void flush(const Timeout& timeout = Timeout()) {
     ThreadGroup solo = make_thread_solo();
-    flush(solo);
+    flush(solo, IbDirection::Send, timeout);
   }
 
   /**
@@ -709,13 +767,14 @@ class P2pIbgdaTransportDevice {
    */
   __device__ void fence(
       ThreadGroup& group,
-      IbDirection direction = IbDirection::Send) {
-    flush(group, direction);
+      IbDirection direction = IbDirection::Send,
+      const Timeout& timeout = Timeout()) {
+    flush(group, direction, timeout);
   }
 
   /** fence (thread-scope) - Single-thread variant. */
-  __device__ void fence() {
-    flush();
+  __device__ void fence(const Timeout& timeout = Timeout()) {
+    flush(timeout);
   }
 
   // =========================================================================
@@ -1027,7 +1086,7 @@ class P2pIbgdaTransportDevice {
             DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
             doca_gpu_dev_verbs_qp_get_cq_sq(qp), ticket);
         if (status == EBUSY) {
-          TIMEOUT_TRAP_IF_EXPIRED_SINGLE(
+          FT_ABORT_BREAK(
               timeout,
               "wait_local_on_qp timed out (ticket=%llu)",
               static_cast<unsigned long long>(ticket));
@@ -1040,24 +1099,28 @@ class P2pIbgdaTransportDevice {
       uint32_t channelId,
       IbDirection direction,
       uint64_t mask,
-      const uint64_t* tickets) {
+      const uint64_t* tickets,
+      const Timeout& timeout = Timeout()) {
     const uint32_t numLanes = num_qp_lanes();
     for (uint32_t laneId = 0; laneId < numLanes; ++laneId) {
       if ((mask & (1ULL << laneId)) == 0) {
         continue;
       }
       IbgdaLane lane = lane_from_ordinal(channelId, direction, laneId);
-      wait_local_on_qp(lane.qp, tickets[laneId]);
+      wait_local_on_qp(lane.qp, tickets[laneId], timeout);
     }
   }
 
-  __device__ void drain_flush_lanes(ThreadGroup& group, IbDirection direction) {
+  __device__ void drain_flush_lanes(
+      ThreadGroup& group,
+      IbDirection direction,
+      const Timeout& timeout = Timeout()) {
     auto& state = qp_state(group.group_id, direction);
     const uint64_t mask = atomic_exchange_u64(&state.pendingFlushLanesMask, 0);
-    wait_lanes(group.group_id, direction, mask, state.lastFlushWqe);
+    wait_lanes(group.group_id, direction, mask, state.lastFlushWqe, timeout);
   }
 
-  __device__ void put_impl(
+  __device__ IbLocalCompletionTicket put_impl(
       ThreadGroup& group,
       const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
@@ -1076,9 +1139,10 @@ class P2pIbgdaTransportDevice {
         PIPES_DEVICE_TRAP();
       }
       group.sync();
-      return;
+      return {};
     }
 
+    IbLocalCompletionTicket completion;
     if (group.is_leader()) {
       validate_group_scope(group);
       const bool hasCounter = counterBuf.ptr != nullptr;
@@ -1093,6 +1157,7 @@ class P2pIbgdaTransportDevice {
           (signalPerLane && signalBuf.ptr != nullptr)
           ? signalBuf.subBuffer(sendRecvSignalSlotOffset(lane.lane_ordinal))
           : signalBuf;
+      uint64_t dataTicket = 0;
       if (hasSignal && hasCounter) {
         const auto tickets = put_signal_counter_single_impl(
             lane,
@@ -1103,22 +1168,33 @@ class P2pIbgdaTransportDevice {
             signalVal,
             counterBuf,
             counterVal);
+        dataTicket = tickets.put_wqe;
+        record_put_wqe(lane, tickets.put_wqe);
         record_signal_wqe(lane, tickets.signal_wqe);
       } else if (hasSignal) {
         const auto tickets = put_signal_single_impl(
             lane, localBuf, remoteBuf, nbytes, effectiveSignalBuf, signalVal);
+        dataTicket = tickets.put_wqe;
+        record_put_wqe(lane, tickets.put_wqe);
         record_signal_wqe(lane, tickets.signal_wqe);
       } else if (hasCounter) {
         const uint64_t putTicket = put_counter_single_impl(
             lane, localBuf, remoteBuf, nbytes, counterBuf, counterVal);
+        dataTicket = putTicket;
         record_put_wqe(lane, putTicket);
       } else {
         const uint64_t putTicket =
             put_single_impl(lane, localBuf, remoteBuf, nbytes);
+        dataTicket = putTicket;
         record_put_wqe(lane, putTicket);
       }
+      completion = IbLocalCompletionTicket{
+          .completionId = lane.lane_ordinal,
+          .value = dataTicket,
+      };
     }
     group.sync();
+    return completion;
   }
 
   __device__ void put_cooperative_impl(
@@ -1181,7 +1257,7 @@ class P2pIbgdaTransportDevice {
     if (group.is_leader()) {
       uint64_t current = load_acquire_system_u64(signalBuf.ptr);
       while (current < expected) {
-        TIMEOUT_TRAP_IF_EXPIRED_SINGLE(
+        FT_ABORT_BREAK(
             timeout,
             "wait_signal: expected>=%llu, current=%llu",
             static_cast<unsigned long long>(expected),
@@ -1202,7 +1278,7 @@ class P2pIbgdaTransportDevice {
     if (group.is_leader()) {
       uint64_t current = load_acquire_system_u64(counterBuf.ptr);
       while (current < expected) {
-        TIMEOUT_TRAP_IF_EXPIRED_SINGLE(
+        FT_ABORT_BREAK(
             timeout,
             "wait_counter: expected>=%llu, current=%llu",
             static_cast<unsigned long long>(expected),
@@ -1262,7 +1338,7 @@ class P2pIbgdaTransportDevice {
       if (group.group_size > qp_depth) {
         printf(
             "[PIPES] FATAL: put group_size (%u) > QP depth (%u). "
-            "Set NCCL_CTRAN_IBGDA_QP_DEPTH >= %u to avoid deadlock.\n",
+            "Set MCCL_IB_QP_DEPTH >= %u to avoid deadlock.\n",
             group.group_size,
             qp_depth,
             group.group_size);
@@ -1921,15 +1997,16 @@ class P2pIbgdaTransportDevice {
    *
    * Sender chunk state machine:
    *
-   *   WaitNicDone
+   *   WaitLocalCompletion
    *        |
    *        | local sendStaging is reusable; copy user src -> sendStaging
    *        v
    *   WaitSlotFree
    *        |
-   *        | remote recvStaging is reusable; RDMA put + DATA_READY + NIC_DONE
+   *        | remote recvStaging is reusable; RDMA put + DATA_READY
    *        v
-   *   Done for this chunk, then either WaitNicDone for next chunk or Done
+   *   Done for this chunk, then either WaitLocalCompletion for next chunk or
+   *   Done
    *
    * Receiver chunk state machine:
    *
@@ -2001,11 +2078,26 @@ class P2pIbgdaTransportDevice {
    * @param nbytes Number of user-buffer bytes to send for this group.
    * @param max_signal_bytes Maximum signaled sub-chunk size, or 0 for default.
    */
+  template <typename Proto = protocol::Simple>
   __device__ __forceinline__ void init_send_progress(
       ThreadGroup& group,
       std::size_t nbytes,
       std::size_t max_signal_bytes = 0) {
-    detail::init_send_progress(*this, group, nbytes, max_signal_bytes);
+    detail::init_send_progress<P2pIbgdaTransportDevice, Proto>(
+        *this, group, nbytes, max_signal_bytes);
+  }
+
+  /**
+   * Initialize a registered-source send that shares the normal send protocol
+   * cursor but bypasses local send staging.
+   */
+  template <typename = void>
+  __device__ __forceinline__ void init_registered_send_progress(
+      ThreadGroup& group,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes = 0) {
+    detail::init_registered_send_progress(
+        *this, group, nbytes, max_signal_bytes);
   }
 
   /**
@@ -2034,11 +2126,13 @@ class P2pIbgdaTransportDevice {
    * @param nbytes Number of user-buffer bytes to receive for this group.
    * @param max_signal_bytes Maximum signaled sub-chunk size, or 0 for default.
    */
+  template <typename Proto = protocol::Simple>
   __device__ __forceinline__ void init_recv_progress(
       ThreadGroup& group,
       std::size_t nbytes,
       std::size_t max_signal_bytes = 0) {
-    detail::init_recv_progress(*this, group, nbytes, max_signal_bytes);
+    detail::init_recv_progress<P2pIbgdaTransportDevice, Proto>(
+        *this, group, nbytes, max_signal_bytes);
   }
 
   /**
@@ -2073,7 +2167,10 @@ class P2pIbgdaTransportDevice {
    * @param timeout Optional device timeout checked while dependencies wait.
    * @param args Additional arguments forwarded to `CopyOp::send`.
    */
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ IbgdaSendRecvProgressStatus progress_send_once(
       ThreadGroup& group,
       const void* __restrict__ src,
@@ -2081,8 +2178,60 @@ class P2pIbgdaTransportDevice {
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    return detail::progress_send_once<P2pIbgdaTransportDevice, CopyOp>(
+    return detail::progress_send_once<P2pIbgdaTransportDevice, CopyOp, Proto>(
         *this, group, src, nbytes, max_signal_bytes, timeout, args...);
+  }
+
+  /**
+   * Post registered-source send chunks without copying through send staging.
+   * `Posted` does not release the source; callers must later drain.
+   */
+  template <typename = void>
+  __device__ __forceinline__ IbgdaRegisteredSendProgressStatus
+  progress_registered_send_once(
+      ThreadGroup& group,
+      const IbgdaLocalBuffer& src,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes = 0,
+      const Timeout& timeout = Timeout()) {
+    return detail::progress_registered_send_once(
+        *this, group, src, nbytes, max_signal_bytes, timeout);
+  }
+
+  /**
+   * Poll all outstanding send completion tickets for this channel. `Drained`
+   * means registered source ranges posted before the call are reusable.
+   */
+  template <typename = void>
+  __device__ __forceinline__ IbgdaRegisteredSendProgressStatus
+  progress_registered_send_drain_once(
+      ThreadGroup& group,
+      const Timeout& timeout = Timeout()) {
+    return detail::progress_registered_send_drain_once(*this, group, timeout);
+  }
+
+  template <typename CopyOp = Memcpy, typename... Args>
+  __device__ __forceinline__ IbgdaSendRecvProgressStatus
+  progress_send_once_with_trace(
+      ThreadGroup& group,
+      const void* __restrict__ src,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes,
+      const Timeout& timeout,
+      const PipesTraceAllReduceContext& traceContext,
+      PipesTraceProgressState& traceState,
+      Args... args) {
+    return detail::
+        progress_send_once_with_trace<P2pIbgdaTransportDevice, CopyOp>(
+            *this,
+            group,
+            src,
+            nbytes,
+            max_signal_bytes,
+            timeout,
+            traceContext,
+            traceState,
+            args...);
   }
 
   /**
@@ -2114,7 +2263,10 @@ class P2pIbgdaTransportDevice {
    * @param timeout Optional device timeout checked while dependencies wait.
    * @param args Additional arguments forwarded to `CopyOp::recv`.
    */
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ IbgdaSendRecvProgressStatus progress_recv_once(
       ThreadGroup& group,
       void* __restrict__ dst,
@@ -2122,8 +2274,61 @@ class P2pIbgdaTransportDevice {
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    return detail::progress_recv_once<P2pIbgdaTransportDevice, CopyOp>(
+    return detail::progress_recv_once<P2pIbgdaTransportDevice, CopyOp, Proto>(
         *this, group, dst, nbytes, max_signal_bytes, timeout, args...);
+  }
+
+  template <typename CopyOp = Memcpy, typename... Args>
+  __device__ __forceinline__ IbgdaSendRecvProgressStatus
+  progress_recv_once_with_trace(
+      ThreadGroup& group,
+      void* __restrict__ dst,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes,
+      const Timeout& timeout,
+      const PipesTraceAllReduceContext& traceContext,
+      PipesTraceProgressState& traceState,
+      Args... args) {
+    return detail::
+        progress_recv_once_with_trace<P2pIbgdaTransportDevice, CopyOp>(
+            *this,
+            group,
+            dst,
+            nbytes,
+            max_signal_bytes,
+            timeout,
+            traceContext,
+            traceState,
+            args...);
+  }
+
+  // Templated for the same reason P2pIbTransportDevice templates its
+  // dispatchers: the definitions live in the progress-impl header, which this
+  // header deliberately does not include. A non-template body is compiled
+  // eagerly in every translation unit, so the HIP/ROCm build -- which never
+  // pulls in that impl header -- failed with -Werror,-Wundefined-inline. A
+  // template body is only instantiated where it is actually called, i.e. where
+  // the definition is visible.
+  template <typename = void>
+  __device__ __forceinline__ IbgdaSendRecvProgressStatus
+  progress_recv_acquire_once(
+      ThreadGroup& group,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes,
+      const Timeout& timeout,
+      detail::RecvChunkAcquisition& out) {
+    return detail::
+        progress_recv_acquire_once<P2pIbgdaTransportDevice, protocol::Simple>(
+            *this, group, nbytes, max_signal_bytes, timeout, out);
+  }
+
+  template <typename = void>
+  __device__ __forceinline__ void progress_recv_release_once(
+      ThreadGroup& group,
+      const detail::RecvChunkAcquisition& view) {
+    detail::
+        progress_recv_release_once<P2pIbgdaTransportDevice, protocol::Simple>(
+            *this, group, view);
   }
 
   /**
@@ -2153,6 +2358,16 @@ class P2pIbgdaTransportDevice {
    * flight. `max_signal_bytes` may vary across calls because it only changes
    * the signal cadence within the fixed per-channel staging slice.
    *
+   * `Proto` is a call-site choice and is never negotiated on the wire, so the
+   * sender and receiver must select the same one: mixing them deadlocks, with
+   * Simple waiting on a DATA_READY counter the LL sender never posts while LL
+   * polls for an inline flag Simple never writes. Callers own that agreement
+   * and must derive the protocol from a collective-uniform input rather than
+   * from per-rank state. MCCL's tree does this on the host, picking from the
+   * total message size and baking the result into the kernel symbol (see
+   * `selectAllReduceTreeKernel` / `MCCL_ALLREDUCE_LL_MAX_BYTES`), so every rank
+   * in a launch runs the same format.
+   *
    * @param group           ThreadGroup (all threads participate in memcpy,
    *                        leader does RDMA ops).
    * @param src             Source data for this block's tile.
@@ -2165,7 +2380,10 @@ class P2pIbgdaTransportDevice {
    * perBlockSlot.
    * @param timeout         Optional timeout for wait operations.
    */
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ void send(
       ThreadGroup& group,
       const void* __restrict__ src,
@@ -2173,11 +2391,28 @@ class P2pIbgdaTransportDevice {
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    sendWithTrace<CopyOp>(
+    sendWithTrace<CopyOp, Proto>(
         group, src, nbytes, max_signal_bytes, timeout, {}, 0, args...);
   }
 
-  template <typename CopyOp = Memcpy, typename... Args>
+  /**
+   * Blocking registered-source send. Returns only after local NIC completion.
+   */
+  template <typename = void>
+  __device__ __forceinline__ void send_registered(
+      ThreadGroup& group,
+      const IbgdaLocalBuffer& src,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes = 0,
+      const Timeout& timeout = Timeout()) {
+    detail::send_registered(
+        *this, group, src, nbytes, max_signal_bytes, timeout);
+  }
+
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ void sendWithTrace(
       ThreadGroup& group,
       const void* __restrict__ src,
@@ -2207,7 +2442,7 @@ class P2pIbgdaTransportDevice {
           /*step=*/0,
           static_cast<uint16_t>(group.group_id));
     }
-    detail::send<P2pIbgdaTransportDevice, CopyOp>(
+    detail::send<P2pIbgdaTransportDevice, CopyOp, Proto>(
         *this, group, src, nbytes, max_signal_bytes, timeout, args...);
     if (group.is_leader()) {
       trace_ibgda_event(
@@ -2218,6 +2453,26 @@ class P2pIbgdaTransportDevice {
           static_cast<uint16_t>(group.group_id));
     }
 #endif
+  }
+
+  template <typename CopyOp = Memcpy, typename... Args>
+  __device__ __forceinline__ void sendWithFineTrace(
+      ThreadGroup& group,
+      const void* __restrict__ src,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes,
+      const Timeout& timeout,
+      const PipesTraceAllReduceContext& traceContext,
+      Args... args) {
+    detail::send_with_fine_trace<P2pIbgdaTransportDevice, CopyOp>(
+        *this,
+        group,
+        src,
+        nbytes,
+        max_signal_bytes,
+        timeout,
+        traceContext,
+        args...);
   }
 
   /**
@@ -2247,7 +2502,10 @@ class P2pIbgdaTransportDevice {
    * perBlockSlot. Must match the sender's value.
    * @param timeout         Optional timeout for wait operations.
    */
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ void recv(
       ThreadGroup& group,
       void* __restrict__ dst,
@@ -2255,11 +2513,14 @@ class P2pIbgdaTransportDevice {
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    recvWithTrace<CopyOp>(
+    recvWithTrace<CopyOp, Proto>(
         group, dst, nbytes, max_signal_bytes, timeout, {}, 0, args...);
   }
 
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ void recvWithTrace(
       ThreadGroup& group,
       void* __restrict__ dst,
@@ -2289,7 +2550,7 @@ class P2pIbgdaTransportDevice {
           /*step=*/0,
           static_cast<uint16_t>(group.group_id));
     }
-    detail::recv<P2pIbgdaTransportDevice, CopyOp>(
+    detail::recv<P2pIbgdaTransportDevice, CopyOp, Proto>(
         *this, group, dst, nbytes, max_signal_bytes, timeout, args...);
     if (group.is_leader()) {
       trace_ibgda_event(
@@ -2300,6 +2561,26 @@ class P2pIbgdaTransportDevice {
           static_cast<uint16_t>(group.group_id));
     }
 #endif
+  }
+
+  template <typename CopyOp = Memcpy, typename... Args>
+  __device__ __forceinline__ void recvWithFineTrace(
+      ThreadGroup& group,
+      void* __restrict__ dst,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes,
+      const Timeout& timeout,
+      const PipesTraceAllReduceContext& traceContext,
+      Args... args) {
+    detail::recv_with_fine_trace<P2pIbgdaTransportDevice, CopyOp>(
+        *this,
+        group,
+        dst,
+        nbytes,
+        max_signal_bytes,
+        timeout,
+        traceContext,
+        args...);
   }
 
   /**
@@ -2403,6 +2684,30 @@ class P2pIbgdaTransportDevice {
 #endif
   }
 
+  template <typename CopyOp = Memcpy, typename... Args>
+  __device__ __forceinline__ void forwardWithFineTrace(
+      ThreadGroup& group,
+      void* __restrict__ dst,
+      P2pIbgdaTransportDevice& fwd,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes,
+      const Timeout& timeout,
+      const PipesTraceAllReduceContext& recvTraceContext,
+      const PipesTraceAllReduceContext& sendTraceContext,
+      Args... args) {
+    detail::forward_with_fine_trace<CopyOp>(
+        *this,
+        group,
+        dst,
+        fwd,
+        nbytes,
+        max_signal_bytes,
+        timeout,
+        recvTraceContext,
+        sendTraceContext,
+        args...);
+  }
+
   __device__ __forceinline__ IbLocalChannel& local_channel(uint32_t channelId) {
     validate_channel_id(channelId);
     return localChannels_[channelId];
@@ -2410,6 +2715,25 @@ class P2pIbgdaTransportDevice {
 
   __device__ __forceinline__ IbLocalChannel& local_channel(ThreadGroup& group) {
     return local_channel(group.group_id);
+  }
+
+  // Per-protocol resources on a channel. `P::kProtoSlot` is a compile-time
+  // constant, so this resolves to a fixed offset. What stays on the channel
+  // itself is the state every protocol shares: sendQp, recvQp, and
+  // recvDataReadyLaneCursor.
+  //
+  // No default on P: omitting the protocol must be a compile error, not a
+  // silent read of the default protocol's cursors.
+  template <typename P>
+  __device__ __forceinline__ IbChannelProtoSlot& local_channel_slot(
+      uint32_t channelId) {
+    return local_channel(channelId).protos[P::kProtoSlot];
+  }
+
+  template <typename P>
+  __device__ __forceinline__ IbChannelProtoSlot& local_channel_slot(
+      ThreadGroup& group) {
+    return local_channel_slot<P>(group.group_id);
   }
 
   __host__ __device__ IbChannelLayout& channel_layout() {

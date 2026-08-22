@@ -5,7 +5,9 @@
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
+#include <cstdint>
 
+#include "comms/common/fault_tolerance/AbortDevice.cuh"
 #include "comms/prims/transport/P2pIbTransportDeviceDecl.cuh"
 
 namespace comms::prims {
@@ -19,9 +21,12 @@ struct DirectReduceScatterIbLaunchParams {
   std::size_t signaling_data_size{0};
   const float* input{nullptr};
   float* output{nullptr};
+  const uint64_t* seed_ptr{nullptr};
+  bool quantized{false};
   bool in_place{false};
   int num_blocks{16};
-  float timeout_ms{0.0f};
+  bool use_tma{true};
+  comms::fault_tolerance::AbortDevice abort{};
   cudaStream_t stream{nullptr};
   P2pIbTransportDevice peers[kDirectReduceScatterIbMaxRanks]{};
 };

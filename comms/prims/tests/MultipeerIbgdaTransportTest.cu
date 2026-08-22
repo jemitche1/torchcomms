@@ -7,7 +7,15 @@
 #include <stdexcept>
 #include <string>
 
+#include "comms/common/fault_tolerance/TestAbort.h"
+#include "comms/prims/transport/P2pIbTransportProgressImpl.cuh"
+#ifndef __HIP_PLATFORM_AMD__
+#include "comms/prims/transport/ibgda/IbgdaWarpProxy.cuh"
+#endif
+
 namespace comms::prims::test {
+
+using comms::fault_tolerance::testing::testAbortDevice;
 
 // =============================================================================
 // Kernel: Put data + signal remote (adaptive-routing safe, with NIC flush)
@@ -354,9 +362,9 @@ __global__ void sendRecvKernel(
     void* buffer,
     std::size_t nbytes,
     std::size_t maxSignalBytes,
-    bool send) {
+    bool send,
+    Timeout timeout) {
   auto group = make_block_group();
-  Timeout timeout(kDefaultDeviceTimeoutCycles);
   timeout.start();
   if (send) {
     transport->send(group, buffer, nbytes, maxSignalBytes, timeout);
@@ -371,9 +379,9 @@ __global__ void twoCallSendThenRecvKernel(
     void* recvBuffer,
     std::size_t firstBytes,
     std::size_t secondBytes,
-    std::size_t maxSignalBytes) {
+    std::size_t maxSignalBytes,
+    Timeout timeout) {
   auto group = make_block_group();
-  Timeout timeout(kDefaultDeviceTimeoutCycles);
   timeout.start();
   auto* sendBytes = static_cast<const char*>(sendBuffer);
   auto* recvBytes = static_cast<char*>(recvBuffer);
@@ -395,7 +403,7 @@ void testSendRecv(
     int numBlocks,
     int blockSize) {
   sendRecvKernel<<<numBlocks, blockSize>>>(
-      transport, buffer, nbytes, maxSignalBytes, send);
+      transport, buffer, nbytes, maxSignalBytes, send, testAbortDevice());
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(
@@ -418,7 +426,8 @@ void testTwoCallSendThenRecv(
       recvBuffer,
       firstBytes,
       secondBytes,
-      maxSignalBytes);
+      maxSignalBytes,
+      testAbortDevice());
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(
@@ -427,27 +436,69 @@ void testTwoCallSendThenRecv(
 }
 
 #ifndef __HIP_PLATFORM_AMD__
+constexpr uint32_t kWarpProxyTestWorkerThreads = 512;
+using WarpProxyTest = IbgdaWarpProxy<kWarpProxyTestWorkerThreads>;
+
+__global__ void __launch_bounds__(WarpProxyTest::kBlockThreads, 1)
+    warpProxySendRecvKernel(
+        P2pIbgdaTransportDevice* transport,
+        void* buffer,
+        std::size_t nbytes,
+        std::size_t maxSignalBytes,
+        bool send,
+        uint32_t queueDepth,
+        uint64_t* queueFullCount,
+        Timeout timeout) {
+  timeout.start();
+  auto block = make_block_group();
+  __shared__ WarpProxyTest::SharedState sharedState;
+  WarpProxyTest::run(
+      sharedState,
+      block,
+      WarpProxyTest::Config{
+          .queueDepth = queueDepth,
+          .queueFullCount = queueFullCount,
+      },
+      timeout,
+      [&](auto& ops) {
+        if (send) {
+          ops.send(*transport, buffer, nbytes, maxSignalBytes);
+        } else {
+          ops.recv(*transport, buffer, nbytes, maxSignalBytes);
+        }
+      });
+}
+
 __global__ void progressSendRecvKernel(
     P2pIbgdaTransportDevice* transport,
     void* buffer,
     std::size_t nbytes,
     std::size_t maxSignalBytes,
-    bool send) {
+    bool send,
+    uint64_t* waitingCount,
+    Timeout timeout) {
   auto group = make_block_group();
-  Timeout timeout(kDefaultDeviceTimeoutCycles);
   timeout.start();
+  uint64_t waits = 0;
   if (send) {
     transport->init_send_progress(group, nbytes, maxSignalBytes);
-    while (transport->progress_send_once(
-               group, buffer, nbytes, maxSignalBytes, timeout) !=
-           IbgdaSendRecvProgressStatus::Done) {
-    }
+    IbgdaSendRecvProgressStatus status;
+    do {
+      status = transport->progress_send_once(
+          group, buffer, nbytes, maxSignalBytes, timeout);
+      waits += status == IbgdaSendRecvProgressStatus::Waiting;
+    } while (status != IbgdaSendRecvProgressStatus::Done);
   } else {
     transport->init_recv_progress(group, nbytes, maxSignalBytes);
-    while (transport->progress_recv_once(
-               group, buffer, nbytes, maxSignalBytes, timeout) !=
-           IbgdaSendRecvProgressStatus::Done) {
-    }
+    IbgdaSendRecvProgressStatus status;
+    do {
+      status = transport->progress_recv_once(
+          group, buffer, nbytes, maxSignalBytes, timeout);
+      waits += status == IbgdaSendRecvProgressStatus::Waiting;
+    } while (status != IbgdaSendRecvProgressStatus::Done);
+  }
+  if (waitingCount != nullptr && group.is_leader()) {
+    waitingCount[group.group_id] = waits;
   }
 }
 
@@ -461,13 +512,232 @@ __global__ void progressReservationKernel(
   transport->init_recv_progress(group, recvBytes);
 
   if (group.is_leader()) {
-    const auto& channel = transport->local_channel(group.group_id);
-    output[0] = channel.sendProgress.nextStep;
-    output[1] = channel.recvProgress.nextStep;
+    const auto& protoSlot =
+        transport->local_channel_slot<protocol::Simple>(group.group_id);
+    output[0] = protoSlot.sendProgress.nextStep;
+    output[1] = protoSlot.recvProgress.nextStep;
+  }
+}
+
+template <typename Transport>
+__device__ IbgdaRegisteredSendProgressStatus postRegisteredSend(
+    Transport& transport,
+    ThreadGroup& group,
+    const IbgdaLocalBuffer& source,
+    std::size_t nbytes,
+    std::size_t maxSignalBytes,
+    const Timeout& timeout,
+    RegisteredSendObservation* observation) {
+  transport.init_registered_send_progress(group, nbytes, maxSignalBytes);
+  IbgdaRegisteredSendProgressStatus status;
+  do {
+    status = transport.progress_registered_send_once(
+        group, source, nbytes, maxSignalBytes, timeout);
+    if (group.is_leader() && observation != nullptr) {
+      observation->record(status);
+    }
+  } while (status != IbgdaRegisteredSendProgressStatus::Posted &&
+           status != IbgdaRegisteredSendProgressStatus::Drained);
+  return status;
+}
+
+template <typename Transport>
+__device__ void drainRegisteredSends(
+    Transport& transport,
+    ThreadGroup& group,
+    const Timeout& timeout,
+    RegisteredSendObservation* observation) {
+  IbgdaRegisteredSendProgressStatus status;
+  do {
+    status = transport.progress_registered_send_drain_once(group, timeout);
+    if (group.is_leader() && observation != nullptr) {
+      observation->record(status);
+    }
+  } while (status != IbgdaRegisteredSendProgressStatus::Drained);
+}
+
+__global__ void registeredSendRecvKernel(
+    P2pIbTransportDevice transport,
+    IbgdaLocalBuffer source,
+    void* recvBuffer,
+    std::size_t nbytes,
+    std::size_t maxSignalBytes,
+    bool send,
+    RegisteredSendObservation* observation,
+    bool blocking,
+    bool overwriteAfterDrain,
+    uint8_t overwriteValue,
+    bool zeroByteAfterPosted,
+    Timeout timeout) {
+  auto group = make_block_group();
+  timeout.start();
+  if (send) {
+    if (blocking) {
+      transport.send_registered(group, source, nbytes, maxSignalBytes, timeout);
+      if (group.is_leader() && observation != nullptr) {
+        ++observation->drainedCount;
+      }
+    } else {
+      const auto status = postRegisteredSend(
+          transport,
+          group,
+          source,
+          nbytes,
+          maxSignalBytes,
+          timeout,
+          observation);
+      if (zeroByteAfterPosted) {
+        transport.init_registered_send_progress(group, 0, maxSignalBytes);
+        const auto zeroByteStatus = transport.progress_registered_send_once(
+            group, IbgdaLocalBuffer{}, 0, maxSignalBytes, timeout);
+        if (group.is_leader() && observation != nullptr) {
+          observation->record(zeroByteStatus);
+        }
+      }
+      if (status != IbgdaRegisteredSendProgressStatus::Drained) {
+        drainRegisteredSends(transport, group, timeout, observation);
+      }
+    }
+    if (overwriteAfterDrain) {
+      auto* bytes = static_cast<uint8_t*>(source.ptr);
+      for (std::size_t i = group.thread_id_in_group; i < nbytes;
+           i += group.group_size) {
+        bytes[i] = overwriteValue;
+      }
+      group.sync();
+    }
+  } else {
+    transport.recv(group, recvBuffer, nbytes, maxSignalBytes, timeout);
+  }
+}
+
+__global__ void mixedRegisteredAndStagedSendRecvKernel(
+    P2pIbgdaTransportDevice* transport,
+    IbgdaLocalBuffer sendBuffer,
+    void* recvBuffer,
+    std::size_t firstBytes,
+    std::size_t secondBytes,
+    std::size_t thirdBytes,
+    std::size_t maxSignalBytes,
+    bool send,
+    Timeout timeout) {
+  auto group = make_block_group();
+  timeout.start();
+  if (send) {
+    (void)postRegisteredSend(
+        *transport,
+        group,
+        sendBuffer,
+        firstBytes,
+        maxSignalBytes,
+        timeout,
+        nullptr);
+    transport->send(
+        group,
+        static_cast<const char*>(sendBuffer.ptr) + firstBytes,
+        secondBytes,
+        maxSignalBytes,
+        timeout);
+    (void)postRegisteredSend(
+        *transport,
+        group,
+        sendBuffer.subBuffer(firstBytes + secondBytes),
+        thirdBytes,
+        maxSignalBytes,
+        timeout,
+        nullptr);
+    drainRegisteredSends(*transport, group, timeout, nullptr);
+    return;
+  }
+
+  auto* output = static_cast<char*>(recvBuffer);
+  transport->recv(group, output, firstBytes, maxSignalBytes, timeout);
+  transport->recv(
+      group, output + firstBytes, secondBytes, maxSignalBytes, timeout);
+  transport->recv(
+      group,
+      output + firstBytes + secondBytes,
+      thirdBytes,
+      maxSignalBytes,
+      timeout);
+}
+
+__global__ void fillTransportStagingKernel(
+    P2pIbgdaTransportDevice* transport,
+    bool sendStaging,
+    std::size_t offset,
+    std::size_t nbytes,
+    uint8_t value) {
+  auto group = make_block_group();
+  auto& layout = transport->channel_layout();
+  char* staging = sendStaging ? layout.sendStagingPtr : layout.recvStagingPtr;
+  staging +=
+      static_cast<std::size_t>(group.group_id) * layout.perChannelBufferSize +
+      offset;
+  for (std::size_t i = group.thread_id_in_group; i < nbytes;
+       i += group.group_size) {
+    staging[i] = static_cast<char>(value);
+  }
+}
+
+__global__ void verifyTransportStagingKernel(
+    P2pIbgdaTransportDevice* transport,
+    bool sendStaging,
+    std::size_t offset,
+    std::size_t nbytes,
+    uint8_t expected,
+    int* errorCount) {
+  auto group = make_block_group();
+  const auto& layout = transport->channel_layout();
+  const char* staging =
+      sendStaging ? layout.sendStagingPtr : layout.recvStagingPtr;
+  staging +=
+      static_cast<std::size_t>(group.group_id) * layout.perChannelBufferSize +
+      offset;
+  for (std::size_t i = group.thread_id_in_group; i < nbytes;
+       i += group.group_size) {
+    if (static_cast<uint8_t>(staging[i]) != expected) {
+      atomicAdd(errorCount, 1);
+    }
   }
 }
 
 #endif
+
+void testWarpProxySendRecv(
+    P2pIbgdaTransportDevice* transport,
+    void* buffer,
+    std::size_t nbytes,
+    std::size_t maxSignalBytes,
+    bool send,
+    uint32_t queueDepth,
+    uint64_t* queueFullCount) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)buffer;
+  (void)nbytes;
+  (void)maxSignalBytes;
+  (void)send;
+  (void)queueDepth;
+  (void)queueFullCount;
+  throw std::runtime_error("warp proxy is NVIDIA-only");
+#else
+  warpProxySendRecvKernel<<<1, WarpProxyTest::kBlockThreads>>>(
+      transport,
+      buffer,
+      nbytes,
+      maxSignalBytes,
+      send,
+      queueDepth,
+      queueFullCount,
+      testAbortDevice());
+  const cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("Kernel launch failed: ") + cudaGetErrorString(err));
+  }
+#endif
+}
 
 void testProgressSendRecv(
     P2pIbgdaTransportDevice* transport,
@@ -476,7 +746,8 @@ void testProgressSendRecv(
     std::size_t maxSignalBytes,
     bool send,
     int numBlocks,
-    int blockSize) {
+    int blockSize,
+    uint64_t* waitingCount) {
 #ifdef __HIP_PLATFORM_AMD__
   (void)transport;
   (void)buffer;
@@ -485,10 +756,17 @@ void testProgressSendRecv(
   (void)send;
   (void)numBlocks;
   (void)blockSize;
+  (void)waitingCount;
   throw std::runtime_error("progress send/recv is NVIDIA-only");
 #else
   progressSendRecvKernel<<<numBlocks, blockSize>>>(
-      transport, buffer, nbytes, maxSignalBytes, send);
+      transport,
+      buffer,
+      nbytes,
+      maxSignalBytes,
+      send,
+      waitingCount,
+      testAbortDevice());
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(
@@ -518,6 +796,158 @@ void testProgressReservations(
   progressReservationKernel<<<numBlocks, blockSize>>>(
       transport, output, sendBytes, recvBytes);
   cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("Kernel launch failed: ") + cudaGetErrorString(err));
+  }
+#endif
+}
+
+void testRegisteredSendRecv(
+    P2pIbgdaTransportDevice* transport,
+    const IbgdaLocalBuffer& source,
+    void* recvBuffer,
+    std::size_t nbytes,
+    std::size_t maxSignalBytes,
+    bool send,
+    int numBlocks,
+    int blockSize,
+    RegisteredSendObservation* observation,
+    bool blocking,
+    bool overwriteAfterDrain,
+    uint8_t overwriteValue,
+    bool zeroByteAfterPosted) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)source;
+  (void)recvBuffer;
+  (void)nbytes;
+  (void)maxSignalBytes;
+  (void)send;
+  (void)numBlocks;
+  (void)blockSize;
+  (void)observation;
+  (void)blocking;
+  (void)overwriteAfterDrain;
+  (void)overwriteValue;
+  (void)zeroByteAfterPosted;
+  throw std::runtime_error("registered-source send is NVIDIA-only");
+#else
+  P2pIbTransportDevice unifiedTransport(transport);
+  registeredSendRecvKernel<<<numBlocks, blockSize>>>(
+      unifiedTransport,
+      source,
+      recvBuffer,
+      nbytes,
+      maxSignalBytes,
+      send,
+      observation,
+      blocking,
+      overwriteAfterDrain,
+      overwriteValue,
+      zeroByteAfterPosted,
+      testAbortDevice());
+  const cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("Kernel launch failed: ") + cudaGetErrorString(err));
+  }
+#endif
+}
+
+void testMixedRegisteredAndStagedSendRecv(
+    P2pIbgdaTransportDevice* transport,
+    const IbgdaLocalBuffer& sendBuffer,
+    void* recvBuffer,
+    std::size_t firstBytes,
+    std::size_t secondBytes,
+    std::size_t thirdBytes,
+    std::size_t maxSignalBytes,
+    bool send,
+    int numBlocks,
+    int blockSize) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)sendBuffer;
+  (void)recvBuffer;
+  (void)firstBytes;
+  (void)secondBytes;
+  (void)thirdBytes;
+  (void)maxSignalBytes;
+  (void)send;
+  (void)numBlocks;
+  (void)blockSize;
+  throw std::runtime_error("registered-source send is NVIDIA-only");
+#else
+  mixedRegisteredAndStagedSendRecvKernel<<<numBlocks, blockSize>>>(
+      transport,
+      sendBuffer,
+      recvBuffer,
+      firstBytes,
+      secondBytes,
+      thirdBytes,
+      maxSignalBytes,
+      send,
+      testAbortDevice());
+  const cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("Kernel launch failed: ") + cudaGetErrorString(err));
+  }
+#endif
+}
+
+void testFillTransportStaging(
+    P2pIbgdaTransportDevice* transport,
+    bool sendStaging,
+    std::size_t offset,
+    std::size_t nbytes,
+    uint8_t value,
+    int numBlocks,
+    int blockSize) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)sendStaging;
+  (void)offset;
+  (void)nbytes;
+  (void)value;
+  (void)numBlocks;
+  (void)blockSize;
+  throw std::runtime_error("registered-source send is NVIDIA-only");
+#else
+  fillTransportStagingKernel<<<numBlocks, blockSize>>>(
+      transport, sendStaging, offset, nbytes, value);
+  const cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("Kernel launch failed: ") + cudaGetErrorString(err));
+  }
+#endif
+}
+
+void testVerifyTransportStaging(
+    P2pIbgdaTransportDevice* transport,
+    bool sendStaging,
+    std::size_t offset,
+    std::size_t nbytes,
+    uint8_t expected,
+    int* errorCount,
+    int numBlocks,
+    int blockSize) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)transport;
+  (void)sendStaging;
+  (void)offset;
+  (void)nbytes;
+  (void)expected;
+  (void)errorCount;
+  (void)numBlocks;
+  (void)blockSize;
+  throw std::runtime_error("registered-source send is NVIDIA-only");
+#else
+  verifyTransportStagingKernel<<<numBlocks, blockSize>>>(
+      transport, sendStaging, offset, nbytes, expected, errorCount);
+  const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(
         std::string("Kernel launch failed: ") + cudaGetErrorString(err));

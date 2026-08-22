@@ -3,6 +3,7 @@
 #pragma once
 
 #include <iostream>
+#include <memory>
 #include <vector>
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/algos/AllGatherP/Types.h"
@@ -10,8 +11,10 @@
 #include "comms/ctran/algos/common/NvlUtils.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/regcache/RegCache.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/CudaGraphUtils.h"
 #include "comms/ctran/utils/ExtUtils.h"
+#include "comms/utils/logger/ScubaLogger.h"
 
 namespace ctran::allgatherp {
 inline void* getPtr(void* base, size_t offset) {
@@ -21,6 +24,24 @@ inline void* getPtr(void* base, size_t offset) {
 using ctran::algos::copyToSelf;
 using ctran::algos::nvlBarrier;
 using ctran::algos::nvlCeBcast;
+
+// Clear the previous op's completion before this one posts any step, so
+// waitPipeEnd cannot latch a stale done. Must run before the first post().
+inline void resetPipeEnd(const Resource& resource, CtranComm* comm) {
+  if (resource.pipeSync != nullptr && comm->statex_->nLocalRanks() > 1) {
+    resource.pipeSync->resetStatus();
+  }
+}
+
+// Block until the end kernel signals completion. The NVL bcast + end barrier
+// run on the stream after the inter-node exchange, so ALGO_DATA needs this.
+inline void waitPipeEnd(const Resource& resource, CtranComm* comm) {
+  if (resource.pipeSync == nullptr || comm->statex_->nLocalRanks() <= 1) {
+    return;
+  }
+  while (!resource.pipeSync->isComplete(kPipeEndDone) && !comm->testAbort()) {
+  }
+}
 
 // Exchange intra-node NVL IPC handles into pArgs and mark initialized. Owns
 // the remote-buffer resize, the intraAllGatherCtrl + intraBarrier, per-peer
@@ -50,7 +71,7 @@ inline commResult_t exchangeIpcReg(CtranComm* comm, PersistArgs& pArgs) {
   FB_COMMCHECK(mapper->intraBarrier());
   const double barrierUs = barrierTimer.durationUs();
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-AGP: Rank {} IPC exchange breakdown: intraAllGatherCtrl {} us, intraBarrier {} us, nLocalRanks {}",
@@ -59,11 +80,26 @@ inline commResult_t exchangeIpcReg(CtranComm* comm, PersistArgs& pArgs) {
       barrierUs,
       statex->nLocalRanks());
 
+  NcclScubaEvent(
+      std::make_unique<CommEvent>(
+          &comm->logMetaData_,
+          "AgpCreate/IpcExchange/IntraAllGatherCtrl",
+          std::string(),
+          ctrlUs / 1000.0))
+      .record();
+  NcclScubaEvent(
+      std::make_unique<CommEvent>(
+          &comm->logMetaData_,
+          "AgpCreate/IpcExchange/IntraBarrier",
+          std::string(),
+          barrierUs / 1000.0))
+      .record();
+
   const int myRank = statex->rank();
   const int nLocalRanks = statex->nLocalRanks();
   for (int i = 0; i < nLocalRanks; ++i) {
     const int peerRank = statex->localRankToRank(i);
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "CTRAN-AGP     Peer {}: addr {} ipcImport {}",
@@ -73,6 +109,9 @@ inline commResult_t exchangeIpcReg(CtranComm* comm, PersistArgs& pArgs) {
                            : pArgs.remoteIpcRegHdls_.at(i).toString());
   }
 
+  // NVL CE-multicast is set up on the window/ctwin registration path
+  // (CtranWin::exchange); the eager/graph AGP path here stays unicast, so
+  // pArgs.mcWrite is left std::nullopt.
   pArgs.initState = InitState::kInitialized;
   return commSuccess;
 }

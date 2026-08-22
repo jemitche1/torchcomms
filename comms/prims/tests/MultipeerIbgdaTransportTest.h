@@ -122,6 +122,31 @@ void testPutOnly(
  */
 bool supportsProgressSendRecv();
 
+struct RegisteredSendObservation {
+  uint64_t waitingCount{0};
+  uint64_t progressedCount{0};
+  uint64_t postedCount{0};
+  uint64_t drainedCount{0};
+
+  template <typename Status>
+  IBGDA_HOST_DEVICE void record(Status status) {
+    switch (status) {
+      case Status::Waiting:
+        ++waitingCount;
+        break;
+      case Status::Progressed:
+        ++progressedCount;
+        break;
+      case Status::Posted:
+        ++postedCount;
+        break;
+      case Status::Drained:
+        ++drainedCount;
+        break;
+    }
+  }
+};
+
 /**
  * Test kernel: snapshot send/recv pipeline geometry through the unified IB
  * transport wrapper. Output: pipelineDepth, pipelineWindow, pipelineChunk.
@@ -145,6 +170,24 @@ void testSendRecv(
     int blockSize);
 
 /**
+ * Test kernel: Blocking pipelined send or recv driving the variable-size
+ * `AnsCompress` CopyOp — the compressed transport path added in D111967119.
+ * `maxSignalBytes == 0` exercises the transport's 0-sentinel (which derives a
+ * trap-safe chunk size via CopyOp::max_safe_chunk_size_for_slot()); a non-zero
+ * value (e.g. 256 KiB) exercises the explicit signaled-chunk-size path.
+ * `blockSize` must be 128, 256, or 512 (NumWarps 4/8/16). Defined in the
+ * separately device-linked MultipeerIbgdaTransportAnsTest.cu.
+ */
+void testSendRecvAns(
+    P2pIbgdaTransportDevice* transport,
+    void* buffer,
+    std::size_t nbytes,
+    std::size_t maxSignalBytes,
+    bool send,
+    int numBlocks,
+    int blockSize);
+
+/**
  * Test kernel: two sequential bidirectional blocking send/recv calls.
  */
 void testTwoCallSendThenRecv(
@@ -158,6 +201,21 @@ void testTwoCallSendThenRecv(
     int blockSize);
 
 /**
+ * Test kernel: Warp-proxy send or recv with queue-full observation.
+ */
+// The device budget comes from `testAbortDevice()` inside the launcher, as with
+// the other kernels here; there is no caller-supplied cycle count since the
+// standalone Prims `Timeout` was replaced by the communicator abort handle.
+void testWarpProxySendRecv(
+    P2pIbgdaTransportDevice* transport,
+    void* buffer,
+    std::size_t nbytes,
+    std::size_t maxSignalBytes,
+    bool send,
+    uint32_t queueDepth,
+    uint64_t* queueFullCount);
+
+/**
  * Test kernel: Resumable pipelined send or recv progress loop.
  */
 void testProgressSendRecv(
@@ -167,7 +225,8 @@ void testProgressSendRecv(
     std::size_t maxSignalBytes,
     bool send,
     int numBlocks,
-    int blockSize);
+    int blockSize,
+    uint64_t* waitingCount = nullptr);
 
 /**
  * Test kernel: initialize transport-owned send/recv progress state and report
@@ -178,6 +237,59 @@ void testProgressReservations(
     int64_t* output,
     std::size_t sendBytes,
     std::size_t recvBytes,
+    int numBlocks,
+    int blockSize);
+
+/**
+ * Test kernel: registered-source send progress or the matching staged recv.
+ */
+void testRegisteredSendRecv(
+    P2pIbgdaTransportDevice* transport,
+    const IbgdaLocalBuffer& source,
+    void* recvBuffer,
+    std::size_t nbytes,
+    std::size_t maxSignalBytes,
+    bool send,
+    int numBlocks,
+    int blockSize,
+    RegisteredSendObservation* observation = nullptr,
+    bool blocking = false,
+    bool overwriteAfterDrain = false,
+    uint8_t overwriteValue = 0,
+    bool zeroByteAfterPosted = false);
+
+/**
+ * Test kernel: registered A, staged B, registered C on one send cursor.
+ */
+void testMixedRegisteredAndStagedSendRecv(
+    P2pIbgdaTransportDevice* transport,
+    const IbgdaLocalBuffer& sendBuffer,
+    void* recvBuffer,
+    std::size_t firstBytes,
+    std::size_t secondBytes,
+    std::size_t thirdBytes,
+    std::size_t maxSignalBytes,
+    bool send,
+    int numBlocks,
+    int blockSize);
+
+/** Fill or verify a byte range in this channel's transport staging. */
+void testFillTransportStaging(
+    P2pIbgdaTransportDevice* transport,
+    bool sendStaging,
+    std::size_t offset,
+    std::size_t nbytes,
+    uint8_t value,
+    int numBlocks,
+    int blockSize);
+
+void testVerifyTransportStaging(
+    P2pIbgdaTransportDevice* transport,
+    bool sendStaging,
+    std::size_t offset,
+    std::size_t nbytes,
+    uint8_t expected,
+    int* errorCount,
     int numBlocks,
     int blockSize);
 

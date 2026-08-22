@@ -20,10 +20,10 @@ const auto myAlgo = NCCL_ALLGATHER_P_ALGO::ctpipeline;
 
 // Get the index of the chunk in recvBuff to receive from the internode Ring
 // neighbor in the rail. E.g., for nRanks = 8, nLocalRanks = 2, rank = 2, it
-// would receive chunkIdx 0, 6, 4 of the recvBuff in a 3-step Ring.
+// would receive chunkIdx 2, 0, 6 of the recvBuff in a 3-step Ring.
 inline size_t
 getRecvChunkIdxInRail(int rank, int step, int nLocalRanks, int nRanks) {
-  return (rank - step * nLocalRanks + nRanks) & (nRanks - 1);
+  return (rank - step * nLocalRanks + nRanks) % nRanks;
 }
 
 commResult_t gpeFn(const std::vector<std::unique_ptr<struct OpElem>>& opGroup) {
@@ -77,6 +77,8 @@ commResult_t gpeFn(const std::vector<std::unique_ptr<struct OpElem>>& opGroup) {
   });
 
   CtranMapperRequest syncSreq, syncRreq;
+
+  resetPipeEnd(*resource, comm);
 
   CTRAN_PROFILER_IF(
       profiler, profiler->startEvent(ctran::ProfilerEvent::ALGO_CTRL));
@@ -148,6 +150,7 @@ commResult_t gpeFn(const std::vector<std::unique_ptr<struct OpElem>>& opGroup) {
   for (auto& putReq : putReqs) {
     FB_COMMCHECK(mapper->waitRequest(&putReq));
   }
+  waitPipeEnd(*resource, comm);
   CTRAN_PROFILER_IF(
       profiler, profiler->endEvent(ctran::ProfilerEvent::ALGO_DATA));
 
@@ -172,7 +175,7 @@ extern __global__ void ncclKernelAllGatherPPipeEnd(
     ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState,
     PipeEndKernArgs args);
-extern __global__ void ncclKernelAllGatherPPipe(
+extern __global__ void ncclKernelAllGatherPRing(
     ctran::gpe::KernelFlagDev* flag,
     CtranAlgoDeviceState* devState);
 
@@ -244,8 +247,7 @@ commResult_t AlgoImpl::execPipeline(
   config.numThreads = 1;
   config.args.devState_d = ctran->algo->getDevState();
 
-  // TODO: ensure colltrace can capture the group of operations as single
-  // allgather
+  bool colltraceGroupOpen = false;
 
   if (nNodes > 1) {
     // Submit inter-node Ring pipeline for GPE thread to execute. Skip if single
@@ -263,37 +265,56 @@ commResult_t AlgoImpl::execPipeline(
 
     if (nLocalRanks > 1) {
       // - For nLocalRanks > 1 case, use ncclKernelAllGatherPPipeStart to hold
-      //   GPE thread till allgather starts. ncclKernelAllGatherPStart returns
-      //   immediately after started GPE, thus the inter-node pipeline can be
-      //   overlapped with the following intra-node copies.
+      //   GPE thread till allgather starts. ncclKernelAllGatherPPipeStart
+      //   returns immediately after started GPE, thus the inter-node pipeline
+      //   can be overlapped with the following intra-node copies.
+      // Multi-kernel begin: emit the start boundary and open the group; the
+      // PipeEnd kernel below reuses this record and emits the end.
+      config.colltraceEmitStart = true;
+      config.colltraceEmitEnd = false;
+      colltraceGroupOpen = true;
       FB_COMMCHECK(ctran->gpe->submit(
           std::move(opGroup),
           gpeFn,
           config,
           reinterpret_cast<void*>(ncclKernelAllGatherPPipeStart)));
     } else {
-      // - For nLocalRanks == 1 case, ncclKernelAllGatherPPipe holds the stream
+      // - For nLocalRanks == 1 case, ncclKernelAllGatherPRing holds the stream
       //   till GPE thread finishes entire transfer.
+      // Single-kernel collective: emit both boundaries explicitly rather than
+      // relying on the reused `config`'s KernelConfig defaults.
+      config.colltraceEmitStart = true;
+      config.colltraceEmitEnd = true;
       FB_COMMCHECK(ctran->gpe->submit(
           std::move(opGroup),
           gpeFn,
           config,
-          reinterpret_cast<void*>(ncclKernelAllGatherPPipe)));
+          reinterpret_cast<void*>(ncclKernelAllGatherPRing)));
     }
   }
 
-  // Copy data to self for out-of-place allgather
-  FB_COMMCHECK(copyToSelf(
-      comm_,
-      sendbuff,
-      getPtr(pArgs.recvbuff, comm_->statex_->rank() * sendSize),
-      sendSize,
-      stream_));
+  // Copy data to self for out-of-place allgather. Skipped when multicast is
+  // engaged: the step-0 CE-multicast broadcast fans out to self too, so
+  // recvbuff[myRank] is already written (the GPE inter-node ring sources its
+  // step-0 chunk from sendbuff, not recvbuff, so there is no early reader).
+  if (!pArgs.mcWrite) {
+    FB_COMMCHECK(copyToSelf(
+        comm_,
+        sendbuff,
+        getPtr(pArgs.recvbuff, comm_->statex_->rank() * sendSize),
+        sendSize,
+        stream_));
+  }
 
   // Submit intra-node copies in the pipeline
   if (nLocalRanks > 1) {
     // - Step 0: Broadcast local chunk to intra-node peers
     // Copy data to other local ranks
+    //
+    // The own-chunk barrier (cross-iteration WAR guard) is folded into
+    // ncclKernelAllGatherPPipeStart, saving a separate ncclKernelNvlBarrier
+    // launch. PipeStart is only submitted when nNodes > 1, so the single-node
+    // case must still emit the standalone barrier here.
     FB_COMMCHECK(nvlCeBcast(
         comm_,
         sendbuff,
@@ -301,9 +322,11 @@ commResult_t AlgoImpl::execPipeline(
         myRank * sendSize,
         pArgs.remoteRecvBuffs,
         pArgs.remoteAccessKeys,
-        stream_));
+        stream_,
+        /*barrier=*/nNodes == 1,
+        pArgs.mcWrite));
 
-    const int upPeer = (nRanks + myRank - nLocalRanks) & (nRanks - 1);
+    const int upPeer = (nRanks + myRank - nLocalRanks) % nRanks;
 
     // -  Remaining steps: broadcast received chunk from internode upPeer
     for (int step = 0; step < nNodes - 1; step++) {
@@ -314,6 +337,11 @@ commResult_t AlgoImpl::execPipeline(
           .pipeSync = resource_.pipeSync,
       };
       config.algoArgs = reinterpret_cast<void*>(&kernArgs);
+      // Interior kernel: emits neither boundary and reuses the begin kernel's
+      // record. Overwrite the values leaked from the reused `config` (set on
+      // the PipeStart submit above).
+      config.colltraceEmitStart = false;
+      config.colltraceEmitEnd = false;
       FB_COMMCHECK(ctran->gpe->submit(
           {},
           nullptr,
@@ -325,6 +353,15 @@ commResult_t AlgoImpl::execPipeline(
       const auto offset =
           getRecvChunkIdxInRail(upPeer, step, nLocalRanks, nRanks) * sendSize;
       const auto sendPtr = getPtr(pArgs.recvbuff, offset);
+      // The per-step barrier only paces the N-1 unicast writes' incast, so it
+      // is always kept on that path. The multicast write is a single
+      // switch-fanned store with no incast to pace, so
+      // NCCL_CTRAN_AGP_SKIP_MC_INTRA_BARRIER can drop it there as a perf A/B.
+      // Correctness holds either way via the step-0 barrier (cross-iteration
+      // WAR) + PipeEnd (completion), with disjoint per-rank rail columns in
+      // between.
+      const bool skipBarrier =
+          pArgs.mcWrite && NCCL_CTRAN_AGP_SKIP_MC_INTRA_BARRIER;
       FB_COMMCHECK(nvlCeBcast(
           comm_,
           sendPtr,
@@ -332,7 +369,9 @@ commResult_t AlgoImpl::execPipeline(
           offset,
           pArgs.remoteRecvBuffs,
           pArgs.remoteAccessKeys,
-          stream_));
+          stream_,
+          /*barrier=*/!skipBarrier,
+          pArgs.mcWrite));
     }
 
     PipeEndKernArgs kernArgs = {
@@ -340,6 +379,15 @@ commResult_t AlgoImpl::execPipeline(
         .pipeSync = resource_.pipeSync,
     };
     config.algoArgs = reinterpret_cast<void*>(&kernArgs);
+    if (colltraceGroupOpen) {
+      // Close the record opened by PipeStart.
+      config.colltraceEmitStart = false;
+      config.colltraceEmitEnd = true;
+    } else {
+      // With no PipeStart, PipeEnd bounds the whole collective.
+      config.colltraceEmitStart = true;
+      config.colltraceEmitEnd = true;
+    }
     FB_COMMCHECK(ctran->gpe->submit(
         {},
         nullptr,

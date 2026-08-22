@@ -5,6 +5,7 @@
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/algos/AllGather/AllGatherImpl.h"
 #include "comms/ctran/mapper/CtranMapper.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/CudaGraphUtils.h"
 #include "comms/ctran/utils/MathUtils.h"
 #include "comms/utils/cvars/nccl_cvars.h"
@@ -23,6 +24,11 @@ static bool isGraphAwareAlgo(enum NCCL_ALLGATHER_ALGO algo) {
     case NCCL_ALLGATHER_ALGO::ctbrucks:
     case NCCL_ALLGATHER_ALGO::cthierarchical_ring:
     case NCCL_ALLGATHER_ALGO::ctran:
+    case NCCL_ALLGATHER_ALGO::ctwin:
+    case NCCL_ALLGATHER_ALGO::ctwin_ring:
+    case NCCL_ALLGATHER_ALGO::ctwin_srd:
+    case NCCL_ALLGATHER_ALGO::ctwin_pipeline:
+    case NCCL_ALLGATHER_ALGO::ctwin_rdpipeline:
     case NCCL_ALLGATHER_ALGO::orig:
       return false;
   }
@@ -35,7 +41,9 @@ static bool isGraphAwareAlgo(enum NCCL_ALLGATHER_ALGO algo) {
 bool ctranAllGatherSupport(
     CtranComm* comm,
     enum NCCL_ALLGATHER_ALGO algo,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const void* recvbuff,
+    size_t recvBytes) {
   if (!ctranInitialized(comm) || !comm->ctran_->mapper->hasBackend()) {
     return false;
   }
@@ -48,7 +56,7 @@ bool ctranAllGatherSupport(
     case NCCL_ALLGATHER_ALGO::ctsrd:
       supported = statex->nLocalRanks() == 1;
       if (!supported) {
-        CLOGF_SUBSYS(
+        CTRAN_LOG_SUBSYS(
             WARN,
             COLL,
             "AllGather algorithm {} only support nLocalRanks=1. Falling back to baseline",
@@ -82,7 +90,7 @@ bool ctranAllGatherSupport(
       supported = (err == cudaSuccess) &&
           (captureInfo.status == cudaStreamCaptureStatusActive);
       if (!supported) {
-        CLOGF_SUBSYS(
+        CTRAN_LOG_SUBSYS(
             INFO,
             COLL,
             "AllGather {}: not in capture mode. "
@@ -101,7 +109,7 @@ bool ctranAllGatherSupport(
       if ((algo == NCCL_ALLGATHER_ALGO::ctgraph_ring ||
            algo == NCCL_ALLGATHER_ALGO::ctgraph_rd) &&
           statex->nLocalRanks() > 1) {
-        CLOGF_SUBSYS(
+        CTRAN_LOG_SUBSYS(
             WARN,
             COLL,
             "AllGather {} requires nLocalRanks==1, got {}. "
@@ -113,7 +121,7 @@ bool ctranAllGatherSupport(
       }
       if (algo == NCCL_ALLGATHER_ALGO::ctgraph_rdpipeline &&
           !ctran::utils::isPowerOfTwo(statex->nNodes())) {
-        CLOGF_SUBSYS(
+        CTRAN_LOG_SUBSYS(
             WARN,
             COLL,
             "AllGather {} requires power-of-2 nNodes, got {}. "
@@ -125,7 +133,7 @@ bool ctranAllGatherSupport(
       }
       if (algo == NCCL_ALLGATHER_ALGO::ctgraph_rd &&
           !ctran::utils::isPowerOfTwo(statex->nRanks())) {
-        CLOGF_SUBSYS(
+        CTRAN_LOG_SUBSYS(
             WARN,
             COLL,
             "AllGather {} requires power-of-2 nRanks, got {}. "
@@ -137,6 +145,16 @@ bool ctranAllGatherSupport(
       }
       break;
     }
+    case NCCL_ALLGATHER_ALGO::ctwin:
+    case NCCL_ALLGATHER_ALGO::ctwin_ring:
+    case NCCL_ALLGATHER_ALGO::ctwin_srd:
+    case NCCL_ALLGATHER_ALGO::ctwin_pipeline:
+    case NCCL_ALLGATHER_ALGO::ctwin_rdpipeline:
+      // recvbuff must sit in a symmetric AllGatherP window; forced variants add
+      // topology constraints. Dormant (false) until a caller passes recvbuff.
+      supported =
+          checkCtranAllGatherCtwinSupport(comm, recvbuff, recvBytes, algo);
+      break;
     case NCCL_ALLGATHER_ALGO::orig: // invalid query
       supported = false;
       break;
@@ -177,13 +195,13 @@ commResult_t ctranAllGather(
   if (algo == NCCL_ALLGATHER_ALGO::ctran) {
     if (statex->nLocalRanks() > 1) {
       algo = NCCL_ALLGATHER_ALGO::ctdirect;
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO, COLL, "Running AllGather ctdirect algorithm for nLocalRanks>1");
     }
     // pick ctring for nLocalRanks=1 if user doesn't provide specific algo
     else if (statex->nLocalRanks() == 1) {
       algo = NCCL_ALLGATHER_ALGO::ctring;
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO, COLL, "Running AllGather ctring algorithm for nLocalRanks=1");
     }
   }
@@ -199,6 +217,14 @@ commResult_t ctranAllGather(
     case NCCL_ALLGATHER_ALGO::ctsrd:
       return ctranAllGatherStreamedRd(
           sendbuff, recvbuff, sendcount, datatype, comm, stream);
+
+    case NCCL_ALLGATHER_ALGO::ctwin:
+    case NCCL_ALLGATHER_ALGO::ctwin_ring:
+    case NCCL_ALLGATHER_ALGO::ctwin_srd:
+    case NCCL_ALLGATHER_ALGO::ctwin_pipeline:
+    case NCCL_ALLGATHER_ALGO::ctwin_rdpipeline:
+      return ctranAllGatherCtwin(
+          sendbuff, recvbuff, sendcount, datatype, comm, stream, algo);
 
     case NCCL_ALLGATHER_ALGO::ctdirect:
     default:

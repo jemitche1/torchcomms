@@ -23,13 +23,9 @@
 #include <cstdio>
 #include <vector>
 #include <sstream>
-#include <folly/logging/LogLevel.h>
-#include <folly/logging/LogStreamProcessor.h>
-#include <folly/logging/xlog.h>
 
-#include "comms/utils/logger/LogUtils.h"
 #include "comms/utils/logger/LoggingFormat.h"
-#include "comms/ctran/utils/ErrorStackTraceUtil.h"
+#include "meta/logger/NcclDebugLog.h"
 
 #define NCCL_DEBUG_RESET_TRIGGERED (-2)
 
@@ -373,17 +369,6 @@ void ncclDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *file
   }
 
   std::stringstream logStream;
-  auto logLevel = folly::LogLevel::INFO;
-  if (level == NCCL_LOG_WARN) {
-    logLevel = folly::LogLevel::WARN;
-  } else if (level == NCCL_LOG_INFO || level == NCCL_LOG_VERSION) {
-    logLevel = folly::LogLevel::INFO;
-  } else if (level == NCCL_LOG_TRACE) {
-    logLevel = folly::LogLevel::DBG;
-  } else if (level == NCCL_LOG_ERROR) {
-    logLevel = folly::LogLevel::ERR;
-  }
-
   size_t logLen = 0;
   va_list vargs;
   va_start(vargs, fmt);
@@ -398,16 +383,7 @@ void ncclDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *file
   logStream << buffer.data();
 
   auto logStr = logStream.str();
-  // logging to specified stdout/stderr/file
-  folly::LogStreamProcessor(
-    XLOG_GET_CATEGORY(),
-    logLevel,
-    filefunc,
-    line,
-    "",
-    folly::LogStreamProcessor::AppendType::APPEND)
-        .stream()
-    << logStr;
+  ncclx::logging::writeNcclLog(level, filefunc, "", line, logStr);
 }
 
 // Non-deprecated version for internal use.
@@ -468,22 +444,9 @@ void ncclSetMyThreadLoggingName(std::string_view name) {
   meta::comms::logger::initThreadMetaData(name);
 }
 
-void ncclMetaDebugLogWithScuba(ncclDebugLogLevel level, unsigned long flags, const char *file, const char *func, int line, const char *fmt, ...) {
-  char buffer[256];
-  va_list vargs;
-  va_start(vargs, fmt);
-  (void) vsnprintf(buffer, sizeof(buffer), fmt, vargs);
-  va_end(vargs);
-  ::meta::comms::logger::appendErrorToStack(std::string{buffer});
-  ErrorStackTraceUtil::logErrorMessage(std::string{buffer});
-  ncclMetaDebugLog(level, flags, file, func, line, "%s", buffer);
-}
-
 /* Meta's logging function with separate file and func parameters.
  * Used by the VERSION, WARN, ERR, INFO, TRACE_CALL, and TRACE macros.
- * Unlike ncclDebugLog (which combines file/func into filefunc for OFI plugin
- * compatibility), this passes file and func separately to LogStreamProcessor
- * so that folly can correctly resolve log levels and categories.
+ * ncclDebugLog keeps file/func combined for OFI plugin compatibility.
  */
 
 void ncclMetaDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *file, const char *func, int line, const char *fmt, ...) {
@@ -515,17 +478,6 @@ void ncclMetaDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *
   }
 
   std::stringstream logStream;
-  auto logLevel = folly::LogLevel::INFO;
-  if (level == NCCL_LOG_WARN) {
-    logLevel = folly::LogLevel::WARN;
-  } else if (level == NCCL_LOG_INFO || level == NCCL_LOG_VERSION) {
-    logLevel = folly::LogLevel::INFO;
-  } else if (level == NCCL_LOG_TRACE) {
-    logLevel = folly::LogLevel::DBG;
-  } else if (level == NCCL_LOG_ERROR) {
-    logLevel = folly::LogLevel::ERR;
-  }
-
   size_t logLen = 0;
   va_list vargs;
   va_start(vargs, fmt);
@@ -540,14 +492,5 @@ void ncclMetaDebugLog(ncclDebugLogLevel level, unsigned long flags, const char *
   logStream << buffer.data();
 
   auto logStr = logStream.str();
-  // logging to specified stdout/stderr/file
-  folly::LogStreamProcessor(
-    XLOG_GET_CATEGORY(),
-    logLevel,
-    file,
-    line,
-    func,
-    folly::LogStreamProcessor::AppendType::APPEND)
-        .stream()
-    << logStr;
+  ncclx::logging::writeNcclLog(level, file, func, line, logStr);
 }

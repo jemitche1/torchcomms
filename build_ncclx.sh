@@ -215,6 +215,11 @@ function build_third_party {
     fi
   fi
 
+  if [[ ! -f "${CMAKE_PREFIX_PATH}/include/spdlog/spdlog.h" ]]; then
+    build_fb_oss_library "https://github.com/gabime/spdlog.git" "v1.16.0" spdlog \
+      "-DSPDLOG_BUILD_SHARED=OFF -DSPDLOG_FMT_EXTERNAL=ON -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF"
+  fi
+
   popd
 }
 
@@ -282,6 +287,17 @@ fi
 # Install pyyaml if not already installed (required by extractcvars.py)
 if [[ -z "${NCCL_SKIP_CONDA_INSTALL}" ]]; then
   conda install pyyaml --yes
+fi
+
+if [[ "${NCCL_PATCH_FMT_NVCC_CXX20:-0}" == "1" ]]; then
+  # fmt 9.1.0 disables relaxed constexpr under NVCC, which conflicts with its
+  # C++20-only constexpr APIs. This mirrors fmtlib PR #3544 and must run after
+  # dependency installation because conda may replace fmt/core.h above.
+  sed -i 's#!FMT_ICC_VERSION && !defined(__NVCC__)$#!FMT_ICC_VERSION \&\& (!defined(__NVCC__) || FMT_CPLUSPLUS >= 202002L)#' "${CONDA_PREFIX}/include/fmt/core.h"
+  grep -qF '!FMT_ICC_VERSION && (!defined(__NVCC__) || FMT_CPLUSPLUS >= 202002L)' "${CONDA_PREFIX}/include/fmt/core.h" || {
+    echo "ERROR: fmt PR#3544 patch did not apply to ${CONDA_PREFIX}/include/fmt/core.h" >&2
+    exit 1
+  }
 fi
 
 # Run the extractcvars.py script directly to generate the files
@@ -377,7 +393,7 @@ fi
 pushd "${NCCL_HOME}"
 
 function build_nccl {
-  make VERBOSE=1 -j$(nproc) \
+  make VERBOSE=1 -j"${NCCL_BUILD_JOBS:-$(nproc)}" \
     src.build \
     BUILDDIR="$BUILDDIR" \
     NVCC_GENCODE="$NVCC_GENCODE" \
@@ -394,7 +410,7 @@ function build_nccl {
 }
 
 function build_and_install_nccl {
-make VERBOSE=1 -j$(nproc) \
+make VERBOSE=1 -j"${NCCL_BUILD_JOBS:-$(nproc)}" \
     src.install \
     BUILDDIR="$BUILDDIR" \
     NVCC_GENCODE="$NVCC_GENCODE" \

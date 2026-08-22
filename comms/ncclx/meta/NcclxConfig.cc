@@ -31,6 +31,7 @@ Config::Config(const ncclConfig_t* config) {
   sendrecvAlgo = NCCL_SENDRECV_ALGO;
   allgatherAlgo = NCCL_ALLGATHER_ALGO;
   allreduceAlgo = NCCL_ALLREDUCE_ALGO;
+  alltoallAlgo = NCCL_ALLTOALL_ALGO;
   alltoallvAlgo = NCCL_ALLTOALLV_ALGO;
   rmaAlgo = NCCL_RMA_ALGO;
 
@@ -178,25 +179,108 @@ Config::Config(const ncclConfig_t* config) {
       }
     }
   }
+  // Per-communicator Prims transport overrides.
   {
-    std::string val = getHintStr("pipesIbgdaDataBufferSize");
+    // Tri-state: absent leaves the optional unset so ctranPrimsEnabled() falls
+    // back to NCCL_CTRAN_USE_PIPES. When present, accept the same spellings as
+    // every other boolean hint (1/0, true/false, yes/no, y/n, t/f) rather than
+    // digits only -- 'enablePrims=true' silently doing nothing is the kind of
+    // per-rank divergence that surfaces only as a comm-init hang.
+    //
+    // An UNPARSEABLE value leaves the optional unset, degrading to the global
+    // default with a WARN, which matches how every other bool hint in this
+    // file behaves. Note this does NOT make a typo safe: if only some ranks
+    // carry it, those ranks fall back to the CVAR while the rest honour the
+    // hint, and a transport mismatch across a communicator hangs comm init.
+    // Cross-rank hint consistency remains the caller's responsibility.
+    // parseHintBool cannot express the tri-state (its default doubles as the
+    // absent value), so parse the spellings directly here. Unlike
+    // parseHintBool there is deliberately no numeric fallback, so
+    // 'enablePrims=2' is rejected rather than treated as true.
+    std::string val = getHintStr("enablePrims");
+    if (!val.empty()) {
+      std::string lower(val.size(), '\0');
+      std::transform(val.begin(), val.end(), lower.begin(), ::tolower);
+      if (lower == "1" || lower == "yes" || lower == "true" || lower == "y" ||
+          lower == "t") {
+        enablePrims = 1;
+      } else if (
+          lower == "0" || lower == "no" || lower == "false" || lower == "n" ||
+          lower == "f") {
+        enablePrims = 0;
+      } else {
+        WARN(
+            "NCCLX hint 'enablePrims': invalid value '%s'; falling back to NCCL_CTRAN_USE_PIPES",
+            val.c_str());
+      }
+    }
+  }
+  {
+    std::string val = getHintStr("primsChannelBufferSize");
     if (!val.empty()) {
       try {
-        auto parsed = std::stoull(val);
-        if (parsed > 0) {
-          pipesIbgdaDataBufferSize = parsed;
+        // std::stoull silently wraps a leading '-', so "-1" would parse as
+        // 2^64-1 and pass the positivity check. Reject the sign explicitly.
+        if (val.find('-') != std::string::npos) {
+          WARN(
+              "NCCLX hint 'primsChannelBufferSize': value must be positive, got '%s'",
+              val.c_str());
+        } else if (auto parsed = std::stoull(val); parsed > 0) {
+          primsChannelBufferSize = parsed;
         } else {
-          WARN("NCCLX hint 'pipesIbgdaDataBufferSize': value must be positive");
+          WARN("NCCLX hint 'primsChannelBufferSize': value must be positive");
         }
       } catch (const std::exception&) {
         WARN(
-            "NCCLX hint 'pipesIbgdaDataBufferSize': invalid value '%s'",
+            "NCCLX hint 'primsChannelBufferSize': invalid value '%s'",
+            val.c_str());
+      }
+    }
+  }
+  {
+    std::string val = getHintStr("primsChannelPipelineDepth");
+    if (!val.empty()) {
+      try {
+        auto parsed = std::stoll(val);
+        if (parsed > 0) {
+          primsChannelPipelineDepth = static_cast<int64_t>(parsed);
+        } else {
+          WARN(
+              "NCCLX hint 'primsChannelPipelineDepth': value must be positive");
+        }
+      } catch (const std::exception&) {
+        WARN(
+            "NCCLX hint 'primsChannelPipelineDepth': invalid value '%s'",
             val.c_str());
       }
     }
   }
 
-  ibLazyConnect = parseHintBool("ibLazyConnect", NCCL_CTRAN_IBGDA_LAZY_CONNECT);
+  for (const auto& [key, field] :
+       {std::pair<const char*, std::optional<int64_t>*>{
+            "primsMaxChannels", &primsMaxChannels},
+        std::pair<const char*, std::optional<int64_t>*>{
+            "primsMaxBlocks", &primsMaxBlocks}}) {
+    std::string val = getHintStr(key);
+    if (val.empty()) {
+      continue;
+    }
+    try {
+      auto parsed = std::stoll(val);
+      if (parsed > 0) {
+        *field = static_cast<int64_t>(parsed);
+      } else {
+        WARN("NCCLX hint '%s': value must be positive", key);
+      }
+    } catch (const std::exception&) {
+      WARN("NCCLX hint '%s': invalid value '%s'", key, val.c_str());
+    }
+  }
+
+  deviceIbLazyConnect =
+      parseHintBool("deviceIbLazyConnect", NCCL_CTRAN_IBGDA_LAZY_CONNECT);
+
+  tmpbufEagerAlloc = parseHintBool("ctranTmpbufEagerAlloc", true);
 
   // vCliqueSize: hint only (no flat ncclConfig_t field)
   {
@@ -270,6 +354,9 @@ Config::Config(const ncclConfig_t* config) {
   useCtran = parseHintBool("useCtran", NCCL_CTRAN_ENABLE);
   usePatAvg = parseHintBool("usePatAvg", NCCL_REDUCESCATTER_PAT_AVG_ENABLE);
   noLocal = parseHintBool("noLocal", false);
+  winRegisterIpcOnly = parseHintBool("win_register_ipc_only", false);
+  winRegisterEnableSignal = parseHintBool("win_register_enable_signal", true);
+  winRegisterSymmetric = parseHintBool("win_register_symmetric", false);
 
   auto parseAlgoHint = [&](const char* key, auto& field) {
     auto val = getHintStr(key);
@@ -280,6 +367,7 @@ Config::Config(const ncclConfig_t* config) {
   parseAlgoHint("sendrecvAlgo", sendrecvAlgo);
   parseAlgoHint("allgatherAlgo", allgatherAlgo);
   parseAlgoHint("allreduceAlgo", allreduceAlgo);
+  parseAlgoHint("alltoallAlgo", alltoallAlgo);
   parseAlgoHint("alltoallvAlgo", alltoallvAlgo);
   parseAlgoHint("rmaAlgo", rmaAlgo);
 }
@@ -314,8 +402,21 @@ ncclResult_t Config::update(const ncclx::Hints* hints) {
   parseAlgoHint("sendrecvAlgo", sendrecvAlgo);
   parseAlgoHint("allgatherAlgo", allgatherAlgo);
   parseAlgoHint("allreduceAlgo", allreduceAlgo);
+  parseAlgoHint("alltoallAlgo", alltoallAlgo);
   parseAlgoHint("alltoallvAlgo", alltoallvAlgo);
   parseAlgoHint("rmaAlgo", rmaAlgo);
+
+  // Mutable bool window hints: applied only when the key is present, so an
+  // unrelated commSetConfig does not reset them (win hints are not pre-seeded).
+  auto parseBoolHint = [&](const char* key, bool& field) {
+    std::string val;
+    if (hints->get(key, val) == ncclSuccess) {
+      field = (val == "1" || val == "true");
+    }
+  };
+  parseBoolHint("win_register_ipc_only", winRegisterIpcOnly);
+  parseBoolHint("win_register_enable_signal", winRegisterEnableSignal);
+  parseBoolHint("win_register_symmetric", winRegisterSymmetric);
 
   return ncclSuccess;
 }
@@ -377,10 +478,16 @@ void ncclxLogCommConfig(ncclComm_t comm) {
     append(fmt::format("useCtran={}", xCfg->useCtran));
     append(fmt::format("usePatAvg={}", xCfg->usePatAvg));
     append(fmt::format("noLocal={}", xCfg->noLocal));
-    append(fmt::format("ibLazyConnect={}", xCfg->ibLazyConnect));
+    append(fmt::format("winRegisterIpcOnly={}", xCfg->winRegisterIpcOnly));
+    append(
+        fmt::format(
+            "winRegisterEnableSignal={}", xCfg->winRegisterEnableSignal));
+    append(fmt::format("winRegisterSymmetric={}", xCfg->winRegisterSymmetric));
+    append(fmt::format("deviceIbLazyConnect={}", xCfg->deviceIbLazyConnect));
     appendAlgo("sendrecvAlgo", xCfg->sendrecvAlgo);
     appendAlgo("allgatherAlgo", xCfg->allgatherAlgo);
     appendAlgo("allreduceAlgo", xCfg->allreduceAlgo);
+    appendAlgo("alltoallAlgo", xCfg->alltoallAlgo);
     appendAlgo("alltoallvAlgo", xCfg->alltoallvAlgo);
     appendAlgo("rmaAlgo", xCfg->rmaAlgo);
     auto appendIfSet = [&](const char* name, const auto& opt) {
@@ -392,7 +499,11 @@ void ncclxLogCommConfig(ncclComm_t comm) {
       append(fmt::format("vCliqueSize={}", xCfg->vCliqueSize));
     }
     appendIfSet("pipesNvlChunkSize", xCfg->pipesNvlChunkSize);
-    appendIfSet("pipesIbgdaDataBufferSize", xCfg->pipesIbgdaDataBufferSize);
+    appendIfSet("enablePrims", xCfg->enablePrims);
+    appendIfSet("primsChannelBufferSize", xCfg->primsChannelBufferSize);
+    appendIfSet("primsChannelPipelineDepth", xCfg->primsChannelPipelineDepth);
+    appendIfSet("primsMaxChannels", xCfg->primsMaxChannels);
+    appendIfSet("primsMaxBlocks", xCfg->primsMaxBlocks);
     appendIfSet("ncclBuffSize", xCfg->ncclBuffSize);
     appendIfSet("ibSplitDataOnQps", xCfg->ibSplitDataOnQps);
     appendIfSet("ibQpsPerConnection", xCfg->ibQpsPerConnection);
@@ -488,20 +599,25 @@ ncclx::commSetConfig(ncclComm_t comm, const ncclConfig_t* config) {
   NCCLCHECK(cfg->update(hints));
 
   std::string updated;
-  auto appendIfSet = [&](const char* key, const auto& field) {
+  auto appendIfSet = [&](const char* key, const std::string& value) {
     std::string val;
     if (hints->get(key, val) == ncclSuccess) {
       if (!updated.empty()) {
         updated += ' ';
       }
-      updated += fmt::format("{}={}", key, algoValToStr(field));
+      updated += fmt::format("{}={}", key, value);
     }
   };
-  appendIfSet("sendrecvAlgo", cfg->sendrecvAlgo);
-  appendIfSet("allgatherAlgo", cfg->allgatherAlgo);
-  appendIfSet("allreduceAlgo", cfg->allreduceAlgo);
-  appendIfSet("alltoallvAlgo", cfg->alltoallvAlgo);
-  appendIfSet("rmaAlgo", cfg->rmaAlgo);
+  appendIfSet("sendrecvAlgo", algoValToStr(cfg->sendrecvAlgo));
+  appendIfSet("allgatherAlgo", algoValToStr(cfg->allgatherAlgo));
+  appendIfSet("allreduceAlgo", algoValToStr(cfg->allreduceAlgo));
+  appendIfSet("alltoallAlgo", algoValToStr(cfg->alltoallAlgo));
+  appendIfSet("alltoallvAlgo", algoValToStr(cfg->alltoallvAlgo));
+  appendIfSet("rmaAlgo", algoValToStr(cfg->rmaAlgo));
+  appendIfSet("win_register_ipc_only", cfg->winRegisterIpcOnly ? "1" : "0");
+  appendIfSet(
+      "win_register_enable_signal", cfg->winRegisterEnableSignal ? "1" : "0");
+  appendIfSet("win_register_symmetric", cfg->winRegisterSymmetric ? "1" : "0");
 
   if (!updated.empty()) {
     INFO(

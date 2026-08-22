@@ -2,54 +2,19 @@
 
 #pragma once
 
-#include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <fmt/format.h>
 #include <folly/Range.h>
 #include <folly/logging/LogFormatter.h>
 #include <folly/logging/LogLevel.h>
 
+#include "comms/utils/commSpecs.h"
+#include "comms/utils/logger/LogTypes.h"
+
 namespace meta::comms::logger {
-
-enum class LogLevel {
-  NONE = 0,
-  VERSION = 1,
-  ERROR = 2,
-  WARN = 3,
-  INFO = 4,
-  ABORT = 5,
-  TRACE = 6
-};
-
-// Save and restore macros that collide with our enum values.
-// topo.h defines #define NET 5 which would expand inside the enum.
-#pragma push_macro("NET")
-#pragma push_macro("INIT")
-#undef NET
-#undef INIT
-enum SubSystem {
-  INIT = 0x1,
-  COLL = 0x2,
-  P2P = 0x4,
-  SHM = 0x8,
-  NET = 0x10,
-  GRAPH = 0x20,
-  TUNING = 0x40,
-  ENV = 0x80,
-  ALLOC = 0x100,
-  CALL = 0x200,
-  PROXY = 0x400,
-  NVLS = 0x800,
-  BOOTSTRAP = 0x1000,
-  REG = 0x2000,
-  PROFILE = 0x4000,
-  RAS = 0x8000,
-  ALL = ~0
-};
-#pragma pop_macro("INIT")
-#pragma pop_macro("NET")
 
 // TODO: Properly clean this up so that we directly parse NCCL logs to folly
 // levels.
@@ -69,9 +34,34 @@ void initThreadMetaData(std::string_view threadName);
 
 fmt::memory_buffer getLogPrefix(LogLevel level);
 
-const char* getLastCommsError();
+std::string getLastCommsError();
 
+// TODO: remove once ncclx v2_29 is retired. The only remaining producer is
+// v2_29's ncclMetaDebugLogWithScuba (via ERR_WITH_SCUBA/WARN_WITH_SCUBA);
+// v2_30 and ctran record the last-error stack via captureNativeErrorStack() +
+// setLastError() instead (native-stack-only).
 void appendErrorToStack(std::string error);
+
+// Record an ERROR-level log to the nccl_structured_logging Scuba table as a
+// single error record (top-level message in the exception_message column,
+// native stack in the stack_trace column). The caller is responsible for gating
+// this on NCCL_SCUBA_LOG_ERROR_ENABLED and for capturing the native `stack`
+// once (via captureNativeErrorStack()) so it can be shared across reporters.
+__attribute__((visibility("default"))) void logErrorToScuba(
+    const std::string& message,
+    int code,
+    const std::string& errorName,
+    const std::vector<std::string>& stack);
+
+// Update the ncclGetLastError() state with the latest error message and its
+// pre-captured native stack. Unconditional; independent of Scuba error logging.
+void setLastError(const std::string& message, std::vector<std::string> stack);
+
+// Record a CTRAN ERR-level error to Scuba, carrying the commResult_t code.
+// Gated by NCCL_SCUBA_LOG_ERROR_ENABLED; a no-op when disabled.
+__attribute__((visibility("default"))) void logCommErrorToScuba(
+    commResult_t code,
+    const std::string& message);
 
 class NcclLogFormatter : public folly::LogFormatter {
  public:

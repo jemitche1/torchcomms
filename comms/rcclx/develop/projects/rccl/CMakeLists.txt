@@ -959,10 +959,17 @@ set(RCCLX_LIB_FILES
   comms/rcclx/develop/meta/lpcoll/p2p_allgather.cc
   comms/rcclx/develop/meta/lpcoll/p2p_allgather.h
   # find comms/rcclx/develop/meta -type f ! -path "*/tests/*" -path "*/relay/*" \( -name "*.cc" -o -name "*.h" -o -name "*.cu" \) | sort
+  comms/rcclx/develop/meta/relay/sharded_relay_all_gather.cc
+  comms/rcclx/develop/meta/relay/sharded_relay_all_gather.h
+  comms/rcclx/develop/meta/relay/sharded_relay_all_to_all.cc
+  comms/rcclx/develop/meta/relay/sharded_relay_all_to_all.h
   comms/rcclx/develop/meta/relay/sharded_relay_allreduce.cc
   comms/rcclx/develop/meta/relay/sharded_relay_allreduce.h
   comms/rcclx/develop/meta/relay/sharded_relay_allreduce_kernels.cu
   comms/rcclx/develop/meta/relay/sharded_relay_allreduce_kernels.h
+  comms/rcclx/develop/meta/relay/sharded_relay_reduce_scatter.cc
+  comms/rcclx/develop/meta/relay/sharded_relay_reduce_scatter.h
+  comms/rcclx/develop/meta/relay/sharded_relay_route.h
 )
 
 # find comms/ctran/ -type f ! -path "*/tests/*" ! -path "*/benchmarks/*" ! -path "*/examples/*" \( -name "*.cc" -o -name "*.h" -o -name "*.hpp" -o -name "*.cuh" -o -name "*.cu" \) | sort
@@ -1012,6 +1019,8 @@ set(COMMON_FILES
   comms/common/IpcMemHandler.cc
   comms/common/IpcMemHandler.h
   comms/common/bootstrap/IBootstrap.h
+  comms/common/fault_tolerance/Abort.cc
+  comms/common/fault_tolerance/Abort.h
   comms/utils/checks.h
   comms/utils/colltrace/AlgoStats.cc
   comms/utils/colltrace/AlgoStats.h
@@ -1079,11 +1088,15 @@ set(COMMON_FILES
   comms/utils/logger/alloc.h
   comms/utils/logger/BackendTopologyUtil.cc
   comms/utils/logger/BackendTopologyUtil.h
+  comms/utils/logger/CommsLogFormatter.cc
+  comms/utils/logger/CommsLogFormatter.h
   comms/utils/logger/DataSink.h
   comms/utils/logger/DataTable.cc
   comms/utils/logger/DataTable.h
   comms/utils/logger/DataTableWrapper.cc
   comms/utils/logger/DataTableWrapper.h
+  comms/utils/logger/ErrorStackUtil.cc
+  comms/utils/logger/ErrorStackUtil.h
   comms/utils/logger/EventMgr.cc
   comms/utils/logger/EventMgr.h
   comms/utils/logger/EventMgrHelperTypes.cc
@@ -1094,18 +1107,20 @@ set(COMMON_FILES
   comms/utils/logger/Logger.h
   comms/utils/logger/LoggingFormat.cc
   comms/utils/logger/LoggingFormat.h
+  comms/utils/logger/LogTypes.cc
+  comms/utils/logger/LogTypes.h
   comms/utils/logger/LogUtils.cc
   comms/utils/logger/LogUtils.h
   comms/utils/logger/NcclScubaSample.cc
   comms/utils/logger/NcclScubaSample.h
   comms/utils/logger/NcclWriterWrapper.cc
   comms/utils/logger/NcclWriterWrapper.h
-  comms/utils/logger/ProcessGlobalErrorsUtil.cc
-  comms/utils/logger/ProcessGlobalErrorsUtil.h
   comms/utils/logger/ScubaFileUtils.cc
   comms/utils/logger/ScubaFileUtils.h
   comms/utils/logger/ScubaLogger.cc
   comms/utils/logger/ScubaLogger.h
+  comms/utils/logger/SpdlogLogger.cc
+  comms/utils/logger/SpdlogLogger.h
   comms/utils/MemUtils.cc
   comms/utils/MemUtils.h
   comms/utils/memtrace/MemoryTrace.cc
@@ -1292,6 +1307,25 @@ endif()
 # comms/utils/hrdw_ring_buffer/GpuClockCalibration.cc, which is compiled into
 # librccl. Resolved from CONDA_PREFIX via CMAKE_PREFIX_PATH (env), same as fmt.
 find_package(absl CONFIG REQUIRED)
+find_package(spdlog 1.16.0 CONFIG QUIET)
+if(NOT spdlog_FOUND)
+  include(FetchContent)
+  set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  set(SPDLOG_BUILD_PIC ON CACHE BOOL "" FORCE)
+  set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
+  set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+  set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    spdlog
+    SOURCE_DIR "${FBCODE_DIR}/../third-party/spdlog"
+  )
+  # spdlog treats BUILD_SHARED_LIBS as an override of SPDLOG_BUILD_SHARED.
+  set(_rccl_saved_build_shared_libs "${BUILD_SHARED_LIBS}")
+  set(BUILD_SHARED_LIBS OFF)
+  FetchContent_MakeAvailable(spdlog)
+  set(BUILD_SHARED_LIBS "${_rccl_saved_build_shared_libs}")
+  unset(_rccl_saved_build_shared_libs)
+endif()
 
 set(GEN_DIR "${HIPIFY_DIR}/gensrc")
 set(GEN_SYM_DIR "${GEN_DIR}/symmetric")
@@ -1400,6 +1434,11 @@ list(APPEND HIP_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/git_version.cpp)
 #==================================================================================================
 ## Set RCCL source files
 add_library(rccl ${HIP_SOURCES})
+
+target_compile_definitions(rccl PRIVATE
+  SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO
+  SPDLOG_FMT_EXTERNAL
+)
 
 ## Set RCCL dependencies
 ## Ensure git version is updated before building rccl
@@ -1867,6 +1906,7 @@ target_link_libraries(rccl PRIVATE   dl)
 target_link_libraries(rccl PRIVATE   atomic)
 target_link_libraries(rccl PRIVATE   ${SMI_LIBRARIES})
 target_link_libraries(rccl PRIVATE fmt::fmt-header-only)
+target_link_libraries(rccl PRIVATE spdlog::spdlog)
 target_link_libraries(rccl PRIVATE absl::log absl::check)  # GpuClockCalibration.cc
 if(ENABLE_MSCCLPP)
   target_link_libraries(rccl PRIVATE mscclpp_nccl)

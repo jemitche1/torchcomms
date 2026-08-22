@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -27,15 +28,28 @@ class PipesTrace {
   using Entry = typename Buffer::Entry;
   using Reader =
       ::hrdw_ring_buffer::HRDWRingBufferReader<comms::prims::PipesTraceEvent>;
+  /*
+   * An empty callback makes warnings fall back to stderr for both PipesTrace
+   * instances and the standalone normalizeRingSize helper.
+   * It may run on the internal poll thread, so captured state must remain valid
+   * for the lifetime of this object and support concurrent invocation.
+   * Exceptions are contained and reported to stderr rather than escaping a
+   * worker thread or destructor. A callback that emits and then throws may
+   * result in a duplicate stderr warning; preserving the diagnostic takes
+   * priority over deduplication.
+   */
+  using WarningCallback = std::function<void(std::string_view message)>;
 
-  PipesTrace() = default;
+  explicit PipesTrace(WarningCallback warningCallback);
   ~PipesTrace();
   PipesTrace(const PipesTrace&) = delete;
   PipesTrace& operator=(const PipesTrace&) = delete;
   PipesTrace(PipesTrace&&) = delete;
   PipesTrace& operator=(PipesTrace&&) = delete;
 
-  static uint32_t normalizeRingSize(uint64_t ringSize);
+  static uint32_t normalizeRingSize(
+      uint64_t ringSize,
+      const WarningCallback& warningCallback);
 
   using EventCallback =
       std::function<void(const PipesTraceEvent& event, uint64_t slot)>;
@@ -44,7 +58,8 @@ class PipesTrace {
   void ensure(
       uint32_t ringSize,
       std::chrono::milliseconds pollInterval,
-      EventCallback eventCallback = nullptr);
+      EventCallback eventCallback = nullptr,
+      uint32_t rank = 0);
 
   // Device-side handle into the ring.
   //
@@ -65,6 +80,7 @@ class PipesTrace {
   struct PendingLogBatch {
     std::vector<PendingLogEntry> entries;
     uint64_t entriesLost{0};
+    uint32_t rank{0};
   };
 
   void logBatch(const PendingLogBatch& batch) const;
@@ -72,7 +88,7 @@ class PipesTrace {
   void pollLoop();
   void startPollThread();
   void stopPollThread();
-
+  WarningCallback warningCallback_;
   std::unique_ptr<Buffer> buffer_;
   std::unique_ptr<Reader> reader_;
   mutable std::mutex drainMutex_;
@@ -81,6 +97,8 @@ class PipesTrace {
   std::condition_variable pollWake_;
   std::chrono::milliseconds pollInterval_{0};
   EventCallback eventCallback_;
+  uint64_t sessionId_{0};
+  uint32_t rank_{0};
   bool stopPolling_{false};
 };
 

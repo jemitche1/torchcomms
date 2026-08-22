@@ -7,8 +7,8 @@
 #include "comms/ctran/interfaces/ICtran.h"
 #include "comms/ctran/memory/memCacheAllocator.h"
 #include "comms/ctran/window/WinHintUtils.h"
-#include "comms/utils/checks.h"
 #include "comms/utils/commSpecs.h"
+#include "meta/NcclxChecks.h"
 #include "meta/NcclxConfig.h" // @manual
 #include "meta/commstate/FactoryCommStateX.h"
 #include "meta/ctran-integration/BaselineBootstrap.h"
@@ -22,12 +22,12 @@ meta::comms::Hints ncclToMetaComm(const ncclx::Hints& hints) {
   meta::comms::Hints ret;
   std::string v;
   for (const auto& k : meta::comms::hints::AllToAllPHintUtils::keys()) {
-    FB_COMMCHECKTHROW(ncclToMetaComm(hints.get(k, v)));
-    FB_COMMCHECKTHROW(ret.set(k, v));
+    NCCLX_COMMCHECKTHROW(ncclToMetaComm(hints.get(k, v)));
+    NCCLX_COMMCHECKTHROW(ret.set(k, v));
   }
   for (const auto& k : meta::comms::hints::WinHintUtils::keys()) {
-    FB_COMMCHECKTHROW(ncclToMetaComm(hints.get(k, v)));
-    FB_COMMCHECKTHROW(ret.set(k, v));
+    NCCLX_COMMCHECKTHROW(ncclToMetaComm(hints.get(k, v)));
+    NCCLX_COMMCHECKTHROW(ret.set(k, v));
   }
   return ret;
 }
@@ -43,13 +43,26 @@ ctranConfig makeCtranConfigFrom(ncclComm* comm) {
     const auto* ncclxCfg =
         static_cast<ncclx::Config*>(comm->config.ncclxConfig);
     if (ncclxCfg->pipesNvlChunkSize.has_value()) {
-      tconfig.pipesConfig.nvlChunkSize =
+      tconfig.primsConfig.nvlChunkSize =
           static_cast<int64_t>(ncclxCfg->pipesNvlChunkSize.value());
     }
-    tconfig.pipesConfig.ibLazyConnect = ncclxCfg->ibLazyConnect;
-    if (ncclxCfg->pipesIbgdaDataBufferSize.has_value()) {
-      tconfig.pipesConfig.ibgdaDataBufferSize =
-          static_cast<int64_t>(ncclxCfg->pipesIbgdaDataBufferSize.value());
+    tconfig.primsConfig.ibLazyConnect = ncclxCfg->deviceIbLazyConnect;
+    if (ncclxCfg->enablePrims.has_value()) {
+      tconfig.primsConfig.enablePrims = ncclxCfg->enablePrims.value();
+    }
+    if (ncclxCfg->primsChannelBufferSize.has_value()) {
+      tconfig.primsConfig.channelBufferSize =
+          static_cast<int64_t>(ncclxCfg->primsChannelBufferSize.value());
+    }
+    if (ncclxCfg->primsChannelPipelineDepth.has_value()) {
+      tconfig.primsConfig.channelPipelineDepth =
+          ncclxCfg->primsChannelPipelineDepth.value();
+    }
+    if (ncclxCfg->primsMaxChannels.has_value()) {
+      tconfig.primsConfig.maxChannels = ncclxCfg->primsMaxChannels.value();
+    }
+    if (ncclxCfg->primsMaxBlocks.has_value()) {
+      tconfig.primsConfig.maxBlocks = ncclxCfg->primsMaxBlocks.value();
     }
   }
   return tconfig;
@@ -66,6 +79,11 @@ commResult_t setCtranCommBase(ncclComm* ncclCommVal) {
   ncclCommVal->ctranComm_->opCount_ = &ncclCommVal->opCount;
   ncclCommVal->ctranComm_->logMetaData_ = ncclCommVal->logMetaData;
   ncclCommVal->ctranComm_->runtimeConn_ = ncclCommVal->runtimeConn;
+  if (ncclCommVal->config.ncclxConfig != nullptr) {
+    const auto* ncclxCfg =
+        static_cast<ncclx::Config*>(ncclCommVal->config.ncclxConfig);
+    ncclCommVal->ctranComm_->tmpbufEagerAlloc_ = ncclxCfg->tmpbufEagerAlloc;
+  }
 
   return commSuccess;
 }
@@ -101,7 +119,7 @@ ncclResult_t destroyCtranComm(ncclComm* comm) {
     comm->ctranComm_->destroy();
     comm->ctranComm_.reset();
   } catch (const std::exception& e) {
-    CLOGF(ERR, "CtranComm destruction failed: {}", e.what());
+    NCCLX_LOG(ERR, "CtranComm destruction failed: {}", e.what());
     return ncclInternalError;
   }
   return ncclSuccess;

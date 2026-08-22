@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include <endian.h>
 
@@ -426,13 +427,13 @@ namespace detail {
  * Internal stage for one transport-owned resumable send/recv operation.
  *
  * `Done` is intentionally zero so freshly zeroed transport memory starts idle.
- * Send operations use `WaitNicDone` and `WaitSlotFree`; recv operations use
- * `WaitDataReady`. Blocking send/recv temporarily use `Busy` to make
- * same-direction overlap fail explicitly instead of sharing a cursor.
+ * Send operations use `WaitLocalCompletion` and `WaitSlotFree`; recv
+ * operations use `WaitDataReady`. Blocking send/recv temporarily use `Busy` to
+ * make same-direction overlap fail explicitly instead of sharing a cursor.
  */
 enum class IbSendRecvProgressStage : uint8_t {
   Done,
-  WaitNicDone,
+  WaitLocalCompletion,
   WaitSlotFree,
   WaitDataReady,
   Busy,
@@ -447,6 +448,15 @@ struct IbChannelProgress {
   int64_t activeBaseStep{0};
   detail::IbSendRecvProgressStage activeStage{
       detail::IbSendRecvProgressStage::Done};
+  // CopyOp category of the most recent op driven on this channel (true =
+  // variable-size, e.g. AnsCompress). The persistent cursor (nextStep) is kept
+  // in WIRE bytes and pinned to whole perBlockSlot strides for BOTH categories,
+  // so a fixed<->variable-size switch on the same slot is safe: a compressed op
+  // always resumes on a slot boundary rather than reinterpreting a mid-slot
+  // byte cursor as a sub-chunk cursor. Recorded here so the compressed-path
+  // slot-alignment trap can attribute a mis-aligned cursor to a preceding
+  // fixed-size op, making the cross-category contract explicit in state.
+  bool activeVariableSize{false};
 };
 
 inline constexpr std::size_t kSendRecvSignalSlotStride = sizeof(SignalState);
@@ -468,7 +478,13 @@ struct IbChannelLayout {
   IbgdaRemoteBuffer remoteSignalBuf; ///< Peer's signal inbox
   IbgdaLocalBuffer localCounterBuf; ///< GPU-readable NIC_DONE counter inbox
   IbgdaLocalBuffer localCounterCompletionBuf; ///< Transport completion target
-  int maxChannels{0}; ///< Layout size for channel-indexed resources
+  int maxChannels{0}; ///< Layout size for SLOT-indexed resources. Equals
+                      ///< numChannels today; the diff that adds a second
+                      ///< protocol makes it numChannels * kNumProtoSlots.
+  int numChannels{0}; ///< Logical channels; a caller's group_id selects within
+                      ///< [0, numChannels). Also the QP channel: protocols
+                      ///< share a channel's QPs and are separated by resource
+                      ///< slot, never by channel id.
   int numLanes{1}; ///< QP lanes = numNics * qpsPerConnection; each lane owns a
                    ///< single-writer DATA_READY slot per channel
   int pipelineDepth{0}; ///< Number of slots/chunks in one channel
@@ -479,6 +495,14 @@ struct IbChannelLayout {
     const std::size_t perChannel =
         perChannelBufferSize != 0 ? perChannelBufferSize : perChannelSize;
     return perChannel * static_cast<std::size_t>(maxChannels);
+  }
+
+  // Flat resource slot for (logical channel, protocol slot). Proto-major, so
+  // kNumProtoSlots == 1 is the identity and a protocol's channels stay
+  // contiguous. Every slot-indexed accessor below takes this flat slot, NOT a
+  // logical channel.
+  IBGDA_HOST_DEVICE int protoChannelSlot(int channelId, int protoSlot) const {
+    return protoSlot * numChannels + channelId;
   }
 
   IBGDA_HOST_DEVICE int dataReadySignalSlot(int channelId) const {
@@ -552,13 +576,47 @@ enum class IbDirection : uint8_t {
 inline constexpr int kIbDirections = 2;
 inline constexpr int kIbMaxQpLanesPerChannelDirection = 64;
 
+// Per-protocol resource slots reserved on every channel, indexed by a protocol
+// tag's kProtoSlot (Simple = 0, LL = 1). The layout reserves this many
+// channels' worth of staging, signal, and counter slots per peer, so raising it
+// costs memory: at the default 128 KiB x 64 channels, each extra slot is
+// +8 MiB per peer of staging.
+//
+// It does NOT reserve more QPs: a channel is one QP pair regardless of how many
+// protocols address it, which is why IbQpState lives on the channel rather than
+// in a slot.
+inline constexpr int kNumProtoSlots = 2;
+
+// Identifies a lane-local completion threshold returned by put().
+// completionId is the send-lane ordinal; value is complete once that lane's
+// backend-specific completion frontier reaches it.
+struct IbLocalCompletionTicket {
+  uint32_t completionId{0};
+  uint64_t value{0};
+};
+
+// Completion thresholds accumulated for one channel's pipeline slot.
+// generation identifies the slot use; laneMask selects valid values entries,
+// each the latest ticket value that must complete before the slot is reused.
+struct IbSendCompletionSlot {
+  uint64_t generation{0};
+  uint64_t laneMask{0};
+  uint64_t values[kIbMaxQpLanesPerChannelDirection]{};
+};
+
 struct IbQpState {
   uint32_t cursor{0};
   uint64_t pendingFlushLanesMask{0};
   uint64_t lastFlushWqe[kIbMaxQpLanesPerChannelDirection]{};
 };
 
-struct IbLocalChannel {
+// Everything ONE wire protocol owns on one channel, selected by the protocol
+// tag's kProtoSlot. Duplicated per protocol: these cursors are resumable across
+// kernel launches, so two protocols sharing a slot would corrupt each other's
+// progress even though they never run concurrently within one kernel.
+//
+// Reach it through detail::acquire_channel<P>(), never by naming a slot index.
+struct IbChannelProtoSlot {
   IbChannelProgress sendProgress;
   IbChannelProgress recvProgress;
 
@@ -581,7 +639,6 @@ struct IbLocalChannel {
   //    zeroing it on a partial reset would desync the round-robin lane mapping.
   //  - `recvLaneExpected` mirrors the DATA_READY slots; zero it whenever those
   //    slots are zeroed (channel construction AND the device reset kernel).
-  uint64_t recvDataReadyLaneCursor{0};
   uint64_t recvLaneExpected[kIbMaxQpLanesPerChannelDirection]{};
 
   IbgdaLocalBuffer dataReady;
@@ -589,9 +646,40 @@ struct IbLocalChannel {
   IbgdaLocalBuffer nicDoneWait;
   IbgdaLocalBuffer nicDoneCompletion;
 
+  IbSendCompletionSlot* sendCompletionSlots{nullptr};
+};
+
+// A channel: the state every protocol on it shares, plus one slot per protocol.
+//
+// `sendQp` / `recvQp` are shared because a channel is one QP pair no matter how
+// many protocols address it, so `lastFlushWqe` and `pendingFlushLanesMask`
+// cover whatever any protocol actually posted on a lane.
+//
+// `recvDataReadyLaneCursor` is shared because it mirrors `sendQp.cursor`, which
+// counts puts POSTED on this (channel, Send) -- NOT DATA_READY events. Every
+// put must have exactly one receiver-observable event advancing the mirror, or
+// the round-robin lane mapping desyncs and the receiver waits on a slot that a
+// later chunk will satisfy, reading data that has not landed. A signal-less raw
+// put() gives the receiver nothing to observe, so it must never share a
+// (channel, direction) with send()/recv().
+//
+// Reset semantics: `recvDataReadyLaneCursor` is free-running and only zeroed at
+// channel (re)construction -- never by the device reset kernel. Reset it only
+// in lock-step with `sendQp.cursor`.
+//
+// `recvLaneExpected` is deliberately NOT shared: it mirrors the contents of a
+// protocol's own DATA_READY slots, so it belongs with those slots.
+struct IbLocalChannel {
   IbQpState sendQp;
   IbQpState recvQp;
+  uint64_t recvDataReadyLaneCursor{0};
+
+  IbChannelProtoSlot protos[kNumProtoSlots];
 };
+
+// Built on the host and cudaMemcpy'd to the device, so it must stay trivially
+// copyable.
+static_assert(std::is_trivially_copyable_v<IbLocalChannel>);
 
 struct IbRemoteChannel {
   IbgdaRemoteBuffer dataReady;
@@ -601,12 +689,20 @@ struct IbRemoteChannel {
 
 IBGDA_HOST_DEVICE inline IbLocalChannel makeIbLocalChannel(
     const IbChannelLayout& layout,
-    int channelId) {
+    int channelId,
+    IbSendCompletionSlot* sendCompletionSlots = nullptr) {
+  // channelId is the LOGICAL channel; every protocol slot on it gets its own
+  // views, resolved at that slot's flat index.
   IbLocalChannel channel{};
-  channel.dataReady = layout.localDataReadySignal(channelId);
-  channel.slotFree = layout.localSlotFreeSignal(channelId);
-  channel.nicDoneWait = layout.localCounter(channelId);
-  channel.nicDoneCompletion = layout.localCompletionCounter(channelId);
+  for (int protoSlot = 0; protoSlot < kNumProtoSlots; ++protoSlot) {
+    const int slot = layout.protoChannelSlot(channelId, protoSlot);
+    IbChannelProtoSlot& proto = channel.protos[protoSlot];
+    proto.dataReady = layout.localDataReadySignal(slot);
+    proto.slotFree = layout.localSlotFreeSignal(slot);
+    proto.nicDoneWait = layout.localCounter(slot);
+    proto.nicDoneCompletion = layout.localCompletionCounter(slot);
+    proto.sendCompletionSlots = sendCompletionSlots;
+  }
   return channel;
 }
 

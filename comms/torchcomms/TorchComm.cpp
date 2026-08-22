@@ -3,6 +3,10 @@
 #include "comms/torchcomms/TorchComm.hpp"
 #include "comms/torchcomms/TorchCommFactory.hpp"
 
+#include <c10/core/Allocator.h>
+#include <c10/core/Device.h>
+#include <c10/util/intrusive_ptr.h>
+#include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp-cpu
 #include <atomic>
 #include <limits>
 
@@ -454,6 +458,10 @@ c10::intrusive_ptr<TorchWork> TorchComm::gather_single(
       GatherSinglePostHookArgs(c10::weak_intrusive_ptr<TorchWork>(work)));
 
   return work;
+}
+
+bool TorchComm::supportsWindow() const {
+  return impl_->supportsWindow();
 }
 
 std::shared_ptr<TorchCommWindow> TorchComm::new_window(

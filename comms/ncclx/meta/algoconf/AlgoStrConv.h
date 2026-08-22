@@ -47,6 +47,16 @@ inline void algoStrToVal(
     val = NCCL_ALLGATHER_ALGO::ctgraph_ring;
   } else if (str == "ctgraph_rd") {
     val = NCCL_ALLGATHER_ALGO::ctgraph_rd;
+  } else if (str == "ctwin") {
+    val = NCCL_ALLGATHER_ALGO::ctwin;
+  } else if (str == "ctwin_ring") {
+    val = NCCL_ALLGATHER_ALGO::ctwin_ring;
+  } else if (str == "ctwin_srd") {
+    val = NCCL_ALLGATHER_ALGO::ctwin_srd;
+  } else if (str == "ctwin_pipeline") {
+    val = NCCL_ALLGATHER_ALGO::ctwin_pipeline;
+  } else if (str == "ctwin_rdpipeline") {
+    val = NCCL_ALLGATHER_ALGO::ctwin_rdpipeline;
   } else {
     val = NCCL_ALLGATHER_ALGO::orig;
   }
@@ -65,6 +75,8 @@ inline void algoStrToVal(
     val = NCCL_ALLREDUCE_ALGO::ctree;
   } else if (str == "cthierarchical_ring") {
     val = NCCL_ALLREDUCE_ALGO::cthierarchical_ring;
+  } else if (str == "ctmdirect") {
+    val = NCCL_ALLREDUCE_ALGO::ctmdirect;
   } else {
     val = NCCL_ALLREDUCE_ALGO::orig;
   }
@@ -81,6 +93,18 @@ inline void algoStrToVal(
     val = NCCL_ALLTOALLV_ALGO::bsCompCtran;
   } else {
     val = NCCL_ALLTOALLV_ALGO::orig;
+  }
+}
+
+inline void algoStrToVal(const std::string& str, enum NCCL_ALLTOALL_ALGO& val) {
+  if (str == "ctran") {
+    val = NCCL_ALLTOALL_ALGO::ctran;
+  } else if (str == "ctgraph") {
+    val = NCCL_ALLTOALL_ALGO::ctgraph;
+  } else if (str == "ctwin") {
+    val = NCCL_ALLTOALL_ALGO::ctwin;
+  } else {
+    val = NCCL_ALLTOALL_ALGO::orig;
   }
 }
 
@@ -134,6 +158,16 @@ inline std::string algoValToStr(enum NCCL_ALLGATHER_ALGO val) {
       return "ctgraph_ring";
     case NCCL_ALLGATHER_ALGO::ctgraph_rd:
       return "ctgraph_rd";
+    case NCCL_ALLGATHER_ALGO::ctwin:
+      return "ctwin";
+    case NCCL_ALLGATHER_ALGO::ctwin_ring:
+      return "ctwin_ring";
+    case NCCL_ALLGATHER_ALGO::ctwin_srd:
+      return "ctwin_srd";
+    case NCCL_ALLGATHER_ALGO::ctwin_pipeline:
+      return "ctwin_pipeline";
+    case NCCL_ALLGATHER_ALGO::ctwin_rdpipeline:
+      return "ctwin_rdpipeline";
   }
   return "unknown";
 }
@@ -152,6 +186,8 @@ inline std::string algoValToStr(enum NCCL_ALLREDUCE_ALGO val) {
       return "ctree";
     case NCCL_ALLREDUCE_ALGO::cthierarchical_ring:
       return "cthierarchical_ring";
+    case NCCL_ALLREDUCE_ALGO::ctmdirect:
+      return "ctmdirect";
   }
   return "unknown";
 }
@@ -166,6 +202,20 @@ inline std::string algoValToStr(enum NCCL_ALLTOALLV_ALGO val) {
       return "compCtran";
     case NCCL_ALLTOALLV_ALGO::bsCompCtran:
       return "bsCompCtran";
+  }
+  return "unknown";
+}
+
+inline std::string algoValToStr(enum NCCL_ALLTOALL_ALGO val) {
+  switch (val) {
+    case NCCL_ALLTOALL_ALGO::orig:
+      return "orig";
+    case NCCL_ALLTOALL_ALGO::ctran:
+      return "ctran";
+    case NCCL_ALLTOALL_ALGO::ctgraph:
+      return "ctgraph";
+    case NCCL_ALLTOALL_ALGO::ctwin:
+      return "ctwin";
   }
   return "unknown";
 }

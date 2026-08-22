@@ -7,9 +7,9 @@
 #include "comms/ctran/algos/AllToAll/AllToAllvImpl.h"
 #include "comms/ctran/algos/CtranAlgo.h"
 #include "comms/ctran/gpe/CtranGpe.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 #ifdef ENABLE_META_COMPRESSION
 #include "comms/ctran/algos/AllToAll/fb/compressed/CompressedAllToAllv.h"
@@ -70,12 +70,22 @@ static inline commResult_t setupKernelConfig(
   config.args.collective.alltoallv.selfSendDispl = sdispls[statex->rank()];
   config.args.collective.alltoallv.selfRecvDispl = rdispls[statex->rank()];
 
-  // When no local NVL peers (ppn=1, pure IB path), the alltoallv kernel's
-  // send/recv loops are empty — only self-copy and GPE sync remain. Issue
-  // the self D2D copy via cudaMemcpyAsync and signal the kernel to skip
-  // its body by setting sendElemsList to nullptr. The kernel then runs as
-  // a 1-block/1-thread stub for GPE sync, freeing SMs for overlapping compute.
-  if (statex->nLocalRanks() <= 1) {
+  // Run the 1-block/1-thread stub not only at ppn=1 but whenever no same-node
+  // NVL peer carries data (e.g. a2a_hier's rail leg): the kernel's send/recv
+  // loops are empty, so the self copy goes through icopy and the IB peers run
+  // on the GPE thread, avoiding the static grid of no-op CTAs.
+  bool hasLocalPeerWork = false;
+  for (int lr = 0; lr < statex->nLocalRanks(); ++lr) {
+    if (lr == statex->localRank()) {
+      continue;
+    }
+    const int g = statex->localRankToRank(lr);
+    if (sendcounts[g] != 0 || recvcounts[g] != 0) {
+      hasLocalPeerWork = true;
+      break;
+    }
+  }
+  if (!hasLocalPeerWork) {
     size_t selfBytes = sendcounts[statex->rank()] * commTypeSize(datatype);
     if (selfBytes > 0) {
       FB_COMMCHECK(comm->ctran_->mapper->icopy(
@@ -259,7 +269,7 @@ commResult_t ctranAllToAllv(
       stream);
   const auto statex = comm->statex_.get();
   for (int i = 0; i < statex->nRanks(); i++) {
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         COLL,
         "{}: opCount {} - sendcounts[{}] {} sdispls[{}] {} recvcounts[{}] {} rdispls[{}] {}",

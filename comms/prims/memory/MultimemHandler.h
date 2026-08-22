@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <string>
 #include <vector>
@@ -81,6 +82,8 @@ class MultimemHandler {
    * multicast object. `backing->size()` becomes this handler's allocated size,
    * so the caller must have sized `backing` to a multiple of max(local
    * allocation granularity, multicast granularity) -- see backingGranularity().
+   * `contract` identifies any protocol layered over the allocation and must be
+   * identical on every rank. The empty default represents raw multicast use.
    *
    * Throws std::runtime_error if `backing` is null.
    */
@@ -89,7 +92,8 @@ class MultimemHandler {
       std::shared_ptr<meta::comms::IBootstrap> bootstrap,
       int32_t commRank,
       std::vector<int> nvlRankToCommRank,
-      int cudaDevice);
+      int cudaDevice,
+      MulticastExchangeContract contract = {});
 
   ~MultimemHandler();
 
@@ -164,18 +168,14 @@ class MultimemHandler {
   AllocationLayout computeAllocationLayout() const;
   void createMulticastHandle(std::size_t allocatedSize);
   ShareableHandle exportMulticastHandle();
-  ShareableHandle exchangeMulticastHandle(ShareableHandle handle);
+  ShareableHandle exchangeMulticastHandle(
+      ShareableHandle handle,
+      const std::exception_ptr& localError);
   void importMulticastHandle(const ShareableHandle& handle);
   void addLocalDeviceToMulticast(CUdevice cuDev);
   void bindLocalMemoryToMulticast(std::size_t allocatedSize);
   void mapMulticastMemory(const AllocationLayout& layout);
-  void synchronizeRanks(const char* phase);
-  // AllGather handleType_ across the NVL team and throw if not every rank
-  // selected the same one. Called from exchange() before rank 0 creates the
-  // multicast object so a per-rank selection drift (e.g. one rank without IMEX
-  // chose POSIX FD while peers chose fabric) is reported as a clear error
-  // instead of a confusing export/import failure later.
-  void agreeOnHandleType();
+  void agreeOnSetup(const std::exception_ptr& localError);
   std::string describeState(const char* failedPhase, const char* completedPhase)
       const;
   void cleanup();
@@ -187,6 +187,7 @@ class MultimemHandler {
   const std::vector<int> nvlRankToCommRank_;
   const int cudaDevice_{-1};
   const std::size_t requestedSize_{0};
+  const MulticastExchangeContract contract_;
   HandleType handleType_{HandleType::kUnsupported};
 
   bool exchanged_{false};

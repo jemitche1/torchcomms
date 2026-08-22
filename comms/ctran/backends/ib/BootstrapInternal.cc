@@ -15,17 +15,17 @@
 #include <folly/ScopeGuard.h>
 #include <folly/SocketAddress.h>
 
-#include "comms/ctran/CtranComm.h"
+#include "comms/ctran/CtranComm.h" // @manual=//comms/ctran:ctran_comm
 #include "comms/ctran/backends/ib/CtranIbVc.h"
 #include "comms/ctran/backends/ib/VcState.h"
 #include "comms/ctran/bootstrap/Socket.h"
 #include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/Debug.h"
 #include "comms/ctran/utils/Exception.h"
 #include "comms/ctran/utils/ExtUtils.h"
 #include "comms/utils/commSpecs.h"
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 #include "comms/utils/logger/ScubaLogger.h"
 
 namespace {
@@ -40,13 +40,13 @@ const uint64_t kBootstrapMagic = 0xfaceb00cdeadbeef;
 // like what would happen if FT is disabled (via
 // the FB_SYSCHECKTHROW_EX macro).
 #define HANDLE_SOCKET_ERROR(cmd, self)                                       \
-  if (!self->abortCtrl_->Enabled()) {                                        \
+  if (!self->abortCtrl_->isEnabled()) {                                      \
     FB_SYSCHECKTHROW_EX(cmd, self->rank_, self->commHash_, self->commDesc_); \
   } else {                                                                   \
     int errCode = cmd;                                                       \
-    if (errCode || self->abortCtrl_->Test()) {                               \
-      CLOGF(ERR, "Socket error encountered: {}. Aborting.", errCode);        \
-      self->abortCtrl_->Set(); /* Ensure remote is notified */               \
+    if (errCode || self->abortCtrl_->isAborted()) {                          \
+      CTRAN_LOG(ERR, "Socket error encountered: {}. Aborting.", errCode);    \
+      self->abortCtrl_->setAbort(); /* Ensure remote is notified */          \
       break;                                                                 \
     }                                                                        \
   }
@@ -57,7 +57,7 @@ Bootstrap::Bootstrap(
     VcState& vcState,
     const VcLayout& vcLayout,
     std::shared_ptr<::ctran::bootstrap::ISocketFactory> socketFactory,
-    std::shared_ptr<::ctran::utils::Abort> abortCtrl,
+    std::shared_ptr<::comms::fault_tolerance::Abort> abortCtrl,
     const CommLogData& logData,
     CtranComm* comm,
     std::vector<CtranIbDevice>& devices,
@@ -113,7 +113,7 @@ void Bootstrap::start(std::optional<const SocketServerAddr*> qpServerAddr) {
     auto maybeAddr = ::ctran::bootstrap::getInterfaceAddress(
         NCCL_SOCKET_IFNAME, NCCL_SOCKET_IPADDR_PREFIX, true, &resolvedIfName);
     if (maybeAddr.hasError()) {
-      CLOGF(WARN, "CTRAN-IB: No socket interfaces found");
+      CTRAN_LOG(WARN, "CTRAN-IB: No socket interfaces found");
       throw ::ctran::utils::Exception(
           "CTRAN-IB : No socket interfaces found",
           commSystemError,
@@ -135,7 +135,7 @@ void Bootstrap::start(std::optional<const SocketServerAddr*> qpServerAddr) {
       rank_,
       commHash_,
       commDesc_);
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-IB: Rank {} created listen socket with {} listenAddr {} ifname {}",
@@ -192,7 +192,7 @@ commResult_t Bootstrap::connect(
     scubaEvent.stopAndRecord();
   };
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-IB: Establishing connection: commHash {:x}, commDesc {}, rank {}, peer {}, peer listenAddr {} clientIfName {}",
@@ -224,8 +224,8 @@ commResult_t Bootstrap::exchangeAndPublish(
     bool isServer,
     int peerRank) {
   if (peerRank < 0 || (comm_ && peerRank >= comm_->statex_->nRanks())) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInternalError,
         "invalid peerRank ({}) < 0 or >= nRanks {}",
         peerRank,
         comm_ ? comm_->statex_->nRanks() : -1);
@@ -333,7 +333,7 @@ void Bootstrap::acceptLoop(Bootstrap* self) {
     uint64_t magic{0};
     HANDLE_SOCKET_ERROR(socket->recv(&magic, sizeof(uint64_t)), self);
     if (magic != kBootstrapMagic) {
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "CTRAN-IB: Invalid magic - received {:x} but expected {:x} for commHash {:x} commDesc {}. "
           "Likely unexpected connection attempt. Ignoring. Local Addr: {},  Peer Addr: {}",
@@ -351,7 +351,7 @@ void Bootstrap::acceptLoop(Bootstrap* self) {
     const auto err = self->exchangeAndPublish(
         std::move(socket), /*isServer=*/true, peerRank);
     if (err != 0) { // TODO: We may want to handle certain errors differently?
-      CLOGF(
+      CTRAN_LOG(
           ERR,
           "CTRAN-IB: Failed to establish connection with peer rank {} for commHash {:x} commDesc {}, err={}",
           peerRank,
@@ -362,7 +362,7 @@ void Bootstrap::acceptLoop(Bootstrap* self) {
     }
   }
 
-  CLOGF(
+  CTRAN_LOG(
       INFO,
       "CTRAN-IB: Listen thread terminating, rank {} commHash {:x} commDesc {}",
       self->rank_,

@@ -2,12 +2,19 @@
 
 #pragma once
 
-#include <ATen/core/ivalue.h> // @manual=//caffe2:ATen-core
+// IWYU pragma: no_include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 #include <chrono>
 #include <functional>
 #include <future>
 #include <vector>
+
+namespace at {
+class Tensor;
+} // namespace at
+namespace c10::ivalue {
+struct Future;
+} // namespace c10::ivalue
 
 namespace torch::comms {
 
@@ -51,6 +58,13 @@ class TorchWork : public c10::intrusive_ptr_target {
   virtual std::chrono::milliseconds getTimeout() const {
     return std::chrono::milliseconds::max();
   }
+
+  // Block the calling CPU thread until the device work behind this object has
+  // completed (in addition to the stream-ordered wait()). Invoked by the c10d
+  // WorkWrapper for synchronous barriers to mirror stock ProcessGroupNCCL,
+  // whose barrier host-blocks the CPU thread. No-op by default; backends whose
+  // wait() is already host-blocking (e.g. CPU/gloo) need not override it.
+  virtual void hostSynchronize() {}
 
   // Fault Tolerance API
 

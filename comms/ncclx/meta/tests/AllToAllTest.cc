@@ -11,9 +11,11 @@
 #include "checks.h"
 
 #include "comms/ctran/Ctran.h"
+#include "comms/ctran/tests/VerifyAlgoStatsUtil.h"
 #include "comms/ncclx/meta/tests/NcclCommUtils.h"
 #include "comms/ncclx/meta/tests/NcclxBaseTest.h"
 #include "comms/utils/cvars/nccl_cvars.h"
+#include "meta/NcclxConfig.h"
 #include "meta/commDump.h"
 
 static const int kTotalColls = 5;
@@ -26,6 +28,7 @@ class AllToAllTest : public NcclxBaseTestFixture {
     setenv("NCCL_COLLTRACE", "trace", 0);
 #endif
     NcclxBaseTestFixture::SetUp();
+    ctranAlgoStats_.enable();
 
     this->comm = ncclx::test::createNcclComm(
         globalRank, numRanks, localRank, bootstrap_.get());
@@ -41,8 +44,6 @@ class AllToAllTest : public NcclxBaseTestFixture {
   }
 
   void run(bool registFlag = false) {
-#ifdef NCCL_ALLTOALL_SUPPORTED
-
     // create and register buffers
     constexpr int count = 1048576;
     int *sendBuf = nullptr, *recvBuf = nullptr;
@@ -67,7 +68,7 @@ class AllToAllTest : public NcclxBaseTestFixture {
 
     // run alltoall
     for (int i = 0; i < kTotalColls; i++) {
-      auto res = ncclAllToAll(sendBuf, recvBuf, count, ncclInt, comm, stream);
+      auto res = ncclAlltoAll(sendBuf, recvBuf, count, ncclInt, comm, stream);
       ASSERT_EQ(res, ncclSuccess);
     }
     CUDACHECK_TEST(cudaStreamSynchronize(stream));
@@ -111,12 +112,12 @@ class AllToAllTest : public NcclxBaseTestFixture {
       }
     }
 #endif
-#endif
   }
 
  protected:
   ncclComm_t comm;
   cudaStream_t stream;
+  ctran::test::VerifyAlgoStatsHelper ctranAlgoStats_;
 };
 
 TEST_F(AllToAllTest, OutOfPlace) {
@@ -125,48 +126,71 @@ TEST_F(AllToAllTest, OutOfPlace) {
 
 #ifdef TEST_ENABLE_CTRAN
 TEST_F(AllToAllTest, Ctran) {
-  auto envGuard = EnvRAII(NCCL_ALLTOALL_ALGO, NCCL_ALLTOALL_ALGO::ctran);
+  // Flip alltoallAlgo to ctran on the already-initialized comm via the
+  // per-comm mutable-update path.
+  ncclConfig_t updateConfig = NCCL_CONFIG_INITIALIZER;
+  ncclx::Hints hints{{"alltoallAlgo", "ctran"}};
+  updateConfig.hints = &hints;
+  ASSERT_EQ(ncclSuccess, ncclx::commSetConfig(this->comm, &updateConfig));
+  EXPECT_EQ(
+      NCCL_ALLTOALL_ALGO::ctran,
+      NCCLX_CONFIG_FIELD(this->comm->config, alltoallAlgo));
+
   run();
+
+  ctranAlgoStats_.verify(comm->ctranComm_.get(), "AllToAll", "Ctran");
+}
+
+TEST_F(AllToAllTest, AllToAllWithHintOverride) {
+  // Recreate the comm with alltoallAlgo=ctran init-time hint.
+  NCCLCHECK_TEST(ncclCommDestroy(this->comm));
+  ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+  ncclx::Hints hints{{"alltoallAlgo", "ctran"}};
+  config.hints = &hints;
+  this->comm = ncclx::test::createNcclComm(
+      globalRank, numRanks, localRank, bootstrap_.get(), false, &config);
+  ASSERT_NE(nullptr, this->comm);
+  EXPECT_EQ(
+      NCCL_ALLTOALL_ALGO::ctran,
+      NCCLX_CONFIG_FIELD(this->comm->config, alltoallAlgo));
+
+  run();
+
+  ctranAlgoStats_.verify(comm->ctranComm_.get(), "AllToAll", "Ctran");
 }
 #endif
 
 TEST_F(AllToAllTest, InvalidSendbuf) {
-#ifdef NCCL_ALLTOALL_SUPPORTED
   constexpr int count = 1048576;
   int* buf = nullptr;
   CUDACHECK_TEST(cudaMalloc(&buf, count * numRanks * sizeof(int)));
 
   // run alltoall
-  auto res = ncclAllToAll(nullptr, buf, count, ncclInt, comm, stream);
+  auto res = ncclAlltoAll(nullptr, buf, count, ncclInt, comm, stream);
   ASSERT_EQ(res, ncclInvalidArgument);
   CUDACHECK_TEST(cudaFree(buf));
-#endif
 }
 
 TEST_F(AllToAllTest, InvalidRecvbuf) {
-#ifdef NCCL_ALLTOALL_SUPPORTED
   constexpr int count = 1048576;
   int* buf = nullptr;
   CUDACHECK_TEST(cudaMalloc(&buf, count * numRanks * sizeof(int)));
 
   // run alltoall
-  auto res = ncclAllToAll(buf, nullptr, count, ncclInt, comm, stream);
+  auto res = ncclAlltoAll(buf, nullptr, count, ncclInt, comm, stream);
   ASSERT_EQ(res, ncclInvalidArgument);
   CUDACHECK_TEST(cudaFree(buf));
-#endif
 }
 
 TEST_F(AllToAllTest, InvalidInPlace) {
-#ifdef NCCL_ALLTOALL_SUPPORTED
   constexpr int count = 1048576;
   int* buf = nullptr;
   CUDACHECK_TEST(cudaMalloc(&buf, count * numRanks * sizeof(int)));
 
   // run alltoall
-  auto res = ncclAllToAll(buf, buf, count, ncclInt, comm, stream);
+  auto res = ncclAlltoAll(buf, buf, count, ncclInt, comm, stream);
   ASSERT_EQ(res, ncclInvalidArgument);
   CUDACHECK_TEST(cudaFree(buf));
-#endif
 }
 
 int main(int argc, char* argv[]) {

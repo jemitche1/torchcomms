@@ -8,9 +8,34 @@
 #include <cstdint>
 
 #include "comms/prims/core/SignalState.cuh"
+#include "comms/prims/transport/nvl/MultimemNvlSignal.cuh"
 #include "comms/prims/transport/nvl/MultimemNvlTransportDevice.cuh"
 
 namespace comms::prims::test {
+
+enum class MultimemReductionTestType { Float, Int32, Float16, Bfloat16 };
+
+struct StageLayoutResult {
+  std::size_t channelBeginBytes;
+  std::size_t stagingBytes;
+  uint64_t signalBase;
+  uint64_t signalsPerChannel;
+  uint64_t readyFirst;
+  uint64_t readyLast;
+  uint64_t ackFirst;
+  uint64_t ackLast;
+  uint64_t consumedFirst;
+  uint64_t consumedLast;
+  uint64_t lane0ReadyCounter;
+  uint64_t lane0ReadyEpoch;
+  uint64_t lane0AckCounter;
+  uint64_t lane0AckEpoch;
+  uint64_t lane1ReadyCounter;
+  uint64_t lane1ReadyEpoch;
+  uint64_t lane1AckCounter;
+  uint64_t lane1AckEpoch;
+  uint32_t pipelineDepth;
+};
 
 // Each launch is one warp -> one ThreadGroup. The leader performs the
 // multimem PTX store; the remaining lanes sync alongside it. Callers must
@@ -74,6 +99,100 @@ void launchReadUserAndInternal(
     uint64_t userId,
     uint64_t internalId,
     uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchSetAllPeerInternalSignals(
+    MultimemNvlTransportDevice transport,
+    uint64_t value,
+    cudaStream_t stream = nullptr);
+
+void launchReadPeerInternalSignals(
+    MultimemNvlTransportDevice transport,
+    uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchAggregateSignalProtocol(
+    MultimemNvlTransportDevice transport,
+    NvlSignalAccess access,
+    NvlSignalPhase phase,
+    bool fanIn,
+    uint64_t roundValue,
+    uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchAggregateAckSignalProtocol(
+    MultimemNvlTransportDevice transport,
+    uint64_t roundValue,
+    uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchPerPeerWaitAllSignalProtocol(
+    MultimemNvlTransportDevice transport,
+    NvlSignalAccess access,
+    NvlSignalPhase phase,
+    bool fanIn,
+    uint64_t roundValue,
+    uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchMultimemReadyPerPeerSignalProtocol(
+    MultimemNvlTransportDevice transport,
+    NvlPerPeerWaitPolicy waitPolicy,
+    bool fanIn,
+    uint64_t roundValue,
+    uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchMultiChannelAggregateSignal(
+    MultimemNvlTransportDevice transport,
+    uint32_t channels,
+    uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchAggregateMultimemWaiterTransition(
+    MultimemNvlTransportDevice transport,
+    uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchSeparatePublishAndWait(
+    MultimemNvlTransportDevice transport,
+    uint64_t roundValue,
+    uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchPerPeerWaitOnly(
+    MultimemNvlTransportDevice transport,
+    uint64_t roundValue,
+    uint64_t* out,
+    cudaStream_t stream = nullptr);
+
+void launchInitializeAggregateSignals(
+    MultimemNvlTransportDevice transport,
+    uint64_t counterValue,
+    uint64_t epochValue,
+    cudaStream_t stream = nullptr);
+
+void launchFillReductionInput(
+    MultimemNvlTransportDevice transport,
+    MultimemReductionTestType type,
+    float value,
+    std::size_t elems,
+    std::size_t sourceOffsetElems,
+    cudaStream_t stream = nullptr);
+
+void launchLoadReduce(
+    MultimemNvlTransportDevice transport,
+    MultimemReductionTestType type,
+    bool accF32,
+    void* output,
+    std::size_t elems,
+    std::size_t sourceOffsetElems,
+    cudaStream_t stream = nullptr);
+
+void launchStageLayout(
+    MultimemNvlTransportDevice transport,
+    StageLayoutResult* results,
+    uint32_t numGroups,
     cudaStream_t stream = nullptr);
 
 } // namespace comms::prims::test

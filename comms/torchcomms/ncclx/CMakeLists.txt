@@ -89,14 +89,14 @@ if("$ENV{ENABLE_PRIMS}" STREQUAL "1")
     set(TORCHCOMMS_ENABLE_PRIMS ON)
     message(STATUS "ENABLE_PRIMS=1 set, building with prims support")
     if(TORCHCOMMS_HAS_NCCL_DEVICE_API)
-        file(GLOB TORCHCOMMS_DEVICE_PIPES_SOURCE
-            "comms/torchcomms/device/pipes/*.cpp")
+        file(GLOB TORCHCOMMS_DEVICE_PRIMS_SOURCE
+            "comms/torchcomms/device/prims/*.cpp")
     else()
-        set(TORCHCOMMS_DEVICE_PIPES_SOURCE "")
+        set(TORCHCOMMS_DEVICE_PRIMS_SOURCE "")
     endif()
 else()
     set(TORCHCOMMS_ENABLE_PRIMS OFF)
-    set(TORCHCOMMS_DEVICE_PIPES_SOURCE "")
+    set(TORCHCOMMS_DEVICE_PRIMS_SOURCE "")
     message(STATUS "ENABLE_PRIMS not set, building without prims support")
 endif()
 
@@ -104,7 +104,7 @@ add_library(torchcomms_comms_ncclx MODULE
     ${TORCHCOMMS_NCCLX_SOURCES}
     ${TORCHCOMMS_CUDA_DEVICE_SOURCES}
     ${TORCHCOMMS_DEVICE_NCCLX_SOURCE}
-    ${TORCHCOMMS_DEVICE_PIPES_SOURCE}
+    ${TORCHCOMMS_DEVICE_PRIMS_SOURCE}
     comms/utils/CudaRAII.cc
     comms/utils/GraphCaptureSideStream.cc
 )
@@ -118,6 +118,8 @@ target_include_directories(torchcomms_comms_ncclx PRIVATE
     ${ROOT}
     ${NCCLX_INCLUDE}
     ${CONDA_INCLUDE}
+    ${CUDA_INCLUDE_DIRS}
+    ${CUDA_INCLUDE_DIRS}/cccl
     ${Python3_INCLUDE_DIRS}
 )
 torchcomms_use_torch_pybind11(torchcomms_comms_ncclx)
@@ -192,6 +194,12 @@ endif()
 if(CUDA_FOUND)
     target_link_libraries(torchcomms_comms_ncclx PRIVATE CUDA::cudart)
 endif()
+
+# NCCLX (whether linked as libnccl.so or the static archive) references 16-byte
+# atomics that lower to libatomic __atomic_*_16 libcalls. Link libatomic on the
+# extension too so those transitive references resolve at the final OSS wheel
+# link (covers both the USE_SYSTEM_LIBS and static NCCLX paths above).
+target_link_libraries(torchcomms_comms_ncclx PRIVATE atomic)
 
 # Link absl LAST — after the ncclx archive (NCCLX_STATIC_LIB) and the folly
 # archives above. The static absl_log_internal_* members that satisfy

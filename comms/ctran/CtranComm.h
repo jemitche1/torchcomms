@@ -7,22 +7,26 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <folly/Synchronized.h>
 #include <folly/container/F14Set.h>
+#include "comms/common/fault_tolerance/Abort.h"
 #include "comms/ctran/algos/PersistentCleanup.h"
 #include "comms/ctran/bootstrap/ICtranBootstrap.h"
 #include "comms/ctran/commstate/CommStateX.h"
 #include "comms/ctran/interfaces/ICtran.h"
-#include "comms/ctran/utils/Abort.h"
 #include "comms/ctran/utils/AsyncError.h"
 #include "comms/ctran/utils/Exception.h"
+#include "comms/ctran/window/WinCache.h"
 #include "comms/utils/colltrace/AlgoStats.h"
 #include "comms/utils/colltrace/CollTraceInterface.h"
 #include "comms/utils/commSpecs.h"
+#include "comms/utils/cvars/nccl_cvars.h"
 
 namespace comms::prims {
 class MultiPeerTransport;
@@ -34,29 +38,64 @@ using meta::comms::CommBackend;
 
 // Per-communicator Prims transport overrides.
 // -1 means use CVAR default.
-struct ctranPipesConfig {
+struct ctranPrimsConfig {
+  // -1 uses NCCL_CTRAN_USE_PIPES. MCCL sets this explicitly so its Prims
+  // policy does not affect NCCLX or standalone Ctran communicators.
+  int64_t enablePrims{-1};
   int64_t nvlChunkSize{-1};
-  bool ibLazyConnect{false};
-  int64_t ibgdaDataBufferSize{-1};
+  bool ibLazyConnect{true};
+  // Per-channel, per-direction IB staging size. Same unit as
+  // MCCL_CHANNEL_BUFFER_SIZE, which it overrides for this communicator.
+  int64_t channelBufferSize{-1};
+  // -1 uses MCCL_CHANNEL_PIPELINE_DEPTH. Together with channelBufferSize this
+  // fixes the per-chunk size: chunk = channelBufferSize / channelPipelineDepth.
+  int64_t channelPipelineDepth{-1};
+  // -1 uses MCCL_MAX_NCHANNELS. Total IB staging for this communicator is
+  // channelBufferSize * maxChannels per peer per direction. Multimem staging
+  // capacity is also provisioned for this many channels.
+  int64_t maxChannels{-1};
+  // -1 uses MCCL_MAX_NBLOCKS. This is the collective launch-geometry block
+  // cap. Multimem requires it not to exceed maxChannels because a launch
+  // cannot consume more blocks than the provisioned channel capacity.
+  int64_t maxBlocks{-1};
 
-  bool operator==(const ctranPipesConfig& other) const {
-    return nvlChunkSize == other.nvlChunkSize &&
+  bool operator==(const ctranPrimsConfig& other) const {
+    return enablePrims == other.enablePrims &&
+        nvlChunkSize == other.nvlChunkSize &&
         ibLazyConnect == other.ibLazyConnect &&
-        ibgdaDataBufferSize == other.ibgdaDataBufferSize;
+        channelBufferSize == other.channelBufferSize &&
+        channelPipelineDepth == other.channelPipelineDepth &&
+        maxChannels == other.maxChannels && maxBlocks == other.maxBlocks;
   }
 };
+
+// Per-communicator override first, global CVAR second. Both the transport
+// (comm init) and the collective launch geometry (per call) must resolve these
+// the same way, so they share these helpers rather than reading the CVAR
+// directly. NOTE: mccl's own launch-geometry validation still reads
+// MCCL_MAX_NCHANNELS / MCCL_MAX_NBLOCKS globally; a communicator that overrides
+// these and also runs mccl collectives would be validated against the global.
+inline int64_t ctranPrimsResolvedMaxChannels(const ctranPrimsConfig& pc) {
+  return pc.maxChannels > 0 ? pc.maxChannels
+                            : static_cast<int64_t>(MCCL_MAX_NCHANNELS);
+}
+
+inline int64_t ctranPrimsResolvedMaxBlocks(const ctranPrimsConfig& pc) {
+  return pc.maxBlocks > 0 ? pc.maxBlocks
+                          : static_cast<int64_t>(MCCL_MAX_NBLOCKS);
+}
 
 struct ctranConfig {
   int blocking{-1};
   std::string commDesc;
   std::vector<enum CommBackend> backends = {};
-  ctranPipesConfig pipesConfig;
+  ctranPrimsConfig primsConfig;
   bool enableProfiler{NCCL_CTRAN_TRANSPORT_PROFILER};
 
   bool operator==(const ctranConfig& other) const {
     return (
         blocking == other.blocking && commDesc == other.commDesc &&
-        backends == other.backends && pipesConfig == other.pipesConfig &&
+        backends == other.backends && primsConfig == other.primsConfig &&
         enableProfiler == other.enableProfiler);
   }
 };
@@ -70,8 +109,14 @@ class memCacheAllocator;
 namespace comms::prims {
 class MultiPeerTransport;
 }
+namespace ctran {
+struct CtranWin;
+namespace algos {
+class OrderedWorkStreamGuard;
+}
+} // namespace ctran
 
-using ctran::utils::Abort;
+using comms::fault_tolerance::Abort;
 using ctran::utils::AsyncError;
 using ctran::utils::Exception;
 
@@ -81,7 +126,7 @@ class CtranComm {
   // For real communicationator we should use factory method to create.
   explicit CtranComm(
       std::shared_ptr<Abort> abort =
-          ctran::utils::createAbort(/*enabled=*/false),
+          comms::fault_tolerance::createAbort(/*enabled=*/false),
       ctranConfig commConfig = ctranConfig{});
 
   // The MemCache allocator is destroyed in a different time than all
@@ -121,23 +166,23 @@ class CtranComm {
   }
 
   inline bool abortEnabled() const {
-    return abort_->Enabled();
+    return abort_->isEnabled();
   }
 
   inline void setAbort() {
-    abort_->Set();
+    abort_->setAbort();
   }
 
   inline bool testAbort() const {
-    return abort_->Test();
+    return abort_->isAborted();
   }
 
   inline void setTimeout(const std::chrono::milliseconds& timeout) {
-    return abort_->SetTimeout(timeout);
+    return abort_->startTimeout(timeout);
   }
 
   inline void cancelTimeout() {
-    return abort_->CancelTimeout();
+    return abort_->cancelTimeout();
   }
 
   inline bool useNativeOpCount() const {
@@ -150,6 +195,13 @@ class CtranComm {
 
   inline uint64_t getCtranOpCount() const {
     return ctranOpCount_;
+  }
+
+  // Monotonic per-comm window id. Windows are registered collectively in the
+  // same order on every rank, so a given window gets the same id on all ranks
+  // -- used to check/log that all ranks pick the same window.
+  inline uint64_t assignWindowId() {
+    return nextWinId_++;
   }
 
   inline bool isSplitShare() const {
@@ -169,16 +221,8 @@ class CtranComm {
     return parentRanks_;
   }
 
-  // Get a pointer to the Transport array from MultiPeerTransport,
-  // indexed by global rank. Returns nullptr if MultiPeerTransport is not
-  // initialized.
-  comms::prims::Transport* getMultiPeerTransportsPtr() const;
-
-  // Lazy-safe overload: materializes `peers` (via get_device_handle(peers))
-  // and returns the Transport array pointer. Required in lazy-connect mode,
-  // where the no-arg overload throws. Non-const because materialization
-  // mutates transport state. An empty `peers` list materializes nothing and
-  // still returns a valid pointer (for ranks that use no IB slots).
+  // Materializes `peers` and returns the Transport array indexed by global
+  // rank. An empty peer list initializes no IB transport slots.
   comms::prims::Transport* getMultiPeerTransportsPtr(
       const std::vector<int>& peers);
 
@@ -216,6 +260,13 @@ class CtranComm {
   // Depending on this flag CtranAlgo initialized resources differently
   bool runtimeConn_{}; // if dynamic connection is supported
 
+  // FIXME: runtimeConn_ is NOT the proper flag to gate tmpbuf allocation;
+  // tmpbuf is unrelated to whether a peer connection is created.
+  // tmpbufEagerAlloc_ is the correct control. The eager tmpbuf-slab gate below
+  // still ANDs with !runtimeConn_ to preserve current behavior until MCCL
+  // updates the callsites of this config.
+  bool tmpbufEagerAlloc_{true};
+
   // TODO: change shared_prt to unique_ptr after refactor all ctran code using
   // CtranComm
   std::shared_ptr<ICtran> ctran_;
@@ -232,6 +283,16 @@ class CtranComm {
   std::shared_ptr<meta::comms::colltrace::ICollTrace> colltraceNew_;
   std::shared_ptr<ncclx::memory::memCacheAllocator> memCache_;
   std::unique_ptr<ncclx::CommStateX> statex_;
+
+  // Persistent staging buffers for the small-message AllReduce-ring padding
+  // path (opt-in via MCCL_FORCE_SMALL_MSG_AR_RING, driven by
+  // ctranAllReduceRingSmallMsg). Lazily allocated on first use, grown on
+  // demand, and reused across collectives; freed in destroy(). Remain nullptr
+  // when the feature is unused.
+  void* smallMsgStageSrc_{nullptr};
+  void* smallMsgStageDst_{nullptr};
+  size_t smallMsgStageBytes_{0};
+
   // AMD carve-out only: ENABLE_PRIMS is on for every non-AMD build (see
   // comms/ctran/def_build.bzl), so these members exist everywhere except AMD.
   // The guard changes CtranComm's layout, so consumers must compile with a
@@ -239,6 +300,8 @@ class CtranComm {
 #if defined(ENABLE_PRIMS)
   std::unique_ptr<comms::prims::MultiPeerTransport> multiPeerTransport_;
   std::unique_ptr<comms::prims::PipesTrace> pipesTrace_;
+  std::unique_ptr<ctran::algos::OrderedWorkStreamGuard>
+      primsOrderedWorkStreamGuard_;
 #endif // defined(ENABLE_PRIMS)
 
   // Deferred cleanup for CUDA graph resources. CUDA user-object destructor
@@ -274,8 +337,18 @@ class CtranComm {
       const std::shared_ptr<PersistentCleanup>& cleanup);
   void drainPersistentCleanups();
 
+  // Returns a cached window fully containing [addr, addr+bytes), or nullptr.
+  // Only symmetric windows are cached and they are registered collectively in
+  // the same order, so every rank resolves a buffer to the same window (needed
+  // for symmetric-offset math). Non-owning: do not free a window that a
+  // collective may still use.
+  ctran::CtranWin* findWindowForBuffer(const void* addr, size_t bytes) const {
+    return winCache_.find(addr, bytes);
+  }
+
  private:
   friend class CtranGpe;
+  friend struct ctran::CtranWin;
   friend commResult_t ctranInit(
       CtranComm* comm,
       std::unique_ptr<ctran::IProfilerReporter> reporter,
@@ -297,7 +370,11 @@ class CtranComm {
   std::shared_ptr<AsyncError> asyncErr_;
   std::shared_ptr<Abort> abort_;
   uint64_t ctranOpCount_{0};
+  uint64_t nextWinId_{0};
 
   folly::Synchronized<folly::F14FastSet<std::shared_ptr<PersistentCleanup>>>
       persistentCleanups_;
+
+  // Per-comm window range cache backing findWindowForBuffer() above.
+  ctran::WinCache winCache_;
 };

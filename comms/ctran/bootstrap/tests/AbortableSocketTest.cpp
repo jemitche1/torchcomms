@@ -1,10 +1,13 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+#include <atomic>
 #include <chrono>
 #include <optional>
 #include <semaphore>
 #include <thread>
 
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 
 #include <gtest/gtest.h>
@@ -31,7 +34,7 @@ class AbortableServerSocketTest : public ::testing::Test {
 
  protected:
   void createAbortableServerSocket() {
-    serverAbort = ctran::utils::createAbort(/*enabled=*/true);
+    serverAbort = comms::fault_tolerance::createAbort(/*enabled=*/true);
 
     server.emplace(1, serverAbort);
     EXPECT_EQ(server->getFd(), -1);
@@ -46,7 +49,7 @@ class AbortableServerSocketTest : public ::testing::Test {
     EXPECT_EQ(serverAddr.getIPAddress().str(), "::1");
   }
 
-  std::shared_ptr<ctran::utils::Abort> serverAbort;
+  std::shared_ptr<comms::fault_tolerance::Abort> serverAbort;
   std::optional<ctran::bootstrap::AbortableServerSocket> server;
   folly::SocketAddress serverAddr;
 };
@@ -67,7 +70,7 @@ class AbortableSocketTest : public AbortableServerSocketTest {
 
  protected:
   void createClientSocket() {
-    clientAbort = ctran::utils::createAbort(/*enabled=*/true);
+    clientAbort = comms::fault_tolerance::createAbort(/*enabled=*/true);
     client = ctran::bootstrap::AbortableSocket(clientAbort);
 
     EXPECT_EQ(0, client.connect(serverAddr, "lo"));
@@ -84,7 +87,7 @@ class AbortableSocketTest : public AbortableServerSocketTest {
         acceptedClient->getPeerAddress().describe());
   }
 
-  std::shared_ptr<ctran::utils::Abort> clientAbort;
+  std::shared_ptr<comms::fault_tolerance::Abort> clientAbort;
   ctran::bootstrap::AbortableSocket client;
   std::unique_ptr<ctran::bootstrap::ISocket> acceptedClient;
 };
@@ -183,10 +186,10 @@ TEST_F(AbortableSocketTest, ConnectionRefused) {
     }
   }
 
-  clientAbort->Set();
+  clientAbort->setAbort();
   connectThread.join();
   EXPECT_TRUE(sem.try_acquire_for(1ms));
-  EXPECT_TRUE(clientAbort->Test());
+  EXPECT_TRUE(clientAbort->isAborted());
 }
 
 TEST_F(AbortableSocketTest, MultipleConnectionAttempts) {
@@ -202,7 +205,7 @@ TEST_F(AbortableSocketTest, MultipleConnectionAttempts) {
   // Connect client to the server. It may experience few connect errors but
   // retry will eventually make it succeed
   XLOG(INFO) << "Connecting to server..";
-  auto abortCtrl = ctran::utils::createAbort(/*enabled=*/true);
+  auto abortCtrl = comms::fault_tolerance::createAbort(/*enabled=*/true);
   ctran::bootstrap::AbortableSocket client1(abortCtrl);
   std::atomic<int> result{-1};
   std::thread connectThread([&]() {
@@ -211,7 +214,7 @@ TEST_F(AbortableSocketTest, MultipleConnectionAttempts) {
 
   std::this_thread::sleep_for(500ms);
   EXPECT_EQ(result.load(), -1);
-  abortCtrl->Set();
+  abortCtrl->setAbort();
   connectThread.join();
   EXPECT_EQ(result.load(), ECONNABORTED);
 }
@@ -342,7 +345,7 @@ TEST_F(AbortableSocketTest, BindAndUnbind) {
 
 TEST_F(AbortableServerSocketTest, AcceptTimeout) {
   std::chrono::milliseconds timeout{250ms};
-  serverAbort->SetTimeout(timeout);
+  serverAbort->startTimeout(timeout);
 
   auto startTime = std::chrono::steady_clock::now();
   auto maybeClient = server->acceptSocket();
@@ -368,13 +371,13 @@ TEST_F(AbortableServerSocketTest, AcceptTimeout) {
 // time, and verifies the operation timed out within the expected bounds
 template <typename OperationFn>
 void testTimeoutOperation(
-    std::shared_ptr<ctran::utils::Abort> abortObj,
+    std::shared_ptr<comms::fault_tolerance::Abort> abortObj,
     std::chrono::milliseconds timeout,
     OperationFn operation,
     std::optional<std::chrono::milliseconds> minElapsed = std::nullopt,
     std::optional<std::chrono::milliseconds> maxElapsed = std::nullopt) {
-  abortObj->SetTimeout(timeout);
-  ASSERT_TRUE(abortObj->HasTimeout());
+  abortObj->startTimeout(timeout);
+  ASSERT_TRUE(abortObj->isTimeoutActive());
 
   auto startTime = std::chrono::steady_clock::now();
   int result = operation();
@@ -555,7 +558,7 @@ TEST_F(AbortableServerSocketTest, ShutdownThreadSafety) {
 // separate thread, aborts it after a delay, and verifies it was aborted
 template <typename OperationFn>
 void testAbortBlockingOperation(
-    std::shared_ptr<ctran::utils::Abort> abortObj,
+    std::shared_ptr<comms::fault_tolerance::Abort> abortObj,
     OperationFn operation,
     std::chrono::milliseconds delayBeforeAbort = 150ms) {
   std::atomic<int> operationResult{-1};
@@ -573,10 +576,10 @@ void testAbortBlockingOperation(
   // Give it some time to get into blocking state
   std::this_thread::sleep_for(delayBeforeAbort);
 
-  EXPECT_FALSE(abortObj->Test());
+  EXPECT_FALSE(abortObj->isAborted());
 
   // Abort the operation
-  abortObj->Set();
+  abortObj->setAbort();
 
   // Wait for operation thread to complete
   operationThread.join();
@@ -589,7 +592,7 @@ void testAbortBlockingOperation(
 
 // Test aborting connect operation with retries
 TEST_F(AbortableSocketTest, AbortOnConnectWaiting) {
-  auto abortObj = ctran::utils::createAbort(/*enabled=*/true);
+  auto abortObj = comms::fault_tolerance::createAbort(/*enabled=*/true);
   ctran::bootstrap::AbortableSocket client(abortObj);
   folly::SocketAddress unreachableAddr("::1", 9999);
 
@@ -625,7 +628,7 @@ TEST_F(AbortableSocketTest, AbortAcceptConcurrent) {
   });
 
   std::this_thread::sleep_for(250ms);
-  serverAbort->Set();
+  serverAbort->setAbort();
 
   // Wait for threads to complete
   acceptThread.join();
@@ -639,14 +642,14 @@ TEST_F(AbortableSocketTest, AbortAcceptConcurrent) {
 // This validates that the timeout mechanism properly triggers abort during
 // connection establishment attempts
 TEST_F(AbortableSocketTest, ConnectTimeout) {
-  auto abort = ctran::utils::createAbort(/*enabled=*/true);
+  auto abort = comms::fault_tolerance::createAbort(/*enabled=*/true);
   ctran::bootstrap::AbortableSocket client(abort);
 
   // Try to connect to unreachable address with short timeout
   folly::SocketAddress unreachableAddr("::1", 9999);
 
   // Set timeout that will expire during connection attempts
-  abort->SetTimeout(100ms);
+  abort->startTimeout(100ms);
 
   auto startTime = std::chrono::steady_clock::now();
   int result = client.connect(unreachableAddr, "lo");
@@ -655,8 +658,8 @@ TEST_F(AbortableSocketTest, ConnectTimeout) {
 
   // Should have timed out via the abort mechanism
   EXPECT_TRUE(result == ECONNABORTED || result == ETIMEDOUT);
-  EXPECT_TRUE(abort->Test());
-  EXPECT_TRUE(abort->TimedOut());
+  EXPECT_TRUE(abort->isAborted());
+  EXPECT_TRUE(abort->isTimedOut());
 
   // Should complete within reasonable time after timeout
   EXPECT_GE(elapsed, 100ms);
@@ -732,9 +735,9 @@ TEST_F(AbortableSocketTest, AbortSendRecvConcurrent) {
 
   std::this_thread::sleep_for(50ms);
 
-  clientAbort->Set();
-  serverAbort->Set();
-  EXPECT_TRUE(clientAbort->Test());
+  clientAbort->setAbort();
+  serverAbort->setAbort();
+  EXPECT_TRUE(clientAbort->isAborted());
 
   if (recvThread.joinable()) {
     recvThread.join();
@@ -765,10 +768,10 @@ TEST_F(AbortableSocketTest, AbortSendRecvConcurrent) {
 // ECONNABORTED
 template <typename OperationFn>
 void testOperationAfterAbort(
-    std::shared_ptr<ctran::utils::Abort> abortObj,
+    std::shared_ptr<comms::fault_tolerance::Abort> abortObj,
     OperationFn operation,
     std::chrono::milliseconds maxElapsed = 500ms) {
-  abortObj->Set();
+  abortObj->setAbort();
 
   auto startTime = std::chrono::steady_clock::now();
   int result = operation();
@@ -796,7 +799,7 @@ TEST_F(AbortableSocketTest, RecvAfterAbort) {
 }
 
 TEST_F(AbortableSocketTest, ConnectAfterAbort) {
-  auto abortObj = ctran::utils::createAbort(/*enabled=*/true);
+  auto abortObj = comms::fault_tolerance::createAbort(/*enabled=*/true);
   ctran::bootstrap::AbortableSocket client(abortObj);
   folly::SocketAddress unreachableAddr("::1", 9999);
 
@@ -812,4 +815,162 @@ TEST_F(AbortableSocketTest, AcceptAfterAbort) {
     auto maybeClient = server->acceptSocket();
     return maybeClient.hasError() ? maybeClient.error() : 0;
   });
+}
+
+//
+// Test Group #7: Signal Interruption
+//
+
+namespace {
+
+void noopSignalHandler(int /* signum */) {}
+
+// Installs a SIGUSR1 handler for the duration of a test. sigaction() is used
+// rather than signal(), which implies SA_RESTART on glibc.
+class ScopedInterruptingSignal {
+ public:
+  ScopedInterruptingSignal() {
+    struct sigaction sa{};
+    sa.sa_handler = noopSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    EXPECT_EQ(0, ::sigaction(SIGUSR1, &sa, &prev_));
+  }
+
+  ~ScopedInterruptingSignal() {
+    ::sigaction(SIGUSR1, &prev_, nullptr);
+  }
+
+ private:
+  struct sigaction prev_{};
+};
+
+// Repeatedly delivers SIGUSR1 to a single target thread. The target must not
+// be joined until stop() returns, so that its pthread_t stays valid.
+class SignalStorm {
+ public:
+  explicit SignalStorm(pthread_t target)
+      : thread_([this, target]() {
+          while (!stop_.load()) {
+            ::pthread_kill(target, SIGUSR1);
+            std::this_thread::sleep_for(1ms);
+          }
+        }) {}
+
+  ~SignalStorm() {
+    stop();
+  }
+
+  void stop() {
+    if (thread_.joinable()) {
+      stop_ = true;
+      thread_.join();
+    }
+  }
+
+ private:
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+};
+
+// Long enough to interrupt the target many times over.
+constexpr auto kSignalStormDuration = 100ms;
+
+} // namespace
+
+// A signal delivered while acceptSocket() is parked must not be reported to the
+// caller as a socket error.
+TEST_F(AbortableServerSocketTest, AcceptSocketSurvivesSignalInterruption) {
+  ScopedInterruptingSignal signalGuard;
+
+  std::atomic<int> acceptError{-1};
+  std::atomic<bool> accepted{false};
+  folly::Baton<> parked;
+
+  std::thread acceptThread([&]() {
+    parked.post();
+    auto maybeClient = server->acceptSocket();
+    if (maybeClient.hasError()) {
+      acceptError = maybeClient.error();
+    } else {
+      accepted = maybeClient.value() != nullptr;
+      maybeClient.value()->close();
+    }
+  });
+
+  parked.wait();
+  SignalStorm storm(acceptThread.native_handle());
+  std::this_thread::sleep_for(kSignalStormDuration);
+
+  ctran::bootstrap::AbortableSocket client;
+  ASSERT_EQ(0, client.connect(serverAddr, "lo"));
+  std::this_thread::sleep_for(50ms);
+
+  storm.stop();
+  acceptThread.join();
+
+  EXPECT_TRUE(accepted.load());
+  EXPECT_EQ(acceptError.load(), -1);
+  EXPECT_FALSE(serverAbort->isAborted());
+  EXPECT_EQ(0, client.close());
+}
+
+// Retrying on EINTR must not defeat the abort: acceptSocket() still has to
+// return promptly while the interruptions keep coming.
+TEST_F(AbortableServerSocketTest, AcceptSocketAbortsWhileSignalInterrupted) {
+  ScopedInterruptingSignal signalGuard;
+
+  std::atomic<int> acceptError{-1};
+  folly::Baton<> parked;
+  folly::Baton<> finished;
+
+  std::thread acceptThread([&]() {
+    parked.post();
+    auto maybeClient = server->acceptSocket();
+    acceptError = maybeClient.hasError() ? maybeClient.error() : 0;
+    finished.post();
+  });
+
+  parked.wait();
+  SignalStorm storm(acceptThread.native_handle());
+  std::this_thread::sleep_for(kSignalStormDuration);
+
+  serverAbort->setAbort();
+  const bool returnedPromptly = finished.try_wait_for(1s);
+
+  storm.stop();
+  acceptThread.join();
+
+  EXPECT_TRUE(returnedPromptly);
+  EXPECT_EQ(acceptError.load(), ECONNABORTED);
+}
+
+// A signal delivered while recv() waits for readability must not truncate the
+// transfer into a spurious ETIMEDOUT.
+TEST_F(AbortableSocketTest, RecvSurvivesSignalInterruption) {
+  ScopedInterruptingSignal signalGuard;
+
+  const std::string payload = "interrupted-but-intact";
+  std::string received(payload.size(), '\0');
+  std::atomic<int> recvResult{-1};
+  folly::Baton<> parked;
+
+  std::thread recvThread([&]() {
+    parked.post();
+    recvResult = acceptedClient->recv(received.data(), received.size());
+  });
+
+  parked.wait();
+  SignalStorm storm(recvThread.native_handle());
+  std::this_thread::sleep_for(kSignalStormDuration);
+
+  ASSERT_EQ(0, client.send(payload.data(), payload.size()));
+  std::this_thread::sleep_for(50ms);
+
+  storm.stop();
+  recvThread.join();
+
+  EXPECT_EQ(recvResult.load(), 0);
+  EXPECT_EQ(received, payload);
+  EXPECT_FALSE(serverAbort->isAborted());
 }

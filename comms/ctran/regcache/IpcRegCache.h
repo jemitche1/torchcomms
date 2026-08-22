@@ -18,6 +18,7 @@
 #include "comms/ctran/bootstrap/AsyncSocket.h"
 #include "comms/ctran/regcache/IpcRegCacheBase.h"
 #include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 
 namespace ctran {
 
@@ -198,7 +199,9 @@ class IpcRegCache {
       ctran::regcache::IpcDesc& ipcDesc,
       std::vector<ctran::utils::CtranIpcSegDesc>& extraSegments) {
     if (ipcRegElem == nullptr) {
-      CLOGF(ERR, "CTRAN-REGCACHE: ipcRegElem is nullptr in exportMem");
+      CTRAN_ERR(
+          commInvalidArgument,
+          "CTRAN-REGCACHE: ipcRegElem is nullptr in exportMem");
       return commInvalidArgument;
     }
     auto reg = reinterpret_cast<ctran::regcache::IpcRegElem*>(ipcRegElem);

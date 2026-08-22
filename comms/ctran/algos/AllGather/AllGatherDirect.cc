@@ -8,10 +8,10 @@
 #include "comms/ctran/algos/CtranAlgo.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/profiler/Profiler.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/ExtUtils.h"
 
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 CTRAN_DATATYPE_TO_FUNC_MAPPER(kernFnMap, ncclKernelAllGatherCtranDirect);
 
@@ -110,8 +110,8 @@ static commResult_t impl(
       // Wait for receiving remote recv buffer from a local peer
       comm->ctran_->mapper->waitRequest(irecvReq[pRank].get());
       if (remoteAccessKeys[pRank].backend != CtranMapperBackend::NVL) {
-        CLOGF(
-            ERR,
+        CTRAN_ERR(
+            commInternalError,
             "NVLink backend not available between rank {} and {}",
             rank,
             pRank);
@@ -210,8 +210,10 @@ static inline unsigned int getThreadBlockSize() {
   // If first time call, query cuda recommended blockSize
   if (bestThreadBlockSize == 0) {
     int minGridSize = 0;
-    XCHECK(kernFnMap.contains(commFloat32))
-        << "kernFnMap does not contain datatype";
+    CTRAN_LOG_IF(
+        FATAL,
+        !kernFnMap.contains(commFloat32),
+        "Check failed: kernFnMap.contains(commFloat32): kernFnMap does not contain datatype");
     FB_CUDACHECK(cudaOccupancyMaxPotentialBlockSize(
         &minGridSize,
         (int*)&bestThreadBlockSize,
@@ -304,8 +306,11 @@ commResult_t ctranAllGatherDirect(
       comm,
       stream));
   FB_COMMCHECK(setupPlan(comm, opGroup, config));
-  XCHECK(kernFnMap.contains(datatype))
-      << "kernFnMap does not contain datatype " << datatype;
+  CTRAN_LOG_IF(
+      FATAL,
+      !kernFnMap.contains(datatype),
+      "Check failed: kernFnMap.contains(datatype): kernFnMap does not contain datatype {}",
+      datatype);
   FB_COMMCHECK(comm->ctran_->gpe->submit(
       std::move(opGroup), impl, config, kernFnMap.at(datatype)));
   if (extraCopyBuff != nullptr) {

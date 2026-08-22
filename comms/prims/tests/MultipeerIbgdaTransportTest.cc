@@ -5,10 +5,11 @@
 #include <folly/init/Init.h>
 #include <folly/logging/xlog.h>
 #include <array>
-
 #include <chrono>
+
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #ifdef __HIP_PLATFORM_AMD__
@@ -127,7 +128,7 @@ class TestIbTransport {
     if (ibgda_) {
       return P2pIbTransportDevice(ibgda_->getP2pTransportDevice(peerRank));
     }
-    if (config_.ibLazyConnect && !ibrc_->isPeerMaterialized(peerRank)) {
+    if (!ibrc_->isPeerMaterialized(peerRank)) {
       ibrc_->materializePeer(peerRank);
     }
     return P2pIbTransportDevice(ibrc_->getP2pTransportDeviceSlot(peerRank));
@@ -1329,7 +1330,7 @@ TEST_F(
         cudaMemcpyDeviceToHost));
 
     const int64_t expectedReservation =
-        static_cast<int64_t>(dataBufferSize / numBlocks);
+        static_cast<int64_t>(dataBufferSize / numBlocks / pipelineDepth);
     EXPECT_EQ(output[0], expectedReservation);
     EXPECT_EQ(output[1], expectedReservation);
   } catch (const std::exception& e) {
@@ -1481,6 +1482,131 @@ TEST_F(
   }
 }
 
+// ANS (nvcompdx) is NVIDIA-only; the compressed CopyOp is not built on AMD/HIP.
+#ifndef __HIP_PLATFORM_AMD__
+// Round-trips a payload through the variable-size (ANS-compressed) CopyOp over
+// the blocking send()/recv() path added in D111967119: rank 0 compresses+sends,
+// rank 1 recvs+decompresses, and the received bytes must match the sent
+// pattern. The channel window is sized so one worst-case-expanded compressed
+// chunk (~1.3x MaxUncompBytes) fits in a per-block staging slot
+// (perBlockSlot = perChannelSize / pipelineDepth). `maxSignalBytes == 0`
+// exercises the transport's 0-sentinel (chunk size picked via
+// AnsCompress::max_safe_chunk_size_for_slot()); a non-zero value drives the
+// explicit signaled-chunk-size path. Both ranks pass the same value.
+namespace {
+void runIbgdaAnsBlockingRoundTrip(
+    int localRank,
+    int globalRank,
+    int numRanks,
+    std::size_t maxSignalBytes) {
+  const std::size_t nbytes = 2 * 1024 * 1024; // 2 MiB payload
+  const std::size_t dataBufferSize = 8 * 1024 * 1024; // 8 MiB channel window
+  const int pipelineDepth = 2; // => perBlockSlot = 4 MiB
+  const int numBlocks = 1;
+  const int blockSize = 128; // NumWarps = 4 (keeps ANS+transport kernel within
+                             // the SM register/shared-mem budget)
+  const int peerRank = (globalRank == 0) ? 1 : 0;
+  const uint8_t pattern = 0x5C;
+
+  try {
+    MultipeerIbgdaTransportConfig config{
+        .cudaDevice = localRank,
+        .perChannelSize = dataBufferSize / numBlocks,
+        .max_num_channels = numBlocks,
+        .pipelineDepth = pipelineDepth,
+    };
+
+    auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+    auto transport = std::make_unique<MultipeerIbgdaTransport>(
+        globalRank, numRanks, bootstrap, config);
+    transport->exchange();
+
+    P2pIbgdaTransportDevice* peerTransportPtr =
+        transport->getP2pTransportDevice(peerRank);
+    DeviceBuffer sendBuffer(nbytes);
+    DeviceBuffer recvBuffer(nbytes);
+    DeviceBuffer errorCountBuf(sizeof(int));
+    auto* d_errorCount = static_cast<int*>(errorCountBuf.get());
+
+    if (globalRank == 0) {
+      test::fillBufferWithPattern(
+          sendBuffer.get(), nbytes, pattern, numBlocks, blockSize);
+    } else {
+      CUDACHECK_TEST(cudaMemset(recvBuffer.get(), 0, nbytes));
+    }
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    if (globalRank == 0) {
+      test::testSendRecvAns(
+          peerTransportPtr,
+          sendBuffer.get(),
+          nbytes,
+          maxSignalBytes,
+          /*send=*/true,
+          numBlocks,
+          blockSize);
+    } else {
+      test::testSendRecvAns(
+          peerTransportPtr,
+          recvBuffer.get(),
+          nbytes,
+          maxSignalBytes,
+          /*send=*/false,
+          numBlocks,
+          blockSize);
+    }
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    if (globalRank == 1) {
+      CUDACHECK_TEST(cudaMemset(d_errorCount, 0, sizeof(int)));
+      test::verifyBufferPattern(
+          recvBuffer.get(),
+          nbytes,
+          pattern,
+          d_errorCount,
+          numBlocks,
+          blockSize);
+      CUDACHECK_TEST(cudaDeviceSynchronize());
+
+      int h_errorCount = 0;
+      CUDACHECK_TEST(cudaMemcpy(
+          &h_errorCount, d_errorCount, sizeof(int), cudaMemcpyDeviceToHost));
+      EXPECT_EQ(h_errorCount, 0)
+          << "ANS compressed send/recv corrupted " << h_errorCount << " bytes";
+    }
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "IBGDA transport not available: " << e.what();
+  }
+}
+} // namespace
+
+// max_signal_bytes == 0: transport derives the chunk size via the 0-sentinel
+// (AnsCompress::max_safe_chunk_size_for_slot()).
+TEST_F(MultipeerIbgdaTransportTestFixture, IbgdaAnsBlockingSendRecvRoundTrip) {
+  if (numRanks != 2) {
+    GTEST_SKIP() << "Skipping test: requires exactly 2 ranks, got " << numRanks;
+  }
+  runIbgdaAnsBlockingRoundTrip(
+      localRank, globalRank, numRanks, /*maxSignalBytes=*/0);
+}
+
+// Explicit 256 KiB signaled chunk size (== PIPES_ANS_DEFAULT_MAX_UNCOMP_BYTES):
+// exercises the non-zero max_signal_bytes path (chunkSize = 256 KiB & ~511;
+// worst_case_chunk_stride fits the 4 MiB perBlockSlot).
+TEST_F(
+    MultipeerIbgdaTransportTestFixture,
+    IbgdaAnsBlockingSendRecvRoundTripMaxSignal256K) {
+  if (numRanks != 2) {
+    GTEST_SKIP() << "Skipping test: requires exactly 2 ranks, got " << numRanks;
+  }
+  runIbgdaAnsBlockingRoundTrip(
+      localRank, globalRank, numRanks, /*maxSignalBytes=*/256 * 1024);
+}
+#endif // __HIP_PLATFORM_AMD__
+
 TEST_F(
     MultipeerIbgdaTransportTestFixture,
     ProgressSendRecvBackpressureAcrossStagingWrap) {
@@ -1519,7 +1645,9 @@ TEST_F(
     DeviceBuffer sendBuffer(nbytes);
     DeviceBuffer recvBuffer(nbytes);
     DeviceBuffer errorCountBuf(sizeof(int));
+    DeviceBuffer waitingCountBuf(numBlocks * sizeof(uint64_t));
     auto* d_errorCount = static_cast<int*>(errorCountBuf.get());
+    auto* d_waitingCount = static_cast<uint64_t*>(waitingCountBuf.get());
 
     auto runDirection = [&](int senderRank, uint8_t pattern) {
       const bool isSender = globalRank == senderRank;
@@ -1529,6 +1657,8 @@ TEST_F(
       } else {
         CUDACHECK_TEST(cudaMemset(recvBuffer.get(), 0, nbytes));
       }
+      CUDACHECK_TEST(
+          cudaMemset(d_waitingCount, 0, numBlocks * sizeof(uint64_t)));
       CUDACHECK_TEST(cudaDeviceSynchronize());
       MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
@@ -1539,9 +1669,22 @@ TEST_F(
           maxSignalBytes,
           isSender,
           numBlocks,
-          blockSize);
+          blockSize,
+          d_waitingCount);
       CUDACHECK_TEST(cudaDeviceSynchronize());
       MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+      if (isSender) {
+        uint64_t waitingCount = 0;
+        CUDACHECK_TEST(cudaMemcpy(
+            &waitingCount,
+            d_waitingCount,
+            sizeof(waitingCount),
+            cudaMemcpyDeviceToHost));
+        EXPECT_GT(waitingCount, 0)
+            << "progress send did not observe backpressure across staging "
+               "reuse";
+      }
 
       if (!isSender) {
         CUDACHECK_TEST(cudaMemset(d_errorCount, 0, sizeof(int)));
@@ -1570,6 +1713,128 @@ TEST_F(
     GTEST_SKIP() << "IBGDA transport not available: " << e.what();
   }
 }
+
+#ifndef __HIP_PLATFORM_AMD__
+TEST_F(
+    MultipeerIbgdaTransportTestFixture,
+    WarpProxyQueueBackpressureAndSlotReuseAcross1024Commands) {
+  if (numRanks != 2) {
+    GTEST_SKIP() << "Skipping test: requires exactly 2 ranks, got " << numRanks;
+  }
+
+  constexpr std::size_t numChunks = 1024;
+  constexpr std::size_t maxSignalBytes = 1024;
+  constexpr int pipelineDepth = 16;
+  constexpr std::size_t perChannelSize =
+      static_cast<std::size_t>(pipelineDepth) * maxSignalBytes;
+  constexpr std::size_t nbytes = numChunks * maxSignalBytes;
+  constexpr uint32_t queueDepth = 1;
+  constexpr uint8_t patternBase = 0xA7;
+  constexpr std::size_t patternPeriod = 251;
+  constexpr std::size_t patternChunkStride = 17;
+  static_assert(numChunks % pipelineDepth == 0);
+  static_assert(numChunks / pipelineDepth == 64);
+  static_assert(perChannelSize / pipelineDepth == maxSignalBytes);
+  const bool isSender = globalRank == 0;
+  const int peerRank = isSender ? 1 : 0;
+
+  std::unique_ptr<MultipeerIbgdaTransport> transport;
+  try {
+    MultipeerIbgdaTransportConfig config{
+        .cudaDevice = localRank,
+        .perChannelSize = perChannelSize,
+        .max_num_channels = 1,
+        .pipelineDepth = pipelineDepth,
+    };
+    auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+    transport = std::make_unique<MultipeerIbgdaTransport>(
+        globalRank, numRanks, bootstrap, config);
+    transport->exchange();
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "IBGDA transport not available: " << e.what();
+  }
+
+  auto* peerTransport = transport->getP2pTransportDevice(peerRank);
+  DeviceBuffer dataBuffer(nbytes);
+  DeviceBuffer queueFullCountBuffer(sizeof(uint64_t));
+  auto* queueFullCount = static_cast<uint64_t*>(queueFullCountBuffer.get());
+
+  std::vector<uint8_t> expected(nbytes);
+  for (std::size_t i = 0; i < nbytes; ++i) {
+    const std::size_t chunk = i / maxSignalBytes;
+    const std::size_t chunkOffset = i % maxSignalBytes;
+    expected[i] = static_cast<uint8_t>(
+        patternBase +
+        (chunk * patternChunkStride + chunkOffset) % patternPeriod);
+  }
+  if (isSender) {
+    CUDACHECK_TEST(cudaMemcpy(
+        dataBuffer.get(), expected.data(), nbytes, cudaMemcpyHostToDevice));
+  } else {
+    CUDACHECK_TEST(cudaMemset(dataBuffer.get(), 0, nbytes));
+  }
+  CUDACHECK_TEST(cudaMemset(queueFullCount, 0, sizeof(*queueFullCount)));
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+  if (isSender) {
+    test::testWarpProxySendRecv(
+        peerTransport,
+        dataBuffer.get(),
+        nbytes,
+        maxSignalBytes,
+        /*send=*/true,
+        queueDepth,
+        queueFullCount);
+  }
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  if (!isSender) {
+    test::testWarpProxySendRecv(
+        peerTransport,
+        dataBuffer.get(),
+        nbytes,
+        maxSignalBytes,
+        /*send=*/false,
+        queueDepth,
+        /*queueFullCount=*/nullptr);
+  }
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+  if (isSender) {
+    uint64_t hostQueueFullCount = 0;
+    CUDACHECK_TEST(cudaMemcpy(
+        &hostQueueFullCount,
+        queueFullCount,
+        sizeof(hostQueueFullCount),
+        cudaMemcpyDeviceToHost));
+    EXPECT_GT(hostQueueFullCount, 0)
+        << "warp proxy send did not observe command-queue backpressure";
+  }
+
+  if (!isSender) {
+    std::vector<uint8_t> received(nbytes);
+    CUDACHECK_TEST(cudaMemcpy(
+        received.data(), dataBuffer.get(), nbytes, cudaMemcpyDeviceToHost));
+    std::size_t mismatchCount = 0;
+    std::size_t firstMismatch = 0;
+    for (std::size_t i = 0; i < nbytes; ++i) {
+      if (received[i] != expected[i]) {
+        if (mismatchCount == 0) {
+          firstMismatch = i;
+        }
+        ++mismatchCount;
+      }
+    }
+    EXPECT_EQ(mismatchCount, 0)
+        << "warp proxy staging-slot reuse corrupted payload; first mismatch "
+        << "at byte " << firstMismatch << ", expected "
+        << static_cast<int>(expected[firstMismatch]) << ", got "
+        << static_cast<int>(received[firstMismatch]);
+  }
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+}
+#endif
 
 TEST_P(
     MultipeerIbTransportTestFixture,
@@ -1647,6 +1912,378 @@ TEST_P(
     GTEST_SKIP() << backendName(backend())
                  << " transport not available: " << e.what();
   }
+}
+
+TEST_F(
+    MultipeerIbgdaTransportTestFixture,
+    RegisteredSendTailsDrainAndStagingIsolation) {
+  if (numRanks != 2) {
+    GTEST_SKIP() << "Skipping test: requires exactly 2 ranks, got " << numRanks;
+  }
+  if (!test::supportsProgressSendRecv()) {
+    GTEST_SKIP() << "registered-source send is not supported for this build";
+  }
+
+  constexpr std::size_t perChannelSize = 64 * 1024;
+  constexpr int pipelineDepth = 2;
+  constexpr std::size_t pipelineChunk = perChannelSize / pipelineDepth;
+  constexpr std::size_t maxSignalBytes = 4 * 1024;
+  constexpr std::size_t simpleProtocolDataBytes = 16;
+  constexpr int numBlocks = 1;
+  constexpr int blockSize = 128;
+  constexpr uint8_t stagingPoison = 0xA5;
+  constexpr std::size_t zeroByteAfterPostedIndex = 2;
+  const int peerRank = globalRank == 0 ? 1 : 0;
+  const std::array<std::size_t, 8> sizes{
+      0,
+      1,
+      7,
+      simpleProtocolDataBytes - 1,
+      simpleProtocolDataBytes,
+      simpleProtocolDataBytes + 1,
+      pipelineChunk - 1,
+      pipelineChunk + 1,
+  };
+
+  std::unique_ptr<MultipeerIbgdaTransport> transport;
+  try {
+    MultipeerIbgdaTransportConfig config{
+        .cudaDevice = localRank,
+        .perChannelSize = perChannelSize,
+        .max_num_channels = numBlocks,
+        .pipelineDepth = pipelineDepth,
+    };
+    auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+    transport = std::make_unique<MultipeerIbgdaTransport>(
+        globalRank, numRanks, bootstrap, config);
+    transport->exchange();
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "IBGDA transport not available: " << e.what();
+  }
+
+  auto* peerTransport = transport->getP2pTransportDevice(peerRank);
+  DeviceBuffer errorCountBuffer(sizeof(int));
+  DeviceBuffer observationBuffer(sizeof(test::RegisteredSendObservation));
+  auto* errorCount = static_cast<int*>(errorCountBuffer.get());
+  auto* observation =
+      static_cast<test::RegisteredSendObservation*>(observationBuffer.get());
+
+  test::testFillTransportStaging(
+      peerTransport,
+      globalRank == 0,
+      0,
+      perChannelSize,
+      stagingPoison,
+      numBlocks,
+      blockSize);
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+
+  for (std::size_t index = 0; index < sizes.size(); ++index) {
+    const std::size_t nbytes = sizes[index];
+    const std::size_t allocationBytes = nbytes == 0 ? 1 : nbytes;
+    const uint8_t pattern = static_cast<uint8_t>(0x20 + index * 13);
+    DeviceBuffer sendBuffer(allocationBytes);
+    DeviceBuffer recvBuffer(allocationBytes);
+    IbgdaLocalBuffer registeredSource{};
+    if (globalRank == 0) {
+      if (nbytes > 0) {
+        registeredSource = transport->registerBuffer(sendBuffer.get(), nbytes);
+      }
+      test::fillBufferWithPattern(
+          sendBuffer.get(), nbytes, pattern, numBlocks, blockSize);
+      CUDACHECK_TEST(
+          cudaMemset(observation, 0, sizeof(test::RegisteredSendObservation)));
+    } else {
+      CUDACHECK_TEST(cudaMemset(recvBuffer.get(), 0, allocationBytes));
+    }
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    test::testRegisteredSendRecv(
+        peerTransport,
+        registeredSource,
+        recvBuffer.get(),
+        nbytes,
+        maxSignalBytes,
+        globalRank == 0,
+        numBlocks,
+        blockSize,
+        globalRank == 0 ? observation : nullptr,
+        index == 4,
+        globalRank == 0 && nbytes > 0,
+        static_cast<uint8_t>(pattern ^ 0xFF),
+        index == zeroByteAfterPostedIndex);
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    if (globalRank == 0) {
+      test::RegisteredSendObservation hostObservation{};
+      CUDACHECK_TEST(cudaMemcpy(
+          &hostObservation,
+          observation,
+          sizeof(hostObservation),
+          cudaMemcpyDeviceToHost));
+      if (index == 4) {
+        EXPECT_EQ(hostObservation.postedCount, 0);
+      } else if (index == zeroByteAfterPostedIndex) {
+        EXPECT_EQ(hostObservation.postedCount, 2);
+      } else {
+        EXPECT_EQ(hostObservation.postedCount, 1);
+      }
+      EXPECT_EQ(hostObservation.drainedCount, 1);
+    } else {
+      CUDACHECK_TEST(cudaMemset(errorCount, 0, sizeof(int)));
+      test::verifyBufferPattern(
+          recvBuffer.get(), nbytes, pattern, errorCount, numBlocks, blockSize);
+      CUDACHECK_TEST(cudaDeviceSynchronize());
+      int hostErrors = 0;
+      CUDACHECK_TEST(cudaMemcpy(
+          &hostErrors, errorCount, sizeof(hostErrors), cudaMemcpyDeviceToHost));
+      EXPECT_EQ(hostErrors, 0) << "registered send corrupted size " << nbytes;
+    }
+
+    if (index == 1 && globalRank == 1) {
+      CUDACHECK_TEST(cudaMemset(errorCount, 0, sizeof(int)));
+      test::testVerifyTransportStaging(
+          peerTransport,
+          false,
+          1,
+          simpleProtocolDataBytes - 1,
+          stagingPoison,
+          errorCount,
+          numBlocks,
+          blockSize);
+      CUDACHECK_TEST(cudaDeviceSynchronize());
+      int hostErrors = 0;
+      CUDACHECK_TEST(cudaMemcpy(
+          &hostErrors, errorCount, sizeof(hostErrors), cudaMemcpyDeviceToHost));
+      EXPECT_EQ(hostErrors, 0)
+          << "registered send wrote rounded tail bytes into recv staging";
+    }
+    if (globalRank == 0 && nbytes > 0) {
+      transport->deregisterBuffer(sendBuffer.get());
+    }
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  }
+
+  if (globalRank == 0) {
+    CUDACHECK_TEST(cudaMemset(errorCount, 0, sizeof(int)));
+    test::testVerifyTransportStaging(
+        peerTransport,
+        true,
+        0,
+        perChannelSize,
+        stagingPoison,
+        errorCount,
+        numBlocks,
+        blockSize);
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    int hostErrors = 0;
+    CUDACHECK_TEST(cudaMemcpy(
+        &hostErrors, errorCount, sizeof(hostErrors), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(hostErrors, 0)
+        << "registered send modified transport send staging";
+  }
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+}
+
+TEST_F(
+    MultipeerIbgdaTransportTestFixture,
+    RegisteredAndStagedSendShareProtocolCursor) {
+  if (numRanks != 2) {
+    GTEST_SKIP() << "Skipping test: requires exactly 2 ranks, got " << numRanks;
+  }
+  if (!test::supportsProgressSendRecv()) {
+    GTEST_SKIP() << "registered-source send is not supported for this build";
+  }
+
+  constexpr std::size_t perChannelSize = 64 * 1024;
+  constexpr int pipelineDepth = 2;
+  constexpr std::size_t firstBytes = 17 * 1024 + 1;
+  constexpr std::size_t secondBytes = 9 * 1024 + 7;
+  constexpr std::size_t thirdBytes = 40 * 1024 + 17;
+  constexpr std::size_t totalBytes = firstBytes + secondBytes + thirdBytes;
+  constexpr std::size_t maxSignalBytes = 4 * 1024;
+  constexpr int numBlocks = 1;
+  constexpr int blockSize = 128;
+  const int peerRank = globalRank == 0 ? 1 : 0;
+
+  std::unique_ptr<MultipeerIbgdaTransport> transport;
+  try {
+    MultipeerIbgdaTransportConfig config{
+        .cudaDevice = localRank,
+        .perChannelSize = perChannelSize,
+        .max_num_channels = numBlocks,
+        .pipelineDepth = pipelineDepth,
+    };
+    auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+    transport = std::make_unique<MultipeerIbgdaTransport>(
+        globalRank, numRanks, bootstrap, config);
+    transport->exchange();
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "IBGDA transport not available: " << e.what();
+  }
+
+  auto* peerTransport = transport->getP2pTransportDevice(peerRank);
+  DeviceBuffer sendBuffer(totalBytes);
+  DeviceBuffer recvBuffer(totalBytes);
+  DeviceBuffer errorCountBuffer(sizeof(int));
+  auto* errorCount = static_cast<int*>(errorCountBuffer.get());
+  IbgdaLocalBuffer registeredSource{};
+  if (globalRank == 0) {
+    registeredSource = transport->registerBuffer(sendBuffer.get(), totalBytes);
+    test::fillBufferWithPattern(
+        sendBuffer.get(), firstBytes, 0x31, numBlocks, blockSize);
+    test::fillBufferWithPattern(
+        static_cast<char*>(sendBuffer.get()) + firstBytes,
+        secondBytes,
+        0x72,
+        numBlocks,
+        blockSize);
+    test::fillBufferWithPattern(
+        static_cast<char*>(sendBuffer.get()) + firstBytes + secondBytes,
+        thirdBytes,
+        0xB4,
+        numBlocks,
+        blockSize);
+  } else {
+    CUDACHECK_TEST(cudaMemset(recvBuffer.get(), 0, totalBytes));
+  }
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+  test::testMixedRegisteredAndStagedSendRecv(
+      peerTransport,
+      registeredSource,
+      recvBuffer.get(),
+      firstBytes,
+      secondBytes,
+      thirdBytes,
+      maxSignalBytes,
+      globalRank == 0,
+      numBlocks,
+      blockSize);
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+  if (globalRank == 1) {
+    const std::array<std::tuple<std::size_t, std::size_t, uint8_t>, 3> ranges{{
+        {0, firstBytes, 0x31},
+        {firstBytes, secondBytes, 0x72},
+        {firstBytes + secondBytes, thirdBytes, 0xB4},
+    }};
+    for (const auto& [offset, nbytes, pattern] : ranges) {
+      CUDACHECK_TEST(cudaMemset(errorCount, 0, sizeof(int)));
+      test::verifyBufferPattern(
+          static_cast<char*>(recvBuffer.get()) + offset,
+          nbytes,
+          pattern,
+          errorCount,
+          numBlocks,
+          blockSize);
+      CUDACHECK_TEST(cudaDeviceSynchronize());
+      int hostErrors = 0;
+      CUDACHECK_TEST(cudaMemcpy(
+          &hostErrors, errorCount, sizeof(hostErrors), cudaMemcpyDeviceToHost));
+      EXPECT_EQ(hostErrors, 0)
+          << "mixed registered/staged send corrupted range at " << offset;
+    }
+  } else {
+    transport->deregisterBuffer(sendBuffer.get());
+  }
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+}
+
+TEST_F(
+    MultipeerIbgdaTransportTestFixture,
+    RegisteredSendBackpressureAcrossStagingWrap) {
+  if (numRanks != 2) {
+    GTEST_SKIP() << "Skipping test: requires exactly 2 ranks, got " << numRanks;
+  }
+  if (!test::supportsProgressSendRecv()) {
+    GTEST_SKIP() << "registered-source send is not supported for this build";
+  }
+
+  constexpr std::size_t perChannelSize = 64 * 1024;
+  constexpr int pipelineDepth = 2;
+  constexpr std::size_t nbytes = 8 * 1024 * 1024 + 17;
+  constexpr std::size_t maxSignalBytes = 4 * 1024;
+  constexpr int numBlocks = 1;
+  constexpr int blockSize = 128;
+  const int peerRank = globalRank == 0 ? 1 : 0;
+  std::vector<uint8_t> expected(nbytes);
+  for (std::size_t i = 0; i < nbytes; ++i) {
+    const std::size_t generation = i / perChannelSize;
+    expected[i] = static_cast<uint8_t>(generation * 37 + (i % 251));
+  }
+
+  std::unique_ptr<MultipeerIbgdaTransport> transport;
+  try {
+    MultipeerIbgdaTransportConfig config{
+        .cudaDevice = localRank,
+        .perChannelSize = perChannelSize,
+        .max_num_channels = numBlocks,
+        .pipelineDepth = pipelineDepth,
+    };
+    auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+    transport = std::make_unique<MultipeerIbgdaTransport>(
+        globalRank, numRanks, bootstrap, config);
+    transport->exchange();
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "IBGDA transport not available: " << e.what();
+  }
+
+  auto* peerTransport = transport->getP2pTransportDevice(peerRank);
+  DeviceBuffer sendBuffer(nbytes);
+  DeviceBuffer recvBuffer(nbytes);
+  DeviceBuffer observationBuffer(sizeof(test::RegisteredSendObservation));
+  auto* observation =
+      static_cast<test::RegisteredSendObservation*>(observationBuffer.get());
+  IbgdaLocalBuffer registeredSource{};
+  if (globalRank == 0) {
+    registeredSource = transport->registerBuffer(sendBuffer.get(), nbytes);
+    CUDACHECK_TEST(cudaMemcpy(
+        sendBuffer.get(), expected.data(), nbytes, cudaMemcpyHostToDevice));
+    CUDACHECK_TEST(
+        cudaMemset(observation, 0, sizeof(test::RegisteredSendObservation)));
+  } else {
+    CUDACHECK_TEST(cudaMemset(recvBuffer.get(), 0, nbytes));
+  }
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+  test::testRegisteredSendRecv(
+      peerTransport,
+      registeredSource,
+      recvBuffer.get(),
+      nbytes,
+      maxSignalBytes,
+      globalRank == 0,
+      numBlocks,
+      blockSize,
+      globalRank == 0 ? observation : nullptr);
+  CUDACHECK_TEST(cudaDeviceSynchronize());
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+  if (globalRank == 0) {
+    test::RegisteredSendObservation hostObservation{};
+    CUDACHECK_TEST(cudaMemcpy(
+        &hostObservation,
+        observation,
+        sizeof(hostObservation),
+        cudaMemcpyDeviceToHost));
+    EXPECT_GT(hostObservation.waitingCount, 0);
+    EXPECT_EQ(hostObservation.postedCount, 1);
+    EXPECT_EQ(hostObservation.drainedCount, 1);
+    transport->deregisterBuffer(sendBuffer.get());
+  } else {
+    std::vector<uint8_t> received(nbytes);
+    CUDACHECK_TEST(cudaMemcpy(
+        received.data(), recvBuffer.get(), nbytes, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(received, expected)
+        << "registered send corrupted data across slot wrap";
+  }
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 }
 
 // =============================================================================
@@ -1865,6 +2502,233 @@ TEST_F(
   } catch (const std::exception& e) {
     GTEST_SKIP() << "IBGDA transport not available: " << e.what();
   }
+}
+
+void runNicDoneMultiQpSendRecvStress(
+    int globalRank,
+    int localRank,
+    int numRanks,
+    std::size_t chunkSize) {
+  if (numRanks != 2) {
+    GTEST_SKIP() << "Skipping test: requires exactly 2 ranks, got " << numRanks;
+  }
+  if (!test::supportsProgressSendRecv()) {
+    GTEST_SKIP() << "progress send/recv is not supported for this build";
+  }
+
+  constexpr std::size_t nbytes = 2ULL * 1024 * 1024 * 1024; // 2 GiB
+  constexpr int kIterations = 100;
+  constexpr std::size_t dataBufferSize = 8ULL * 1024 * 1024;
+  constexpr int numBlocks = 8;
+  constexpr int blockSize = 128;
+  constexpr int pipelineDepth = 2;
+  constexpr int qpsPerConnection = 2;
+  const int peerRank = (globalRank == 0) ? 1 : 0;
+
+  try {
+    MultipeerIbgdaTransportConfig config{
+        .cudaDevice = localRank,
+        .perChannelSize = dataBufferSize / numBlocks,
+        .max_num_channels = numBlocks,
+        .pipelineDepth = pipelineDepth,
+        .qpsPerConnection = qpsPerConnection,
+    };
+
+    auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+    auto transport = std::make_unique<MultipeerIbgdaTransport>(
+        globalRank, numRanks, bootstrap, config);
+    transport->exchange();
+
+    P2pIbgdaTransportDevice* peerTransportPtr =
+        transport->getP2pTransportDevice(peerRank);
+    DeviceBuffer sendBuffer(nbytes);
+    DeviceBuffer recvBuffer(nbytes);
+    DeviceBuffer errorCountBuf(sizeof(int));
+    auto* d_errorCount = static_cast<int*>(errorCountBuf.get());
+    const bool isSender = globalRank == 0;
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    for (int iter = 0; iter < kIterations; ++iter) {
+      SCOPED_TRACE(
+          ::testing::Message()
+          << "chunkSize=" << chunkSize << " iteration=" << iter);
+      const uint8_t testPattern = static_cast<uint8_t>(0x30 + (iter & 0x7F));
+      if (isSender) {
+        test::fillBufferWithPattern(
+            sendBuffer.get(), nbytes, testPattern, numBlocks, blockSize);
+      } else {
+        CUDACHECK_TEST(cudaMemset(recvBuffer.get(), 0, nbytes));
+      }
+      CUDACHECK_TEST(cudaDeviceSynchronize());
+      MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+      test::testSendRecv(
+          peerTransportPtr,
+          isSender ? sendBuffer.get() : recvBuffer.get(),
+          nbytes,
+          chunkSize,
+          isSender,
+          numBlocks,
+          blockSize);
+      const cudaError_t syncErr = cudaDeviceSynchronize();
+      ASSERT_EQ(syncErr, cudaSuccess)
+          << "rank " << globalRank
+          << " send/recv failed: " << cudaGetErrorString(syncErr);
+
+      if (!isSender) {
+        CUDACHECK_TEST(cudaMemset(d_errorCount, 0, sizeof(int)));
+        test::verifyBufferPattern(
+            recvBuffer.get(),
+            nbytes,
+            testPattern,
+            d_errorCount,
+            numBlocks,
+            blockSize);
+        CUDACHECK_TEST(cudaDeviceSynchronize());
+
+        int h_errorCount = 0;
+        CUDACHECK_TEST(cudaMemcpy(
+            &h_errorCount, d_errorCount, sizeof(int), cudaMemcpyDeviceToHost));
+        ASSERT_EQ(h_errorCount, 0) << "multi-QP NIC_DONE send/recv corrupted "
+                                   << h_errorCount << " bytes";
+      }
+      MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    }
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "IBGDA transport not available: " << e.what();
+  }
+}
+
+TEST_F(
+    MultipeerIbgdaTransportTestFixture,
+    NicDoneMultiQpSendRecv512KiBNoCorruption) {
+  runNicDoneMultiQpSendRecvStress(
+      globalRank, localRank, numRanks, 512ULL * 1024);
+}
+
+TEST_F(
+    MultipeerIbgdaTransportTestFixture,
+    NicDoneMultiQpSendRecv64KiBNoCorruption) {
+  runNicDoneMultiQpSendRecvStress(
+      globalRank, localRank, numRanks, 64ULL * 1024);
+}
+
+void runNicDoneMultiQpMutableMaxSignalBytes(
+    int globalRank,
+    int localRank,
+    int numRanks) {
+  if (numRanks != 2) {
+    GTEST_SKIP() << "Skipping test: requires exactly 2 ranks, got " << numRanks;
+  }
+  if (!test::supportsProgressSendRecv()) {
+    GTEST_SKIP() << "progress send/recv is not supported for this build";
+  }
+
+  constexpr std::size_t nbytes = 64ULL * 1024 * 1024;
+  constexpr int kIterations = 40;
+  constexpr std::size_t dataBufferSize = 8ULL * 1024 * 1024;
+  constexpr int numBlocks = 8;
+  constexpr int blockSize = 128;
+  constexpr int pipelineDepth = 2;
+  constexpr int qpsPerConnection = 2;
+  constexpr std::size_t perBlockSlot =
+      (dataBufferSize / numBlocks) / pipelineDepth;
+  const std::array<std::size_t, 2> maxSignalBytes = {
+      64ULL * 1024,
+      perBlockSlot,
+  };
+  const int peerRank = (globalRank == 0) ? 1 : 0;
+
+  try {
+    MultipeerIbgdaTransportConfig config{
+        .cudaDevice = localRank,
+        .perChannelSize = dataBufferSize / numBlocks,
+        .max_num_channels = numBlocks,
+        .pipelineDepth = pipelineDepth,
+        .qpsPerConnection = qpsPerConnection,
+    };
+
+    auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
+    auto transport = std::make_unique<MultipeerIbgdaTransport>(
+        globalRank, numRanks, bootstrap, config);
+    transport->exchange();
+
+    P2pIbgdaTransportDevice* peerTransportPtr =
+        transport->getP2pTransportDevice(peerRank);
+    DeviceBuffer sendBuffer(nbytes);
+    DeviceBuffer recvBuffer(nbytes);
+    DeviceBuffer errorCountBuf(sizeof(int));
+    auto* d_errorCount = static_cast<int*>(errorCountBuf.get());
+    const bool isSender = globalRank == 0;
+
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    for (int iter = 0; iter < kIterations; ++iter) {
+      for (std::size_t phase = 0; phase < maxSignalBytes.size(); ++phase) {
+        const std::size_t chunkSize = maxSignalBytes[phase];
+        SCOPED_TRACE(
+            ::testing::Message() << "chunkSize=" << chunkSize << " iteration="
+                                 << iter << " phase=" << phase);
+        const uint8_t testPattern =
+            static_cast<uint8_t>(0x80 + ((iter * 2 + phase) & 0x7F));
+        if (isSender) {
+          test::fillBufferWithPattern(
+              sendBuffer.get(), nbytes, testPattern, numBlocks, blockSize);
+        } else {
+          CUDACHECK_TEST(cudaMemset(recvBuffer.get(), 0, nbytes));
+        }
+        CUDACHECK_TEST(cudaDeviceSynchronize());
+        MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+        test::testSendRecv(
+            peerTransportPtr,
+            isSender ? sendBuffer.get() : recvBuffer.get(),
+            nbytes,
+            chunkSize,
+            isSender,
+            numBlocks,
+            blockSize);
+        const cudaError_t syncErr = cudaDeviceSynchronize();
+        ASSERT_EQ(syncErr, cudaSuccess)
+            << "rank " << globalRank
+            << " send/recv failed: " << cudaGetErrorString(syncErr);
+
+        if (!isSender) {
+          CUDACHECK_TEST(cudaMemset(d_errorCount, 0, sizeof(int)));
+          test::verifyBufferPattern(
+              recvBuffer.get(),
+              nbytes,
+              testPattern,
+              d_errorCount,
+              numBlocks,
+              blockSize);
+          CUDACHECK_TEST(cudaDeviceSynchronize());
+
+          int h_errorCount = 0;
+          CUDACHECK_TEST(cudaMemcpy(
+              &h_errorCount,
+              d_errorCount,
+              sizeof(int),
+              cudaMemcpyDeviceToHost));
+          ASSERT_EQ(h_errorCount, 0)
+              << "multi-QP mutable max_signal_bytes send/recv corrupted "
+              << h_errorCount << " bytes";
+        }
+        MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+      }
+    }
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "IBGDA transport not available: " << e.what();
+  }
+}
+
+TEST_F(
+    MultipeerIbgdaTransportTestFixture,
+    NicDoneMultiQpMutableMaxSignalBytesNoCorruption) {
+  runNicDoneMultiQpMutableMaxSignalBytes(globalRank, localRank, numRanks);
 }
 
 // =============================================================================
@@ -2504,7 +3368,6 @@ class LazyModeTestFixture
         .numSignalSlots = 1,
         .numCounterSlots = 1,
         .ibLazyConnect = true,
-        .materializePeerTimeoutMs = 10000,
     };
     auto bootstrap = std::make_shared<meta::comms::MpiBootstrap>();
     return std::make_unique<TestIbTransport>(
@@ -2556,7 +3419,7 @@ TEST_P(LazyModeTestFixture, QueueThenConnect) {
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 }
 
-TEST_P(LazyModeTestFixture, EagerModeAllPeersMaterialized) {
+TEST_P(LazyModeTestFixture, DefaultModeDefersAllPeers) {
   if (numRanks < 2) {
     GTEST_SKIP() << "Requires at least 2 ranks";
   }
@@ -2568,7 +3431,7 @@ TEST_P(LazyModeTestFixture, EagerModeAllPeersMaterialized) {
       if (peer == globalRank) {
         continue;
       }
-      EXPECT_TRUE(transport->isPeerMaterialized(peer));
+      EXPECT_FALSE(transport->isPeerMaterialized(peer));
     }
   } catch (const std::exception& e) {
     GTEST_SKIP() << backendName(backend()) << " not available: " << e.what();

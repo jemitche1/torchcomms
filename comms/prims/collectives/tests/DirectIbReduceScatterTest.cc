@@ -19,6 +19,8 @@ namespace {
 
 struct DirectIbReduceScatterTestParams {
   std::size_t chunk_elements;
+  bool quantized;
+  bool use_tma{true};
   std::string name;
 };
 
@@ -65,10 +67,15 @@ TEST_P(DirectIbReduceScatterTest, Correctness) {
   const std::size_t total_elements = params.chunk_elements * worldSize;
   DeviceBuffer inputBuf(total_elements * sizeof(float));
   DeviceBuffer outputBuf(params.chunk_elements * sizeof(float));
+  DeviceBuffer repeatOutputBuf(params.chunk_elements * sizeof(float));
+  DeviceBuffer seedBuf(sizeof(std::uint64_t));
   CUDACHECK_TEST(
       cudaMemset(outputBuf.get(), 0, params.chunk_elements * sizeof(float)));
 
   fill_input(static_cast<float*>(inputBuf.get()), total_elements);
+  const std::uint64_t seed = 0x123456789abcdef0ULL;
+  CUDACHECK_TEST(
+      cudaMemcpy(seedBuf.get(), &seed, sizeof(seed), cudaMemcpyHostToDevice));
 
   DirectReduceScatterIbLaunchParams launchParams{};
   launchParams.my_rank = globalRank;
@@ -77,8 +84,12 @@ TEST_P(DirectIbReduceScatterTest, Correctness) {
   launchParams.signaling_data_size = 0;
   launchParams.input = static_cast<const float*>(inputBuf.get());
   launchParams.output = static_cast<float*>(outputBuf.get());
+  launchParams.quantized = params.quantized;
+  launchParams.seed_ptr = params.quantized
+      ? static_cast<const std::uint64_t*>(seedBuf.get())
+      : nullptr;
   launchParams.num_blocks = num_blocks;
-  launchParams.timeout_ms = 30000.0f;
+  launchParams.use_tma = params.use_tma;
   for (int peer = 0; peer < worldSize; ++peer) {
     if (peer == globalRank) {
       continue;
@@ -92,8 +103,32 @@ TEST_P(DirectIbReduceScatterTest, Correctness) {
   CUDACHECK_TEST(cudaDeviceSynchronize());
   bootstrap->barrierAll();
 
+  if (params.quantized) {
+    launchParams.output = static_cast<float*>(repeatOutputBuf.get());
+    bootstrap->barrierAll();
+    launch_direct_reduce_scatter_ib(launchParams);
+    CUDACHECK_TEST(cudaDeviceSynchronize());
+    bootstrap->barrierAll();
+
+    std::vector<float> output(params.chunk_elements);
+    std::vector<float> repeatOutput(params.chunk_elements);
+    CUDACHECK_TEST(cudaMemcpy(
+        output.data(),
+        outputBuf.get(),
+        params.chunk_elements * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    CUDACHECK_TEST(cudaMemcpy(
+        repeatOutput.data(),
+        repeatOutputBuf.get(),
+        params.chunk_elements * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    EXPECT_EQ(output, repeatOutput);
+  }
+
   verify_reduce_scatter(
-      static_cast<const float*>(outputBuf.get()), params.chunk_elements);
+      static_cast<const float*>(outputBuf.get()),
+      params.chunk_elements,
+      params.quantized ? 5e-2f : 1e-2f);
 }
 
 std::vector<DirectIbReduceScatterTestParams> all_test_params() {
@@ -110,8 +145,36 @@ std::vector<DirectIbReduceScatterTestParams> all_test_params() {
   for (const auto& [size_label, total_bytes] : sizes) {
     const std::size_t chunk_elements =
         total_bytes / sizeof(float) / kExpectedRanks;
-    out.push_back({.chunk_elements = chunk_elements, .name = size_label});
+    out.push_back(
+        {.chunk_elements = chunk_elements,
+         .quantized = false,
+         .name = size_label + "Fp32"});
+    out.push_back(
+        {.chunk_elements = chunk_elements,
+         .quantized = true,
+         .name = size_label + "Quantized"});
+    // MCCL_PRIMS_TMA=0. Exercises launch_quantized<false, ...>, which is the
+    // production kill switch and is otherwise never instantiated by a test.
+    out.push_back(
+        {.chunk_elements = chunk_elements,
+         .quantized = true,
+         .use_tma = false,
+         .name = size_label + "QuantizedNoTma"});
   }
+  out.push_back(
+      {.chunk_elements = 1025, .quantized = true, .name = "OddTailQuantized"});
+  out.push_back(
+      {.chunk_elements = 1025,
+       .quantized = true,
+       .use_tma = false,
+       .name = "OddTailQuantizedNoTma"});
+  // A tile is 16384 bf16 elements per channel; this size leaves a partial final
+  // tile so the TMA path's ragged-tail handling is covered rather than only
+  // whole-tile chunks.
+  out.push_back(
+      {.chunk_elements = 16384 * 8 + 4096,
+       .quantized = true,
+       .name = "RaggedTileQuantized"});
   return out;
 }
 

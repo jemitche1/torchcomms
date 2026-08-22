@@ -12,9 +12,9 @@
 #include "comms/ctran/backends/ib/CtranIbVc.h"
 #include "comms/ctran/ibverbx/IbvQpUtils.h"
 #include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 #define CTRAN_HARDCODED_MAX_QPS (128)
 
@@ -38,6 +38,12 @@ struct BusCard {
       uint16_t lids[CTRAN_MAX_IB_DEVICES_PER_RANK];
     } ib;
   } u;
+  // OOO_RQ capability advertised to the peer during bootstrap. 1 iff the local
+  // peer set NCCL_CTRAN_IB_ENABLE_OOO_RQ=true AND every active device
+  // exposes ooo_recv_wrs_caps.max_rc >= MAX_RECV_WR. setupVc() cross-checks
+  // both sides and fail-closes if the local peer requested OOO_RQ but the
+  // negotiation doesn't yield mutual support.
+  uint8_t oooRq;
 };
 
 // Apply the per-VC QP configuration. MAX_QPS is supplied by the caller
@@ -87,7 +93,7 @@ inline commResult_t CtranIbVirtualConn::setDefaultQPConfig() {
 
   // cannot execeed the hardcoded max number of QPs
   if (maxNumQps_ > CTRAN_HARDCODED_MAX_QPS) {
-    CLOGF(
+    CTRAN_LOG(
         WARN,
         "CTRAN-IB: CTRAN_MAX_QPS set to more than the hardcoded max value ({} > {}), use {} instead",
         maxNumQps_,
@@ -102,7 +108,7 @@ inline commResult_t CtranIbVirtualConn::setDefaultQPConfig() {
   if (maxNumQps_ % numActive) {
     int originalMaxNumQps = maxNumQps_;
     maxNumQps_ = maxNumQps_ + (numActive - maxNumQps_ % numActive);
-    CLOGF(
+    CTRAN_LOG(
         WARN,
         "CTRAN-IB: CTRAN_MAX_QPS is not a multiple of active device count ({} < {}), rounding up to {} instead",
         originalMaxNumQps,
@@ -111,7 +117,7 @@ inline commResult_t CtranIbVirtualConn::setDefaultQPConfig() {
   }
 
   if (maxQpMsgs_ > MAX_SEND_WR) {
-    CLOGF(
+    CTRAN_LOG(
         WARN,
         "CTRAN-IB: Max messages per QP set to more than the hardcoded max value ({} > {}), use {} instead",
         maxQpMsgs_,
@@ -120,7 +126,8 @@ inline commResult_t CtranIbVirtualConn::setDefaultQPConfig() {
     maxQpMsgs_ = MAX_SEND_WR;
   }
 
-  pendingWqeQs_.resize(maxNumQps_);
+  putWqesByQp_.resize(maxNumQps_);
+  getWqesByQp_.resize(maxNumQps_);
 
   // Cache the per-device QP count now that maxNumQps_ is finalized.
   // maxNumQps_ is guaranteed to be a multiple of activeDevices_.size() above.
@@ -210,7 +217,7 @@ void CtranIbVirtualConn::logConnectionConfig(ConnectionType connTyp) {
   if (!lockedMap->at(connTyp)) {
     if (comm_ && comm_->statex_) {
       const auto& statex = comm_->statex_.get();
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO,
           INIT,
           "CTRAN-IB-VC: QP setting for connection type {} (sameDC {}, sameZone {}): maxNumQps_={}, numQpsPerDevice_={}, qpScalingTh_={}, vcMode_={}, maxQpMsgs_={}, "
@@ -228,7 +235,7 @@ void CtranIbVirtualConn::logConnectionConfig(ConnectionType connTyp) {
           statex->commHash(),
           statex->commDesc());
     } else {
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO,
           INIT,
           "CTRAN-IB-VC: QP setting for connection type {} (no statex): maxNumQps_={}, numQpsPerDevice_={}, qpScalingTh_={}, vcMode_={}, maxQpMsgs_={}",
@@ -264,7 +271,7 @@ commResult_t CtranIbVirtualConn::prepCtrlMsgs() {
   FOLLY_EXPECTED_CHECK(maybeRecvCtrlMr);
   this->recvCtrl_.ibvMr_ = std::move(*maybeRecvCtrlMr);
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       INIT,
       "CTRAN-IB-VC: CMsg packets pre-registered to device {}: sendCtrl {}, recvCtrl {}, size {} (packetSize {} * MAX_RECV_WR {})",
       ctrlDevice,
@@ -404,7 +411,7 @@ CtranIbVirtualConn::CtranIbVirtualConn(
         ? ibvDev->device()->name
         : "<uninitialized>";
   }
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-IB-VC: VC peerRank={} cudaDev={} ifnames=[{}]",
@@ -431,6 +438,31 @@ std::size_t CtranIbVirtualConn::getBusCardSize() {
 
 commResult_t CtranIbVirtualConn::getLocalBusCard(void* localBusCard) {
   BusCard* busCard = reinterpret_cast<BusCard*>(localBusCard);
+
+  // Compute local OOO_RQ support from per-device caps probed at init.
+  // Require every active device's HW to accept at least MAX_RECV_WR OOO
+  // placements — matches the per-QP pre-post depth we run with.
+  localOooRq_ = NCCL_CTRAN_IB_ENABLE_OOO_RQ;
+  for (int device : activeDevices_) {
+    if (devices_[device].oooRqSize < static_cast<uint32_t>(MAX_RECV_WR)) {
+      localOooRq_ = false;
+      break;
+    }
+  }
+
+  // Data QPs get MLX5DV_QP_CREATE_OOO_DP when local support is confirmed
+  // (localOooRq_). If the user requested OOO_RQ but local caps are missing,
+  // we still create plain QPs and advertise oooRq=0; setupVc() on both peers
+  // evaluates the negotiation symmetrically and fail-closes (WARN +
+  // commSystemError) if the request can't be honored.
+  if (localOooRq_) {
+    CTRAN_LOG(
+        INFO,
+        "CTRAN-IB-VC: OOO_RQ ENABLED — data QPs created with "
+        "MLX5DV_QP_CREATE_OOO_DP (per-device oooRqSize >= MAX_RECV_WR={}).",
+        MAX_RECV_WR);
+  }
+
   // assuming all devices portAttr
   ibverbx::ibv_port_attr portAttr;
   const int ctrlDevice = ctrlDevice_;
@@ -445,7 +477,7 @@ commResult_t CtranIbVirtualConn::getLocalBusCard(void* localBusCard) {
     if (portAttr.max_msg_sz < qpScalingTh_) {
       // Every message we post will be NCCL_CTRAN_IB_QP_SCALING_THRESHOLD or
       // smaller; clamp if this was set beyond what we can support
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "CTRAN-IB-VC: QP Scaling threshold {} higher than max message size {}; clamping",
           qpScalingTh_,
@@ -491,13 +523,17 @@ commResult_t CtranIbVirtualConn::getLocalBusCard(void* localBusCard) {
           devices_[device].port,
           qpAccessFlags | ibverbx::IBV_ACCESS_REMOTE_ATOMIC));
     }
-    // maxNumQps_ is always a multiple of activeDevices_.size()
+    // Data QPs may opt into OOO_DP when local caps confirm it (localOooRq_).
+    // Control / notify / atomic QPs stay on the plain createRcQp path — their
+    // CQE handler (processCqeImpl) matches by FIFO deque order and would
+    // break under reordering.
     for (int i = 0; i < numQpsPerDevice_; i++) {
-      auto maybeQp = createRcQp(
+      auto maybeQp = createRcQpWithOooDp(
           devices_[device].ibvPd,
           devices_[device].ibvCq->cq(),
           MAX_SEND_WR,
-          MAX_RECV_WR);
+          MAX_RECV_WR,
+          localOooRq_);
       FOLLY_EXPECTED_CHECK(maybeQp);
       FOLLY_EXPECTED_CHECK(
           initQp(*maybeQp, devices_[device].port, qpAccessFlags));
@@ -531,16 +567,47 @@ commResult_t CtranIbVirtualConn::getLocalBusCard(void* localBusCard) {
   mtu_ = 128 * (1 << static_cast<int>(portAttr.active_mtu));
   maxMsgSize_ = portAttr.max_msg_sz;
 
+  busCard->oooRq = localOooRq_ ? 1 : 0;
+
   return commSuccess;
 }
 
 commResult_t CtranIbVirtualConn::setupVc(void* remoteBusCard) {
   BusCard* remoteBusCardStruct = reinterpret_cast<BusCard*>(remoteBusCard);
 
+  // OOO_RQ negotiation: fail-closed at the receive side so both peers
+  // evaluate symmetrically and abort together. Only fires when the local
+  // user explicitly requested OOO_RQ; peers with the cvar off ignore the
+  // remote's advertisement.
+  if (NCCL_CTRAN_IB_ENABLE_OOO_RQ) {
+    const bool remoteOooRq = (remoteBusCardStruct->oooRq != 0);
+    if (!localOooRq_ || !remoteOooRq) {
+      std::string perDevice;
+      for (int device : activeDevices_) {
+        perDevice += fmt::format(
+            " [dev={} name={} oooRqSize={}]",
+            device,
+            devices_[device].devName,
+            devices_[device].oooRqSize);
+      }
+      CTRAN_LOG(
+          WARN,
+          "CTRAN-IB-VC: NCCL_CTRAN_IB_ENABLE_OOO_RQ=true requested but "
+          "negotiation failed with peer {}: localOooRq={}, remoteOooRq={} "
+          "(need both sides supported). Local per-device state:{}. Aborting "
+          "connection (no silent fallback).",
+          peerRank,
+          localOooRq_,
+          remoteOooRq,
+          perDevice);
+      return commSystemError;
+    }
+  }
+
   // Validate that QPs have been initialized via getLocalBusCard()
   if (!areQpsInitialized()) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInternalError,
         "CTRAN-IB-VC: setupVc called before getLocalBusCard(). "
         "QPs not initialized: controlQp={}, notifyQp={}, atomicQp={}, dataQps={}. "
         "peerRank={}",
@@ -562,14 +629,28 @@ commResult_t CtranIbVirtualConn::setupVc(void* remoteBusCard) {
     QpUniqueId qpId =
         std::make_pair(this->ibvDataQps_.at(i).qp()->qp_num, ibDevice);
     if (qpNumToIdx_.find(qpId) != qpNumToIdx_.end()) {
-      CLOGF(
-          ERR,
+      CTRAN_ERR(
+          commInternalError,
           "CTRAN-IB-VC: QP {} on device {} already exists",
           this->ibvDataQps_.at(i).qp()->qp_num,
           ibDevice);
       return commInternalError;
     }
     qpNumToIdx_.emplace(qpId, i);
+  }
+
+  /* Post receive WQEs before making the QPs reachable. */
+  for (int i = 0; i < MAX_RECV_WR; i++) {
+    FB_COMMCHECK(this->postRecvCtrlMsg(this->recvCtrl_.packets_.at(i)));
+    this->recvCtrl_.postedPkts_.push_back(this->recvCtrl_.packets_.at(i));
+
+    // Pre populate recv on notifyQp
+    this->postRecvNotifyMsg(kNotifyQpIdx);
+
+    // In case dqplb is used, pre populate recv on dataQps
+    for (int j = 0; j < maxNumQps_; j++) {
+      FB_COMMCHECK(this->postRecvNotifyMsg(j));
+    }
   }
 
   /* set QP to RTR state for control and notify QP first*/
@@ -641,20 +722,6 @@ commResult_t CtranIbVirtualConn::setupVc(void* remoteBusCard) {
   for (int i = 0; i < maxNumQps_; i++) {
     FOLLY_EXPECTED_CHECK(
         rtsQp(ibvDataQps_.at(i), NCCL_IB_TIMEOUT, NCCL_IB_RETRY_CNT));
-  }
-
-  /* post control WQEs */
-  for (int i = 0; i < MAX_RECV_WR; i++) {
-    FB_COMMCHECK(this->postRecvCtrlMsg(this->recvCtrl_.packets_.at(i)));
-    this->recvCtrl_.postedPkts_.push_back(this->recvCtrl_.packets_.at(i));
-
-    // Pre populate recv on notifyQp
-    this->postRecvNotifyMsg(kNotifyQpIdx);
-
-    // In case dqplb is used, pre populate recv on dataQps
-    for (int j = 0; j < maxNumQps_; j++) {
-      FB_COMMCHECK(this->postRecvNotifyMsg(j));
-    }
   }
 
   isReady_ = true;

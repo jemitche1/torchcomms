@@ -10,6 +10,8 @@
 #include "comms/uniflow/transport/rdma/RdmaTransport.h"
 #ifndef __HIP_PLATFORM_AMD__
 #include "comms/uniflow/transport/nvlink/NVLinkTransport.h"
+#else
+#include "comms/uniflow/transport/p2p/P2pTransport.h"
 #endif
 
 #include <cstring>
@@ -76,7 +78,9 @@ Status MultiTransportFactory::supported(TransportType type) {
       return NVLinkTransportFactory::supported();
 #else
     case TransportType::NVLink:
-      return Err(ErrCode::NotImplemented, "nvlink is not supported on AMD");
+      // On AMD the NVLink tier is served by the P2P (XGMI) transport, whose
+      // supported() encodes the all-XGMI arch gate.
+      return P2pTransportFactory::supported();
 #endif
     case TransportType::TCP:
       return Err(ErrCode::NotImplemented, "tcp transport is not implemented");
@@ -140,11 +144,31 @@ MultiTransportFactory::MultiTransportFactory(
       deviceId_ >= -1 && deviceId_ < static_cast<int>(topo.gpuCount()),
       std::runtime_error);
 
+  // Register the intra-node interconnect tier whenever the hardware is present
+  // (NVLink on NVIDIA, P2P/XGMI on AMD). This tier and RDMA are both registered
+  // when available; selectTransport chooses per transfer (intraNodeTransport
+  // can flip the intra-node default -- see selectTransport).
 #ifndef __HIP_PLATFORM_AMD__
   if (deviceId_ >= 0 && isNvlinkAvailable()) {
     auto nvlink = std::make_shared<NVLinkTransportFactory>(
         deviceId, eventBaseThread_->getEventBase());
     factories_.emplace_back(std::move(nvlink));
+  }
+#else
+  // AMD: the NVLink tier is served by the P2P (XGMI) transport. Its supported()
+  // owns the all-XGMI arch gate (selectTransport is presence-driven; see §5.6).
+  if (deviceId_ >= 0) {
+    auto p2pSupported = P2pTransportFactory::supported();
+    if (!p2pSupported.hasError()) {
+      auto p2p = std::make_shared<P2pTransportFactory>(
+          deviceId, eventBaseThread_->getEventBase());
+      factories_.emplace_back(std::move(p2p));
+    } else {
+      UNIFLOW_LOG_INFO(
+          "P2P transport disabled for device {}: {}",
+          deviceId_,
+          p2pSupported.error().message());
+    }
   }
 #endif
 
@@ -285,9 +309,23 @@ Result<Transport*> MultiTransport::selectTransport(
     return true;
   };
 
-  // VRAM→VRAM on matching device: prefer NVLink if ALL requests have it.
+  // Intra-node (VRAM<->VRAM on this device): default to the interconnect tier
+  // (NVLink/P2P). intraNodeTransport flips that choice (e.g. to RDMA) -- both
+  // tiers are registered, so this is a per-transfer selection override, not a
+  // kill-switch.
   if (localMemType == MemoryType::VRAM && remoteMemType == MemoryType::VRAM &&
       localDeviceId == deviceId_) {
+    // Try the intra-node override first (only if set and distinct from the
+    // NVLink/P2P default), then the default. Two explicit checks -> no
+    // per-transfer heap allocation, and no redundant re-check when the override
+    // is itself NVLink/P2P.
+    if (intraNodeTransport_.has_value() &&
+        *intraNodeTransport_ != TransportType::NVLink &&
+        allHaveTransport(*intraNodeTransport_)) {
+      if (auto* t = findTransport(*intraNodeTransport_)) {
+        return t;
+      }
+    }
     if (allHaveTransport(TransportType::NVLink)) {
       if (auto* t = findTransport(TransportType::NVLink)) {
         return t;
@@ -459,7 +497,8 @@ Result<std::unique_ptr<MultiTransport>> MultiTransportFactory::createTransport(
         entries.size());
   }
 
-  auto mt = std::make_unique<MultiTransport>(deviceId_, eventBaseThread_);
+  auto mt = std::make_unique<MultiTransport>(
+      deviceId_, eventBaseThread_, options_.intraNodeTransport);
   for (size_t i = 0, j = 0; i < entries.size() && j < factories_.size();) {
     if (entries[i].type < factories_[j]->transportType()) {
       ++i;

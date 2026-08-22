@@ -2,7 +2,9 @@
 
 #pragma once
 
-#include <ATen/ATen.h>
+// IWYU pragma: no_include <ATen/ATen.h>
+// IWYU pragma: no_include <torch/csrc/distributed/c10d/Store.hpp>
+#include <c10/core/Allocator.h>
 #include <c10/core/Device.h>
 #include <c10/util/intrusive_ptr.h>
 #include <comms/torchcomms/RemovableHandle.hpp>
@@ -11,9 +13,20 @@
 #include <comms/torchcomms/TorchCommHooks.hpp>
 #include <comms/torchcomms/TorchCommOptions.hpp>
 #include <comms/torchcomms/TorchCommTypes.hpp>
-#include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp-cpu
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace c10d {
+class Store;
+} // namespace c10d
+namespace at {
+class Tensor;
+} // namespace at
 
 namespace torch::comms {
 
@@ -184,6 +197,8 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
   std::shared_ptr<TorchCommBackend> getBackendImpl() const {
     return impl_;
   }
+
+  bool supportsWindow() const;
 
   std::shared_ptr<TorchCommWindow> new_window(
       const std::optional<at::Tensor>& tensor = std::nullopt);

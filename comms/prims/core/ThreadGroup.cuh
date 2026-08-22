@@ -66,6 +66,7 @@ enum class SyncScope { THREAD, WARP, MULTIWARP, BLOCK, CLUSTER };
  *   - thread_id_in_group = 2 (position within warp: 34 % 32 = 2)
  */
 struct ThreadGroup {
+  static constexpr uint32_t kAutoBarrierId = UINT32_MAX;
   // LOCAL IDENTITY (within group):
   // ===============================
 
@@ -102,6 +103,8 @@ struct ThreadGroup {
   // CLUSTER: uses cluster.sync().
   SyncScope scope;
 
+  uint32_t barrier_id = kAutoBarrierId;
+
   __device__ inline void sync() {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     switch (scope) {
@@ -128,8 +131,14 @@ struct ThreadGroup {
         // group. `group_size` is configurable for make_multiwarp_group().
         uint32_t tid = threadIdx.x + threadIdx.y * blockDim.x +
             threadIdx.z * blockDim.x * blockDim.y;
-        uint32_t barrierId = tid / group_size;
-        asm volatile("bar.sync %0, %1;" : : "r"(barrierId), "r"(group_size));
+        uint32_t barrierId =
+            barrier_id == kAutoBarrierId ? tid / group_size : barrier_id;
+        // Keep compiler memory operations on their respective sides of the
+        // hardware barrier.
+        asm volatile("bar.sync %0, %1;"
+                     :
+                     : "r"(barrierId), "r"(group_size)
+                     : "memory");
 #else
         // AMD: no named barriers, fall back to block-level sync
         __syncthreads();
@@ -270,7 +279,8 @@ struct ThreadGroup {
         __shared__ uint64_t __tg_broadcast_scratch[kMaxMultiwarpsPerBlock];
         uint32_t tid = threadIdx.x + threadIdx.y * blockDim.x +
             threadIdx.z * blockDim.x * blockDim.y;
-        uint32_t scratch_idx = tid / group_size;
+        uint32_t scratch_idx =
+            barrier_id == kAutoBarrierId ? tid / group_size : barrier_id;
         if (is_leader()) {
           __tg_broadcast_scratch[scratch_idx] = static_cast<uint64_t>(val);
         }
@@ -295,6 +305,72 @@ struct ThreadGroup {
     }
 #endif
     return val;
+  }
+
+  /**
+   * Group-wide AND: returns true iff `pred` holds on every thread of the group.
+   *
+   * Lives next to broadcast() and derives its scratch index the same way, so
+   * the slot a group reduces into always matches the barrier it rendezvouses
+   * on. That pairing matters more here than for broadcast(): every thread
+   * atomicAnds into the slot rather than only the leader writing it, so a group
+   * reducing into the wrong index corrupts another group's result instead of
+   * merely reading a stale one.
+   *
+   * All threads in the group must call this -- it barriers.
+   *
+   * @param pred This thread's predicate
+   * @return Whether the predicate held on every thread in the group
+   */
+  __device__ __forceinline__ bool all(bool pred) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    switch (scope) {
+      case SyncScope::THREAD:
+        return pred;
+      case SyncScope::WARP:
+#ifdef __HIP_PLATFORM_AMD__
+        // A wavefront is kWarpSize == 64 lanes here, so __all() already spans
+        // the whole WARP group; HIP's __all_sync() would additionally reject
+        // the 32-bit full-warp mask NVIDIA wants (it static_asserts on a 64-bit
+        // one).
+        return __all(pred) != 0;
+#else
+        return __all_sync(0xFFFFFFFFU, pred) != 0;
+#endif
+      case SyncScope::MULTIWARP: {
+        __shared__ int __tg_all_scratch[kMaxMultiwarpsPerBlock];
+        uint32_t tid = threadIdx.x + threadIdx.y * blockDim.x +
+            threadIdx.z * blockDim.x * blockDim.y;
+        uint32_t scratch_idx =
+            barrier_id == kAutoBarrierId ? tid / group_size : barrier_id;
+        if (is_leader()) {
+          __tg_all_scratch[scratch_idx] = 1;
+        }
+        sync();
+        atomicAnd(&__tg_all_scratch[scratch_idx], pred ? 1 : 0);
+        sync();
+        bool result = __tg_all_scratch[scratch_idx] != 0;
+        sync(); // Prevent leader re-seeding before all threads read
+        return result;
+      }
+      case SyncScope::BLOCK: {
+        __shared__ int __tg_all_block;
+        if (is_leader()) {
+          __tg_all_block = 1;
+        }
+        sync();
+        atomicAnd(&__tg_all_block, pred ? 1 : 0);
+        sync();
+        bool result = __tg_all_block != 0;
+        sync(); // Prevent leader re-seeding before all threads read
+        return result;
+      }
+      case SyncScope::CLUSTER:
+        printf("ThreadGroup::all: CLUSTER scope not yet supported\n");
+        __trap();
+    }
+#endif
+    return pred;
   }
 
   /**
@@ -472,7 +548,7 @@ struct ThreadGroup {
  * PartitionResult - Result of partitioning a ThreadGroup
  */
 struct PartitionResult {
-  uint32_t partition_id;
+  uint32_t partition_id{};
   ThreadGroup subgroup;
 };
 
@@ -569,8 +645,9 @@ __device__ inline PartitionResult ThreadGroup::partition(
           .block_id = block_id,
           .total_groups = partition_size,
           .scope = scope}};
-#endif
+#else
   return PartitionResult{};
+#endif
 }
 
 /**
@@ -762,8 +839,9 @@ __device__ inline PartitionResult ThreadGroup::partition_interleaved(
           .block_id = block_id,
           .total_groups = groups_in_partition,
           .scope = scope}};
-#endif
+#else
   return PartitionResult{};
+#endif
 }
 
 /**

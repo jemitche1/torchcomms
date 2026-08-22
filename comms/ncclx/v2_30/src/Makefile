@@ -23,6 +23,8 @@ include ../makefiles/version.mk
 CXXFLAGS += -DMOCK_SCUBA_DATA -DFOLLY_XLOG_STRIP_PREFIXES=\"${BASE_DIR}\"
 # Use header-only fmt to avoid runtime dependency on libfmt.so
 CXXFLAGS += -DFMT_HEADER_ONLY=1
+CXXFLAGS += -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO -DSPDLOG_FMT_EXTERNAL
+NVCUFLAGS += -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO -DSPDLOG_FMT_EXTERNAL
 
 # Enable JSON parsing in the NCCLX built-in CSV/JSON tuner (meta/tuner) when
 # folly is available. The conda feedstock build sets NCCLX_TUNER_WITH_FOLLY_JSON=1
@@ -31,6 +33,18 @@ CXXFLAGS += -DFMT_HEADER_ONLY=1
 NCCLX_TUNER_WITH_FOLLY_JSON ?= 0
 ifeq ($(NCCLX_TUNER_WITH_FOLLY_JSON),1)
 CXXFLAGS += -DNCCLX_TUNER_WITH_FOLLY_JSON
+endif
+
+# NCCLX v2.30 uses tuner API v6, which adds the getChunkSize hook. Gate the
+# v6-only getChunkSize callback in meta/tuner on this flag -- matching
+# def_build.bzl. The conda feedstock build sets NCCLX_TUNER_HAS_GETCHUNKSIZE=1;
+# a bare OSS `make` leaves it off so chunkSize overrides compile out (proto/algo
+# and channel rules still work).
+# TODO: Remove this flag once v2.29 is deleted (all remaining versions use tuner
+# API v6+, so getChunkSize can be enabled unconditionally).
+NCCLX_TUNER_HAS_GETCHUNKSIZE ?= 0
+ifeq ($(NCCLX_TUNER_HAS_GETCHUNKSIZE),1)
+CXXFLAGS += -DNCCLX_TUNER_HAS_GETCHUNKSIZE
 endif
 
 ifeq ($(ENABLE_TCPDM),0)
@@ -119,6 +133,8 @@ LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/utils/colltrace/plugins/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/ibverbx/*.cc)
 ## Include cvars files
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/utils/cvars/*.cc)
+## Include common fault-tolerance files
+LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/common/fault_tolerance/*.cc)
 ## Include ctran files
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/*.cc)
 LIBSRCFILES += $(wildcard ${BASE_DIR}/comms/ctran/backends/*.cc)
@@ -160,6 +176,7 @@ LIBSRCFILES += ${BASE_DIR}/comms/prims/memory/CuMulticastAllocation.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/memory/GpuMemHandler.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/memory/MultimemHandler.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/memory/NvlMemExchange.cc
+LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/nvl/MultimemNvlTransportConfig.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/nvl/MultimemNvlTransport.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/nvl/MultiPeerNvlTransport.cc
 LIBSRCFILES += ${BASE_DIR}/comms/prims/transport/MultiPeerTransport.cc
@@ -377,7 +394,7 @@ $(BINDIR)/$(BINNAME): $(BINOBJ)
 $(BINDIR)/$(PARAMBIN): $(PARAMBINOBJ) $(LIBDIR)/$(LIBTARGET)
 	@printf "Linking    %-35s > %s\n" $(PARAMBIN) $@
 	mkdir -p $(BINDIR)
-	$(CXX) $(CXXFLAGS) $< -o $@ -L$(LIBDIR) -L${CONDA_LIB_DIR} -lnccl -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl
+	$(CXX) $(CXXFLAGS) $< -o $@ -L$(LIBDIR) -L${CONDA_LIB_DIR} -lnccl -L${CUDA_LIB} -l$(CUDARTLIB) -lpthread -lrt -ldl -latomic
 
 $(PKGDIR)/nccl.pc : nccl.pc.in
 	mkdir -p $(PKGDIR)

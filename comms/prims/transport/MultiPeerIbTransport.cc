@@ -3,7 +3,6 @@
 #include "comms/prims/transport/MultiPeerIbTransport.h"
 
 #include <cerrno>
-#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -249,6 +248,27 @@ void checkSendRecvSignalAlignment(const void* ptr, const char* label) {
         fmt::format("{} must be {}-byte aligned", label, alignof(SignalState)));
   }
 }
+
+bool rangeContains(
+    uintptr_t outerBegin,
+    std::size_t outerSize,
+    uintptr_t innerBegin,
+    std::size_t innerSize) {
+  return innerSize != 0 && innerBegin >= outerBegin && innerSize <= outerSize &&
+      innerBegin - outerBegin <= outerSize - innerSize;
+}
+
+uintptr_t
+checkedRangeEnd(const void* ptr, std::size_t size, const char* operation) {
+  const auto begin = reinterpret_cast<uintptr_t>(ptr);
+  if (ptr == nullptr || size == 0 ||
+      size > std::numeric_limits<uintptr_t>::max() - begin) {
+    throw std::invalid_argument(
+        fmt::format(
+            "{}: invalid buffer range ptr={} size={}", operation, ptr, size));
+  }
+  return begin + size;
+}
 } // namespace
 
 MultiPeerIbTransportBase::MultiPeerIbTransportBase(
@@ -281,6 +301,10 @@ MultiPeerIbTransportBase::MultiPeerIbTransportBase(
   }
   if (nRanks_ < 2) {
     throw std::invalid_argument("Need at least 2 ranks");
+  }
+  if (auto isolatedBootstrap = bootstrap_->duplicate()) {
+    bootstrap_ =
+        std::shared_ptr<meta::comms::IBootstrap>(std::move(isolatedBootstrap));
   }
   // RoCE GID index: config override, else the RoCEv2 default. Read by
   // openNics() (query_gid) and by backends when building address handles.
@@ -397,8 +421,10 @@ std::size_t MultiPeerIbTransportBase::sendRecvSignalBytesPerPeer() const {
   //               lane); numLanes must equal the device QP-lane count.
   //   SLOT_FREE:  one slot per channel.
   // See the layout in IbgdaBuffer.h.
+  // Slot-indexed: one DATA_READY block plus one SLOT_FREE slot per
+  // (logical channel, protocol slot).
   const std::size_t maxChannels =
-      static_cast<std::size_t>(config_.max_num_channels);
+      static_cast<std::size_t>(config_.totalChannelSlots());
   const std::size_t numLanes = static_cast<std::size_t>(numNics_) *
       static_cast<std::size_t>(config_.qpsPerConnection);
   const std::size_t dataReadySlots = numLanes * maxChannels;
@@ -407,7 +433,7 @@ std::size_t MultiPeerIbTransportBase::sendRecvSignalBytesPerPeer() const {
 }
 
 std::size_t MultiPeerIbTransportBase::sendRecvCounterBytesPerPeer() const {
-  return static_cast<std::size_t>(config_.max_num_channels) *
+  return static_cast<std::size_t>(config_.totalChannelSlots()) *
       kSendRecvSignalSlotStride;
 }
 
@@ -428,7 +454,8 @@ IbChannelLayout MultiPeerIbTransportBase::channelLayoutForPeer(
       .remoteSignalBuf = pb.remoteSignal,
       .localCounterBuf = pb.counter,
       .localCounterCompletionBuf = pb.counterCompletion,
-      .maxChannels = config_.max_num_channels,
+      .maxChannels = config_.totalChannelSlots(),
+      .numChannels = config_.max_num_channels,
       .numLanes = numNics_ * config_.qpsPerConnection,
       .pipelineDepth = config_.pipelineDepth,
       .perChannelSize = config_.perChannelSize,
@@ -1077,6 +1104,10 @@ IbgdaLocalBuffer MultiPeerIbTransportBase::registerBuffer(
     throw std::invalid_argument("Invalid buffer pointer or size");
   }
 
+  const auto addr = reinterpret_cast<uintptr_t>(ptr);
+  [[maybe_unused]] const auto requestedEnd =
+      checkedRangeEnd(ptr, size, "registerBuffer");
+
   // Resolve the effective Relaxed Ordering once, up front: the caller's request
   // gated by config (NCCL_IB_PCI_RELAXED_ORDERING) AND by NIC capability probed
   // during openNics. Gating on capability means a NIC whose driver rejects
@@ -1090,11 +1121,10 @@ IbgdaLocalBuffer MultiPeerIbTransportBase::registerBuffer(
   // Fast path: containment lookup — if [ptr, ptr+size) falls entirely within an
   // existing registration with the same effective ordering, return the cached
   // per-NIC lkeys with no driver call.
-  const auto addr = reinterpret_cast<uintptr_t>(ptr);
   auto it = registeredBuffers_.upper_bound(addr);
   if (it != registeredBuffers_.begin()) {
     --it;
-    if (addr + size <= it->first + it->second.allocSize) {
+    if (rangeContains(it->first, it->second.allocSize, addr, size)) {
       // The cache holds one MR set per allocation; its access flags (including
       // Relaxed Ordering) are fixed at registration, so the effective ordering
       // is part of the cache key. A containment hit resolving to different
@@ -1151,7 +1181,6 @@ IbgdaLocalBuffer MultiPeerIbTransportBase::registerBuffer(
   // covers the full contiguous VA — ibv_reg_dmabuf_mr handles the underlying
   // physical discontinuity transparently.
   {
-    const auto requestedEnd = reinterpret_cast<uintptr_t>(ptr) + size;
     const auto allocEnd = static_cast<uintptr_t>(allocBase) + allocSize;
     if (requestedEnd > allocEnd) {
       allocBase = reinterpret_cast<CUdeviceptr>(ptr);
@@ -1218,11 +1247,13 @@ IbgdaLocalBuffer MultiPeerIbTransportBase::registerBuffer(
                 allocSize));
       }
       errno = 0;
+      // Data Direct requires the whole exported mapping; registering an
+      // unaligned subrange can fail with EOPNOTSUPP on GB300.
       mr = symbols.mlx5dv_internal_reg_dmabuf_mr(
           nics_[n].ibvPd,
-          ddDmabuf->alignment.dmabufOffset,
-          allocSize,
-          static_cast<uint64_t>(allocBase),
+          /*offset=*/0,
+          ddDmabuf->alignment.alignedSize,
+          reinterpret_cast<uint64_t>(ddDmabuf->alignment.alignedBase),
           ddDmabuf->fd,
           accessFlags,
           ibverbx::MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
@@ -1311,6 +1342,113 @@ IbgdaLocalBuffer MultiPeerIbTransportBase::registerBuffer(
     keys[n] = NetworkLKey(HostLKey(cached.mrs[n]->lkey));
   }
   return IbgdaLocalBuffer(ptr, keys);
+}
+
+IbBufferRegistrationLease MultiPeerIbTransportBase::registerIbBulkBuffer(
+    void* ptr,
+    std::size_t size) {
+  checkedRangeEnd(ptr, size, "registerIbBulkBuffer");
+  const auto localBuffer = registerBuffer(ptr, size, /*relaxedOrdering=*/true);
+
+  try {
+    const auto addr = reinterpret_cast<uintptr_t>(ptr);
+    auto mrIt = registeredBuffers_.upper_bound(addr);
+    if (mrIt == registeredBuffers_.begin()) {
+      throw std::logic_error(
+          "registerIbBulkBuffer: MR missing after registration");
+    }
+    --mrIt;
+    if (!rangeContains(mrIt->first, mrIt->second.allocSize, addr, size)) {
+      throw std::logic_error(
+          "registerIbBulkBuffer: MR does not contain registered range");
+    }
+    if (nextBulkBufferGeneration_ == std::numeric_limits<uint64_t>::max()) {
+      throw std::overflow_error(
+          "registerIbBulkBuffer: lease generation exhausted");
+    }
+
+    const uint64_t generation = nextBulkBufferGeneration_++;
+    bulkBufferRegistrations_.emplace(
+        generation,
+        BulkBufferRegistration{
+            .ptr = ptr,
+            .size = size,
+            .localBuffer = localBuffer,
+            .relaxedOrdering = mrIt->second.relaxedOrdering,
+        });
+    return IbBufferRegistrationLease(generation);
+  } catch (...) {
+    deregisterBuffer(ptr);
+    throw;
+  }
+}
+
+std::optional<IbBufferRegistrationView>
+MultiPeerIbTransportBase::lookupIbBulkBuffer(
+    const IbBufferRegistrationLease& lease,
+    void* ptr,
+    std::size_t size) const {
+  checkedRangeEnd(ptr, size, "lookupIbBulkBuffer");
+  if (!lease.valid()) {
+    return std::nullopt;
+  }
+
+  const auto registration = bulkBufferRegistrations_.find(lease.generation());
+  if (registration == bulkBufferRegistrations_.end()) {
+    return std::nullopt;
+  }
+
+  const auto& active = registration->second;
+  const auto requestedBegin = reinterpret_cast<uintptr_t>(ptr);
+  const auto registeredBegin = reinterpret_cast<uintptr_t>(active.ptr);
+  if (!rangeContains(registeredBegin, active.size, requestedBegin, size)) {
+    return std::nullopt;
+  }
+
+  return IbBufferRegistrationView{
+      .leaseGeneration = lease.generation(),
+      .localBuffer =
+          active.localBuffer.subBuffer(requestedBegin - registeredBegin),
+      .size = size,
+      .relaxedOrdering = active.relaxedOrdering,
+  };
+}
+
+void MultiPeerIbTransportBase::deregisterIbBulkBuffer(
+    IbBufferRegistrationLease& lease) {
+  if (!lease.valid()) {
+    throw std::invalid_argument(
+        "deregisterIbBulkBuffer: invalid registration lease");
+  }
+
+  const auto registration = bulkBufferRegistrations_.find(lease.generation());
+  if (registration == bulkBufferRegistrations_.end()) {
+    throw std::runtime_error(
+        "deregisterIbBulkBuffer: stale registration lease");
+  }
+
+  void* const ptr = registration->second.ptr;
+  bulkBufferRegistrations_.erase(registration);
+  deregisterBuffer(ptr);
+  lease.reset();
+}
+
+bool MultiPeerIbTransportBase::isIbBulkBufferViewActive(
+    const IbBufferRegistrationView& view) const {
+  if (!view.valid()) {
+    return false;
+  }
+  const auto registration = bulkBufferRegistrations_.find(view.leaseGeneration);
+  if (registration == bulkBufferRegistrations_.end()) {
+    return false;
+  }
+
+  const auto& active = registration->second;
+  return rangeContains(
+      reinterpret_cast<uintptr_t>(active.ptr),
+      active.size,
+      reinterpret_cast<uintptr_t>(view.localBuffer.ptr),
+      view.size);
 }
 
 void MultiPeerIbTransportBase::deregisterBuffer(void* ptr) {
@@ -1855,16 +1993,26 @@ bool MultiPeerIbTransportBase::isPeerMaterialized(int peerRank) const {
             myRank_,
             nRanks_));
   }
-  if (!config_.ibLazyConnect) {
-    return true;
-  }
+  const std::lock_guard<std::mutex> lock(materializationMutex_);
   return peerMaterialized_[rankToPeerIndex(peerRank)];
 }
 
-void MultiPeerIbTransportBase::queuePeerForMaterialization(int peerRank) {
-  if (!config_.ibLazyConnect) {
+void MultiPeerIbTransportBase::logPeersMaterialized(
+    std::size_t peerCount,
+    std::int64_t elapsedMs,
+    bool failed) const {
+  if (failed) {
+    LOG(WARNING) << "MultiPeerIbTransport: rank " << myRank_
+                 << " failed after materializing " << peerCount
+                 << " peer(s) in " << elapsedMs << " ms";
     return;
   }
+  LOG(INFO) << "MultiPeerIbTransport: rank " << myRank_ << " materialized "
+            << peerCount << " peer(s) in " << elapsedMs << " ms";
+}
+
+void MultiPeerIbTransportBase::queuePeerForMaterialization(int peerRank) {
+  const std::lock_guard<std::mutex> lock(materializationMutex_);
   if (materializationFailed_) {
     throw std::runtime_error(
         "MultiPeerIbTransport: lazy peer materialization previously failed; "
@@ -1879,7 +2027,7 @@ void MultiPeerIbTransportBase::queuePeerForMaterialization(int peerRank) {
             myRank_,
             nRanks_));
   }
-  if (isPeerMaterialized(peerRank)) {
+  if (peerMaterialized_[rankToPeerIndex(peerRank)]) {
     return;
   }
   for (int p : pendingPeers_) {
@@ -1961,29 +2109,22 @@ void MultiPeerIbTransportBase::exchangeRawWithPeer(
     const void* localPayload,
     void* remotePayload,
     std::size_t bytes,
-    int tag) {
-  auto timeoutUs = std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::milliseconds(config_.materializePeerTimeoutMs));
-  auto waitFuture = [&](auto&& future, const char* op) -> int {
-    try {
-      return std::move(future).get(timeoutUs);
-    } catch (const std::exception&) {
-      throw std::runtime_error(
-          fmt::format(
-              "materializePeer: rank {} {} with peer {} timed out ({}ms)",
-              myRank_,
-              op,
-              peerRank,
-              config_.materializePeerTimeoutMs));
-    }
-  };
-
+    int phase) {
+  constexpr int64_t kPrimsPeerTagBase = 1 << 16;
+  const int lowRank = std::min(myRank_, peerRank);
+  const int highRank = std::max(myRank_, peerRank);
+  const int64_t pairIndex = static_cast<int64_t>(lowRank) * nRanks_ + highRank;
+  const int64_t tagValue = kPrimsPeerTagBase + pairIndex * 2 + phase;
+  if (tagValue > std::numeric_limits<int>::max()) {
+    throw std::runtime_error("materializePeer: bootstrap tag overflow");
+  }
+  const int tag = static_cast<int>(tagValue);
   // Lower rank recvs first to avoid deadlock with blocking bootstrap
   // implementations (e.g. MpiBootstrap uses blocking MPI_Send/MPI_Recv).
   if (myRank_ < peerRank) {
     auto recvFuture =
         bootstrap_->recv(remotePayload, bytes, peerRank, /*tag=*/tag);
-    int recvResult = waitFuture(std::move(recvFuture), "recv");
+    int recvResult = std::move(recvFuture).get();
     if (recvResult != 0) {
       throw std::runtime_error(
           fmt::format(
@@ -1994,7 +2135,7 @@ void MultiPeerIbTransportBase::exchangeRawWithPeer(
     }
     auto sendFuture = bootstrap_->send(
         const_cast<void*>(localPayload), bytes, peerRank, /*tag=*/tag);
-    int sendResult = waitFuture(std::move(sendFuture), "send");
+    int sendResult = std::move(sendFuture).get();
     if (sendResult != 0) {
       throw std::runtime_error(
           fmt::format(
@@ -2006,7 +2147,7 @@ void MultiPeerIbTransportBase::exchangeRawWithPeer(
   } else {
     auto sendFuture = bootstrap_->send(
         const_cast<void*>(localPayload), bytes, peerRank, /*tag=*/tag);
-    int sendResult = waitFuture(std::move(sendFuture), "send");
+    int sendResult = std::move(sendFuture).get();
     if (sendResult != 0) {
       throw std::runtime_error(
           fmt::format(
@@ -2017,7 +2158,7 @@ void MultiPeerIbTransportBase::exchangeRawWithPeer(
     }
     auto recvFuture =
         bootstrap_->recv(remotePayload, bytes, peerRank, /*tag=*/tag);
-    int recvResult = waitFuture(std::move(recvFuture), "recv");
+    int recvResult = std::move(recvFuture).get();
     if (recvResult != 0) {
       throw std::runtime_error(
           fmt::format(

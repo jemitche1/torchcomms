@@ -11,10 +11,16 @@
 #include "comms/ctran/mapper/CtranMapperTypes.h"
 #include "comms/ctran/regcache/IpcRegCache.h"
 #include "comms/ctran/regcache/RegCache.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
+#include "comms/ctran/utils/CudaWrap.h"
+#include "comms/ctran/utils/DevMemType.h"
 
 #include <folly/ScopeGuard.h>
 
+#include <algorithm>
+#include <exception>
 #include <memory>
+#include <vector>
 
 using ctran::algos::GpeKernelSync;
 using ctran::allgatherp::AlgoImpl;
@@ -57,7 +63,7 @@ commResult_t exchangeMemHdl(
 
   if (NCCL_CTRAN_ENABLE_TRACE_LOG) {
     for (int i = 0; i < nRanks; i++) {
-      CLOGF_TRACE(
+      CTRAN_LOG_TRACE(
           INIT,
           "    remoteRecvBuffs[{}]: {}, remoteAccessKey: {}",
           i,
@@ -90,6 +96,8 @@ commResult_t createPersistentRequest(
     CtranPersistentRequest** out,
     bool waitForInit) {
   if (out == nullptr) {
+    CTRAN_ERR(
+        commInvalidArgument, "AllGatherP: output buffer must not be null");
     return commInvalidArgument;
   }
   *out = nullptr;
@@ -112,6 +120,7 @@ commResult_t createPersistentRequest(
       recvBytes,
       comm->statex_->cudaDev(),
       comm->ctran_->mapper->getBackends(),
+      comm->logMetaData_,
       localRecvReg));
   const double scopedRegisterUs = scopedRegisterTimer.durationUs();
 
@@ -179,7 +188,7 @@ commResult_t createPersistentRequest(
     ipcExchangeUs = ipcExchangeTimer.durationUs();
   }
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-AGP: Rank {} createPersistentRequest ({}): comm {} recvbuff {} recvHdl {} nLocalRanks {} commHash {:x}: scopedRegister {} us, ipcExchange {} us",
@@ -192,6 +201,26 @@ commResult_t createPersistentRequest(
       comm->statex_->commHash(),
       scopedRegisterUs,
       ipcExchangeUs);
+
+  // AgpCreate/IpcExchange is the createPersistentRequest-side wall time of the
+  // IPC exchange phase: for graph (waitForInit) it is the real blocking
+  // exchange, but for eager it is only the async submitHost latency -- the
+  // actual exchange runs later on the GPE thread and is captured by the
+  // AgpCreate/IpcExchange/Intra* child rows.
+  NcclScubaEvent(
+      std::make_unique<CommEvent>(
+          &comm->logMetaData_,
+          "AgpCreate/Reg",
+          std::string(),
+          scopedRegisterUs / 1000.0))
+      .record();
+  NcclScubaEvent(
+      std::make_unique<CommEvent>(
+          &comm->logMetaData_,
+          "AgpCreate/IpcExchange",
+          std::string(),
+          ipcExchangeUs / 1000.0))
+      .record();
 
   reqGuard.dismiss();
   *out = request.release();
@@ -327,7 +356,9 @@ commResult_t allGatherPExec(
         algo->pArgs.datatype);
   }
 
-  switch (NCCL_ALLGATHER_P_ALGO) {
+  const enum NCCL_ALLGATHER_P_ALGO variant =
+      algo->pArgs.algo.value_or(NCCL_ALLGATHER_P_ALGO);
+  switch (variant) {
     case NCCL_ALLGATHER_P_ALGO::ctdirect:
       return algo->execDirect(sendbuff, count, datatype);
     case NCCL_ALLGATHER_P_ALGO::ctpipeline:
@@ -335,7 +366,11 @@ commResult_t allGatherPExec(
     case NCCL_ALLGATHER_P_ALGO::ctsrdpipeline:
       return algo->execStreamedRecursiveDoubling(sendbuff, count, datatype);
     default:
-      return ErrorStackTraceUtil::log(commInternalError);
+      CTRAN_ERR(
+          commInternalError,
+          "AllGatherP: unknown algorithm variant {}",
+          static_cast<int>(variant));
+      return commInternalError;
   }
 }
 
@@ -365,7 +400,7 @@ commResult_t allGatherPDestroy(CtranPersistentRequest* request) {
   ctran::CHECK_VALID_IPC_REGCACHE(ipcRegCache);
   ipcRegCache->cleanupInvalidImports();
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "allGatherPDestroy: rank {} destroyed request {}",

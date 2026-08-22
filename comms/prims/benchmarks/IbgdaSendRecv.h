@@ -7,12 +7,15 @@
 #include <cstdint>
 
 #include "comms/prims/core/Timeout.cuh"
+#include "comms/prims/transport/ibgda/IbgdaBuffer.h"
 
 namespace comms::prims {
 class P2pIbgdaTransportDevice;
 } // namespace comms::prims
 
 namespace comms::prims::benchmark {
+
+inline constexpr uint32_t kDefaultIbgdaWarpProxyQueueDepth = 16;
 
 /**
  * Launch bidirectional tile sendrecv kernel for IBGDA transport.
@@ -84,9 +87,68 @@ void launch_ibgda_send(
     Timeout timeout = Timeout());
 
 /**
+ * Launch NVIDIA-only unidirectional send with one IB service warp per block.
+ */
+void launch_ibgda_warp_proxy_send(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes = 0,
+    Timeout timeout = Timeout(),
+    uint32_t queueDepth = kDefaultIbgdaWarpProxyQueueDepth);
+
+/**
  * Launch unidirectional tile recv kernel. All blocks receive.
  */
 void launch_ibgda_recv(
+    P2pIbgdaTransportDevice* transport,
+    char* dst,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes = 0,
+    Timeout timeout = Timeout());
+
+/**
+ * Launch NVIDIA-only unidirectional receive with one IB service warp per block.
+ */
+void launch_ibgda_warp_proxy_recv(
+    P2pIbgdaTransportDevice* transport,
+    char* dst,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes = 0,
+    Timeout timeout = Timeout(),
+    uint32_t queueDepth = kDefaultIbgdaWarpProxyQueueDepth);
+
+/**
+ * Low-latency (LL) protocol counterparts of launch_ibgda_send_recv/send/recv.
+ * Same grid layout; dispatch to the transport's send_ll/recv_ll (data + inline
+ * flag, 2x wire, no DATA_READY wait; Memcpy only).
+ */
+void launch_ibgda_send_recv_ll(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    char* dst,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes = 0,
+    Timeout timeout = Timeout());
+
+void launch_ibgda_send_ll(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes = 0,
+    Timeout timeout = Timeout());
+
+void launch_ibgda_recv_ll(
     P2pIbgdaTransportDevice* transport,
     char* dst,
     std::size_t nbytes,
@@ -129,9 +191,60 @@ void launch_ibgda_progress_send(
     Timeout timeout = Timeout());
 
 /**
+ * Launch the staged progress sender and wait for the receiver's final credit.
+ */
+void launch_ibgda_progress_send_complete(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes = 0,
+    Timeout timeout = Timeout());
+
+/**
+ * Launch a unidirectional registered-source progress send kernel.
+ *
+ * The source is read directly by the NIC. The kernel drains local NIC reads
+ * and waits for the receiver's final slot-free credit before returning.
+ */
+void launch_ibgda_registered_progress_send(
+    P2pIbgdaTransportDevice* transport,
+    const IbgdaLocalBuffer& src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes = 0,
+    Timeout timeout = Timeout());
+
+/**
  * Launch unidirectional progress recv kernel. All blocks receive.
  */
 void launch_ibgda_progress_recv(
+    P2pIbgdaTransportDevice* transport,
+    char* dst,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes = 0,
+    Timeout timeout = Timeout());
+
+/**
+ * Launch unidirectional LL progress send kernel. All blocks send.
+ */
+void launch_ibgda_progress_send_ll(
+    P2pIbgdaTransportDevice* transport,
+    char* src,
+    std::size_t nbytes,
+    int numBlocks,
+    cudaStream_t stream,
+    std::size_t maxSignalBytes = 0,
+    Timeout timeout = Timeout());
+
+/**
+ * Launch unidirectional LL progress recv kernel. All blocks receive.
+ */
+void launch_ibgda_progress_recv_ll(
     P2pIbgdaTransportDevice* transport,
     char* dst,
     std::size_t nbytes,

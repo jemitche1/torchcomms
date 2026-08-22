@@ -16,13 +16,29 @@ namespace ctran::allgatherp {
 // transfer.
 // Used when nLocalRanks > 1 in allgatherP pipeline algorithm. It is called once
 // to start the algorithm
+//
+// Also carries the own-chunk intra-node barrier that the following nvlCeBcast
+// would otherwise launch as a separate ncclKernelNvlBarrier, saving one kernel
+// (one graph node under capture). Folding it in is free: that standalone kernel
+// does the same devStateLoadToShm + barrier, so the ~67KB shared-memory load
+// moves rather than being added.
 __global__ void ncclKernelAllGatherPPipeStart(
     ctran::gpe::KernelFlagDev* f,
     CtranAlgoDeviceState* devState) {
+  ctran::device::ColltraceEventScope colltraceScope(f);
   int* flag = f ? const_cast<int*>(f->flag_) : nullptr;
   if (flag) {
+    // Kick GPE first: barriering before this would let a rank that is late to
+    // the barrier delay every peer's inter-node start, which is exactly the
+    // overlap this kernel exists to preserve.
     ctran::device::KernelStartGpeAndExit(f);
   }
+  if (flag) {
+    devStateLoadToShm(flag, devState);
+  } else {
+    devStateLoadToShm(devState);
+  }
+  barrier(statex->localRank(), statex->nLocalRanks());
 }
 
 // Kernel to block intranode CE copies on the stream till GPE thread has
@@ -33,17 +49,34 @@ __global__ void ncclKernelAllGatherPPipeSync(
     ctran::gpe::KernelFlagDev* f,
     CtranAlgoDeviceState* devState,
     PipeSyncKernArgs args) {
+  ctran::device::ColltraceEventScope colltraceScope(f);
   int* flag = f ? const_cast<int*>(f->flag_) : nullptr;
   ctran::device::devLoadAbortFlags(flag, devState);
   // wait till GPE thread post the current stepId
   GpeKernelSyncDev::waitPost(args.pipeSync, 0, args.stepId);
 }
 
-// Stub kernel to hold stream while GPE thread does inter-node transfer.
-// Used when nLocalRanks == 1 in allgatherP pipeline algorithm
-__global__ void ncclKernelAllGatherPPipe(
+// Stream-holder stub for the ctpipeline (ring) variant at nLocalRanks==1: holds
+// the stream while the GPE thread runs the inter-node ring transfer.
+// Ring = ctpipeline nLocalRanks==1.
+__global__ void ncclKernelAllGatherPRing(
     ctran::gpe::KernelFlagDev* f,
     CtranAlgoDeviceState* devState) {
+  ctran::device::ColltraceEventScope colltraceScope(f);
+  int* flag = f ? const_cast<int*>(f->flag_) : nullptr;
+  if (flag) {
+    ctran::device::devLoadAbortFlags(flag, devState);
+    ctran::device::KernelStartGpe(f);
+    ctran::device::KernelWaitGpeTerminate(flag);
+  }
+}
+
+// Stream-holder stub for the ctsrdpipeline (streamed recursive-doubling)
+// variant at nLocalRanks==1. StreamedRd = ctsrdpipeline nLocalRanks==1.
+__global__ void ncclKernelAllGatherPStreamedRd(
+    ctran::gpe::KernelFlagDev* f,
+    CtranAlgoDeviceState* devState) {
+  ctran::device::ColltraceEventScope colltraceScope(f);
   int* flag = f ? const_cast<int*>(f->flag_) : nullptr;
   if (flag) {
     ctran::device::devLoadAbortFlags(flag, devState);
@@ -56,9 +89,11 @@ __global__ void ncclKernelAllGatherPPipe(
 // broadcast. Used when nLocalRanks > 1 in allgatherP pipeline algorithm. It is
 // called once at the end.
 __global__ void ncclKernelAllGatherPPipeEnd(
-    ctran::gpe::KernelFlagDev* flag,
+    ctran::gpe::KernelFlagDev* f,
     CtranAlgoDeviceState* devState,
     PipeEndKernArgs args) {
+  ctran::device::ColltraceEventScope colltraceScope(f);
+
   // Reset sync flag for next GPE->kernel pipeline sync to use
   GpeKernelSyncDev::reset(args.pipeSync, 0);
 
@@ -67,6 +102,57 @@ __global__ void ncclKernelAllGatherPPipeEnd(
   const auto localRank = statex->localRank();
   const auto nLocalRanks = statex->nLocalRanks();
   barrier(localRank, nLocalRanks);
+
+  // Signal the GPE thread that the intra-node bcast + barrier finished
+  GpeKernelSyncDev::complete(args.pipeSync, 0, kPipeEndDone);
+}
+
+// The ctsrdpipeline (streamed recursive-doubling) variant's nLocalRanks > 1
+// pipeline kernels. Bodies are identical to the ctpipeline PPipe* kernels
+// above; they exist as separate symbols so each variant owns its own kernels.
+__global__ void ncclKernelAllGatherPSrdPipeStart(
+    ctran::gpe::KernelFlagDev* f,
+    CtranAlgoDeviceState* devState) {
+  ctran::device::ColltraceEventScope colltraceScope(f);
+  int* flag = f ? const_cast<int*>(f->flag_) : nullptr;
+  if (flag) {
+    ctran::device::KernelStartGpeAndExit(f);
+  }
+  if (flag) {
+    devStateLoadToShm(flag, devState);
+  } else {
+    devStateLoadToShm(devState);
+  }
+  barrier(statex->localRank(), statex->nLocalRanks());
+}
+
+__global__ void ncclKernelAllGatherPSrdPipeSync(
+    ctran::gpe::KernelFlagDev* f,
+    CtranAlgoDeviceState* devState,
+    PipeSyncKernArgs args) {
+  ctran::device::ColltraceEventScope colltraceScope(f);
+  int* flag = f ? const_cast<int*>(f->flag_) : nullptr;
+  ctran::device::devLoadAbortFlags(flag, devState);
+  // wait till GPE thread post the current stepId
+  GpeKernelSyncDev::waitPost(args.pipeSync, 0, args.stepId);
+}
+
+__global__ void ncclKernelAllGatherPSrdPipeEnd(
+    ctran::gpe::KernelFlagDev* flag,
+    CtranAlgoDeviceState* devState,
+    PipeEndKernArgs args) {
+  ctran::device::ColltraceEventScope colltraceScope(flag);
+  // Reset sync flag for next GPE->kernel pipeline sync to use
+  GpeKernelSyncDev::reset(args.pipeSync, 0);
+
+  // Ensure nvl intra-node comm finishes
+  devStateLoadToShm(devState);
+  const auto localRank = statex->localRank();
+  const auto nLocalRanks = statex->nLocalRanks();
+  barrier(localRank, nLocalRanks);
+
+  // Signal the GPE thread that the intra-node bcast + barrier finished
+  GpeKernelSyncDev::complete(args.pipeSync, 0, kPipeEndDone);
 }
 
 } // namespace ctran::allgatherp

@@ -21,9 +21,9 @@ inline constexpr uint32_t kDefaultRingSize =
 // ALL CUDA graphs share a single ring buffer (owned by CollTrace) and
 // atomically claim slots via a shared write index.
 //
-// Each GraphCudaWaitEvent owns its own timestamp stream and dependency event.
-// Per-collective streams ensure that concurrent collectives (e.g.,
-// signal/wait RMA ops) don't serialize their timestamp kernels.
+// The collective kernel publishes its own start/end timestamps into the ring
+// from inside the kernel (see ColltraceEventScope + the GPE arming path); this
+// class holds the shared ring handle and per-collective identity used for that.
 //
 // No back-pressure — if the poll thread falls behind by more than ringSize
 // replays across all collectives, data loss is detected and logged.
@@ -69,17 +69,26 @@ class GraphCudaWaitEvent : public ICollWaitEvent {
     collId_ = collId;
   }
 
+  bool hasRingBuffer() const noexcept {
+    return ringBuffer_ != nullptr;
+  }
+
+  // Device-side write handle for the shared ring, handed to a collective kernel
+  // so it can publish its own start/end timestamps from inside the kernel.
+  // Returns a default (null-ring, invalid) handle if no ring is attached, so
+  // callers that skip the hasRingBuffer() gate can't null-deref.
+  ::hrdw_ring_buffer::HRDWRingBufferDeviceHandle<GraphCollTraceEvent>
+  deviceHandle() const noexcept {
+    if (ringBuffer_ == nullptr) {
+      return {};
+    }
+    return ringBuffer_->deviceHandle();
+  }
+
  private:
   cudaStream_t stream_;
   uint32_t collId_;
   system_clock_time_point enqueueTime_;
-
-  // per-collective timestamp stream — runs in parallel with the collective
-  // stream. each collective gets its own stream so concurrent collectives
-  // (e.g., signal/wait) don't serialize their timestamp kernels.
-  cudaStream_t timestampStream_{nullptr};
-  // per-collective dependency event for fork/join edges.
-  cudaEvent_t depEvent_{nullptr};
 
   // owned by CollTrace, shared across ALL graphs. set via attachRingBuffer().
   ::hrdw_ring_buffer::HRDWRingBuffer<GraphCollTraceEvent>* ringBuffer_{nullptr};

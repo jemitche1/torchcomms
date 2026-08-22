@@ -3,6 +3,7 @@
 #include "comms/ctran/ibverbx/IbvPd.h"
 #include "comms/ctran/ibverbx/IbvVirtualCq.h"
 #include "comms/ctran/ibverbx/IbverbxSymbols.h"
+#include "comms/ctran/utils/CtranLogger.h"
 
 namespace ibverbx {
 
@@ -34,7 +35,7 @@ IbvPd::~IbvPd() {
   if (pd_) {
     int rc = ibvSymbols.ibv_internal_dealloc_pd(pd_);
     if (rc != 0) {
-      XLOGF(
+      CTRAN_LOG(
           WARN,
           "Failed to deallocate pd rc: {}, {}. "
           "This is a post-failure warning likely due to an uncleaned RDMA resource on the failure path.",
@@ -201,6 +202,49 @@ folly::Expected<IbvQp, Error> IbvPd::createDcQp(
 
   ibv_qp* qp;
   qp = ibvSymbols.mlx5dv_internal_create_qp(
+      pd_->context, initAttrEx, mlx5InitAttr);
+  if (!qp) {
+    return folly::makeUnexpected(Error(errno));
+  }
+  return IbvQp(qp, deviceId_);
+}
+
+folly::Expected<IbvQp, Error> IbvPd::createExtRcQpMlx5(
+    ibv_qp_init_attr_ex* initAttrEx,
+    mlx5dv_qp_init_attr* mlx5InitAttr) const {
+  if (initAttrEx == nullptr || mlx5InitAttr == nullptr) {
+    return folly::makeUnexpected(
+        Error(EINVAL, "createExtRcQpMlx5: null init attrs"));
+  }
+  if (initAttrEx->qp_type != IBV_QPT_RC) {
+    return folly::makeUnexpected(
+        Error(EINVAL, "createExtRcQpMlx5: only IBV_QPT_RC supported"));
+  }
+  if ((mlx5InitAttr->comp_mask & MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS) ==
+      0) {
+    return folly::makeUnexpected(Error(
+        EINVAL,
+        "createExtRcQpMlx5: MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS bit not "
+        "set in comp_mask — caller must advertise create_flags via comp_mask"));
+  }
+  if (mlx5InitAttr->create_flags == 0) {
+    return folly::makeUnexpected(Error(
+        EINVAL,
+        "createExtRcQpMlx5: create_flags is 0 — use plain createRcQp instead "
+        "of the mlx5dv path when no mlx5-specific flags are needed"));
+  }
+  if (!ibvSymbols.mlx5dv_internal_create_qp) {
+    return folly::makeUnexpected(
+        Error(ENOTSUP, "mlx5dv_create_qp not available"));
+  }
+
+  // mlx5dv_create_qp only honors initAttrEx->pd when IBV_QP_INIT_ATTR_PD is
+  // set in comp_mask. Set both together to avoid asymmetry that would let a
+  // caller who forgot the bit silently get a QP with an unexpected PD.
+  initAttrEx->pd = pd_;
+  initAttrEx->comp_mask |= IBV_QP_INIT_ATTR_PD;
+
+  ibv_qp* qp = ibvSymbols.mlx5dv_internal_create_qp(
       pd_->context, initAttrEx, mlx5InitAttr);
   if (!qp) {
     return folly::makeUnexpected(Error(errno));

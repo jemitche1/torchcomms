@@ -11,7 +11,7 @@
 #include <unordered_map>
 
 #include "comms/ctran/backends/ib/CtranIbSingleton.h"
-#include "comms/ctran/mapper/CtranMapperTypes.h"
+#include "comms/ctran/mapper/CtranMapperTypes.h" // @manual=//comms/ctran:mapper_types
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/CtranAvlTree.h"
 #include "comms/ctran/utils/CtranIpc.h"
@@ -366,11 +366,15 @@ class RegCache {
   // returned ScopedRegHdl owns that use, releasing it SW-only in its
   // destructor. If the buffer is not backed by a cached segment,
   // commInvalidUsage is returned and the ScopedRegHdl stays empty.
+  // The caller passes the owning comm's log metadata (real commHash/commDesc)
+  // so memory-logging attribution reflects the real comm rather than a
+  // placeholder.
   commResult_t acquireScopedRegister(
       const void* buf,
       size_t len,
       int cudaDev,
       const std::vector<bool>& backends,
+      const CommLogData& logMetaData,
       ScopedRegHdl& scopedRegHdl);
 
   // Thread-safe functions to cache a buffer range into the global cache.

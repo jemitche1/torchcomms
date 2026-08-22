@@ -2,7 +2,8 @@
 
 #pragma once
 
-#include <ATen/ATen.h>
+// IWYU pragma: no_include <ATen/ATen.h>
+#include <ATen/core/Tensor.h> // @manual=//caffe2:ATen-core
 #include <c10/core/Device.h>
 #include <c10/util/intrusive_ptr.h>
 #include <comms/torchcomms/TorchCommBatch.hpp>
@@ -12,11 +13,12 @@
 #include <comms/torchcomms/TorchCommWindow.hpp>
 #include <comms/torchcomms/TorchWork.hpp>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace torch::comms {
 
-inline constexpr const char* TORCHCOMM_BACKEND_ABI_VERSION = "1.2";
+inline constexpr const char* TORCHCOMM_BACKEND_ABI_VERSION = "1.3";
 
 /**
  * TorchCommBackend - Abstract base class for communication backends.
@@ -184,6 +186,10 @@ class TorchCommBackend {
   virtual const at::Device& getDevice() const = 0;
   // Window & One-sided Operations, not required for all backends, so we added
   // default implementation here
+  virtual bool supportsWindow() const {
+    return false;
+  }
+
   virtual std::shared_ptr<TorchCommWindow> new_window(
       [[maybe_unused]] const std::optional<at::Tensor>& tensor = std::nullopt) {
     throw std::logic_error(

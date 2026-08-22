@@ -3,6 +3,7 @@
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/algos/ReduceScatter/ReduceScatterImpl.h"
 #include "comms/ctran/mapper/CtranMapper.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/utils/cvars/nccl_cvars.h"
 
 bool ctranReduceScatterSupport(
@@ -22,14 +23,14 @@ bool ctranReduceScatterSupport(
   // Check backend availability (except for single rank case)
   if (nRanks > 1 && !directIbReduceScatter &&
       !comm->ctran_->mapper->hasBackend()) {
-    CLOGF_EVERY_MS(
+    CTRAN_LOG_EVERY_MS(
         WARN,
         60000,
         "ctranReduceScatterSupport: no backend available, falling back to baseline");
     for (int peer = 0; peer < nRanks; peer++) {
       if (peer != rank &&
           comm->ctran_->mapper->getBackend(peer) == CtranMapperBackend::UNSET) {
-        CLOGF(
+        CTRAN_LOG(
             WARN,
             "ctranReduceScatterSupport: rank {} peer {} has unset backend",
             rank,
@@ -43,7 +44,7 @@ bool ctranReduceScatterSupport(
   switch (algo) {
     case NCCL_REDUCESCATTER_ALGO::ctdirect:
       if (nNodes > 1) {
-        CLOGF_EVERY_MS(
+        CTRAN_LOG_EVERY_MS(
             WARN,
             60000,
             "ctranReduceScatterSupport: ctdirect only supports nNodes=1. Falling back to baseline.");
@@ -52,7 +53,7 @@ bool ctranReduceScatterSupport(
       break;
     case NCCL_REDUCESCATTER_ALGO::ctring:
       if (nLocalRanks > 1) {
-        CLOGF_EVERY_MS(
+        CTRAN_LOG_EVERY_MS(
             WARN,
             60000,
             "ctranReduceScatterSupport: ctring only supports nLocalRanks=1. Falling back to baseline.");
@@ -64,7 +65,7 @@ bool ctranReduceScatterSupport(
       // buffer size is smaller than NCCL_CTRAN_INTERNODE_TMPBUF_SIZE.
       // Currently, we return false here since we can't check the data buffer
       // size.
-      CLOGF_EVERY_MS(
+      CTRAN_LOG_EVERY_MS(
           WARN,
           60000,
           "ctranReduceScatterSupport returns false for all cases of algo=ctrhd. Falling back to baseline.");
@@ -74,7 +75,7 @@ bool ctranReduceScatterSupport(
       // we return false here. If a new ctran algo is added that supports this
       // case, we can remove this check.
       if (nNodes > 1 && nLocalRanks > 1) {
-        CLOGF_EVERY_MS(
+        CTRAN_LOG_EVERY_MS(
             WARN,
             60000,
             "ctranReduceScatterSupport: ctran only supports nLocalRanks=1 or nNodes=1. Falling back to baseline.");
@@ -82,7 +83,15 @@ bool ctranReduceScatterSupport(
       }
       break;
     case NCCL_REDUCESCATTER_ALGO::ctdirect_ib:
-      return true;
+#if defined(ENABLE_PRIMS)
+      return ctranReduceScatterDirectIbSupport(comm);
+#else
+      return false;
+#endif
+    case NCCL_REDUCESCATTER_ALGO::ctring_ib:
+      // Hosted by MCCL; CTRAN reports unsupported so non-MCCL callers fall
+      // back.
+      return false;
     case NCCL_REDUCESCATTER_ALGO::orig: // invalid query
       return false;
   }
@@ -111,12 +120,12 @@ commResult_t ctranReduceScatter(
   // nLocalRanks>1 case is currently unsupported.
   if (algo == NCCL_REDUCESCATTER_ALGO::ctran) {
     if (nNodes == 1) {
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO, COLL, "Running ReduceScatter ctdirect algorithm for nNodes=1");
       algo = NCCL_REDUCESCATTER_ALGO::ctdirect;
     } else if (nLocalRanks == 1) {
       // Only ctring for nLocalRanks=1 && nNodes >1 case
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO,
           COLL,
           "Running ReduceScatter ctring algorithm for nLocalRanks=1 and nNodes>1");
@@ -138,11 +147,37 @@ commResult_t ctranReduceScatter(
       return ctranReduceScatterDirectIb(
           sendbuff, recvbuff, recvcount, datatype, redOp, comm, stream);
     default:
-      CLOGF(
-          WARN,
+      CTRAN_ERR(
+          commInternalError,
           "ctranReduceScatter: no valid algorithm to support nLocalRanks {} nNodes {}",
           nLocalRanks,
           nNodes);
-      return ErrorStackTraceUtil::log(commInternalError);
+      return commInternalError;
   }
+}
+
+commResult_t ctranReduceScatterQuantize(
+    const void* sendbuff,
+    void* recvbuff,
+    size_t recvcount,
+    commDataType_t inputType,
+    commDataType_t transportType,
+    commRedOp_t redOp,
+    const uint64_t* seedPtr,
+    CtranComm* comm,
+    cudaStream_t stream,
+    enum NCCL_REDUCESCATTER_ALGO algo) {
+  if (algo != NCCL_REDUCESCATTER_ALGO::ctdirect_ib) {
+    return commInvalidArgument;
+  }
+  return ctranReduceScatterQuantizeDirectIb(
+      sendbuff,
+      recvbuff,
+      recvcount,
+      inputType,
+      transportType,
+      redOp,
+      seedPtr,
+      comm,
+      stream);
 }

@@ -36,6 +36,12 @@ add_library(ctran OBJECT
 )
 
 target_compile_features(ctran PRIVATE cxx_std_20)
+# CTRAN public headers expose the logger, so consumers need the same spdlog
+# configuration when compiling those headers.
+target_compile_definitions(ctran PUBLIC
+    SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO
+    SPDLOG_FMT_EXTERNAL
+)
 
 target_compile_options(ctran PRIVATE
     -fPIC
@@ -61,6 +67,7 @@ target_include_directories(ctran PRIVATE
     ${ROOT}
     ${CONDA_INCLUDE}
     ${CUDA_INCLUDE_DIRS}
+    ${CUDA_INCLUDE_DIRS}/cccl
 )
 
 # ctran is the primary prims consumer: enabling this activates the (otherwise

@@ -68,11 +68,17 @@ class CtranDistTestFixture : public CtranTestFixtureBase,
 
   void TearDown() override;
 
-  // When ibLazyConnect is true, the communicator is built with
-  // pipesConfig.ibLazyConnect set so IBGDA peers are materialized on-demand
-  // (the NCCL_CTRAN_IBGDA_LAZY_CONNECT env does NOT reach this default-config
-  // path -- see comment in makeCtranComm).
-  std::unique_ptr<CtranComm> makeCtranComm(bool ibLazyConnect = false);
+  // ibLazyConnect is retained for compatibility; peers are always materialized
+  // on demand regardless of its value.
+  std::unique_ptr<CtranComm> makeCtranComm(
+      bool noLocal = false,
+      bool ibLazyConnect = true,
+      bool tmpbufEagerAlloc = true);
+
+  // Asserts the comm's runtime topology matches the NCCL_COMM_STATE_DEBUG_TOPO
+  // env override (nolocal/vnode). Early-returns when the env is unset, so
+  // default-topology suites are unaffected.
+  void assertExpectedTopology(CtranComm* comm) const;
 
   // Intra-node (NVL domain) barrier using CtranComm's bootstrap
   void barrierNvlDomain(CtranComm* comm);
@@ -88,8 +94,6 @@ class CtranDistTestFixture : public CtranTestFixtureBase,
         comm->statex_->localRankToRanks());
     COMMCHECK_TEST(static_cast<commResult_t>(std::move(resFuture).get()));
   }
-
-  bool enableNolocal{false};
 
  private:
   std::unordered_map<std::string, std::optional<std::string>> savedEnvs_;

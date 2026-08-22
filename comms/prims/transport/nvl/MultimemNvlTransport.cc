@@ -2,19 +2,30 @@
 
 #include "comms/prims/transport/nvl/MultimemNvlTransport.h"
 
-#include <limits>
+#include <algorithm>
+#include <exception>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <utility>
 
-#include "comms/common/BitOps.cuh"
+#include "comms/prims/bootstrap/NvlBootstrapAdapter.h"
+#include "comms/prims/bootstrap/TeamStatusAgreement.h"
 #include "comms/prims/core/SignalState.cuh"
 #include "comms/utils/checks.h"
+#ifdef __HIP_PLATFORM_AMD__
+#include "comms/prims/transport/amd/HipHostCompat.h"
+#else
+#include "comms/utils/CudaRAII.h"
+#endif
 
 namespace comms::prims {
 
 namespace {
+
+constexpr uint64_t kMultimemNvlTransportProtocol = 0x4D4D4E564CULL;
+constexpr uint64_t kMultimemNvlTransportProtocolVersion = 6;
 
 int getCurrentCudaDevice() {
   int cudaDevice = 0;
@@ -38,6 +49,8 @@ std::vector<int> identityRankMap(int nRanks) {
 }
 
 } // namespace
+
+MultimemNvlTransport::~MultimemNvlTransport() = default;
 
 void MultimemNvlTransport::validateRankMap(
     int commRank,
@@ -75,56 +88,47 @@ MultimemNvlTransport::MultimemNvlTransport(
     int commRank,
     std::vector<int> nvlRankToCommRank,
     const MultimemNvlTransportConfig& config)
-    : commRank_(commRank),
-      nvlRanks_(static_cast<int>(nvlRankToCommRank.size())),
-      nvlRankToCommRank_(std::move(nvlRankToCommRank)),
-      config_(config) {
+    : nvlRanks_(static_cast<int>(nvlRankToCommRank.size())), config_(config) {
   // Topology validation runs BEFORE cudaGetDevice so the rank-map preconditions
   // are exercisable on CPU-only hosts (see MultimemNvlTransportValidationTest).
-  validateRankMap(commRank_, nvlRankToCommRank_);
+  validateRankMap(commRank, nvlRankToCommRank);
 
-  if (config_.dataBufferSize == 0) {
+  const auto validation =
+      validate_multimem_nvl_transport_config(config_, nvlRanks_);
+  if (!validation) {
     throw std::runtime_error(
-        "MultimemNvlTransport: dataBufferSize must be non-zero");
+        std::string("MultimemNvlTransport: ") +
+        std::string(validation.errorMessage));
   }
-  const uint64_t totalSignalCount =
-      static_cast<uint64_t>(config_.userSignalCount) +
-      static_cast<uint64_t>(config_.internalSignalCount);
-  if (totalSignalCount == 0) {
-    throw std::runtime_error(
-        "MultimemNvlTransport: at least one signal slot is required");
-  }
-  if (totalSignalCount >
-      static_cast<uint64_t>(std::numeric_limits<int>::max())) {
-    throw std::runtime_error("MultimemNvlTransport: signalCount too large");
-  }
+  dataBufferSize_ = validation.dataBufferSize;
+  internalSignalCount_ = validation.internalSignalCount;
+  signalsPerChannel_ = validation.signalsPerChannel;
 
-  // commRank presence in the map is already verified by validateRankMap.
-  int nvlRank = -1;
-  for (int rank = 0; rank < nvlRanks_; ++rank) {
-    if (nvlRankToCommRank_[static_cast<std::size_t>(rank)] == commRank_) {
-      nvlRank = rank;
-      break;
-    }
-  }
+  // validateRankMap() guarantees that commRank appears exactly once.
+  const auto nvlRankIt =
+      std::find(nvlRankToCommRank.begin(), nvlRankToCommRank.end(), commRank);
+  const int nvlRank =
+      static_cast<int>(std::distance(nvlRankToCommRank.begin(), nvlRankIt));
+  nvlRank_ = nvlRank;
+
+  static_assert(alignof(SignalState) == detail::kMultimemSignalAlignment);
+  static_assert(sizeof(SignalState) == detail::kMultimemSignalStateSize);
+  signalRegionOffset_ = validation.signalRegionOffset;
+  const std::size_t combinedSize = validation.backingAllocationSize;
+  const std::size_t signalRegionBytes = combinedSize - signalRegionOffset_;
 
   cudaDevice_ = getCurrentCudaDevice();
 
-  signalRegionOffset_ =
-      comms::bitops::alignUp(config_.dataBufferSize, alignof(SignalState));
-  const std::size_t signalRegionBytes =
-      getSignalBufferSize(static_cast<int>(totalSignalCount));
-  const std::size_t combinedSize = signalRegionOffset_ + signalRegionBytes;
-
   // The GpuMemHandler owns the unicast backing; exchange() adds the multicast
   // overlay over it. Size the allocation to the multicast granularity
-  // (alignFloor) so it is bindable into a multicast object. Only multicast is
-  // used (no P2P exchangeMemPtrs), so the selfRank/nRanks coordinates here are
-  // the NVL-team rank and size.
+  // (alignFloor) so it is bindable into a multicast object. The unicast peer
+  // exchange and multicast exchange both use NVL-team coordinates.
   const std::size_t alignFloor =
       GpuMemHandler::backingGranularity(cudaDevice_, nvlRanks_);
+  nvlBootstrap_ = std::make_shared<NvlBootstrapAdapter>(
+      std::move(bootstrap), std::move(nvlRankToCommRank));
   combinedHandler_ = std::make_unique<GpuMemHandler>(
-      std::move(bootstrap),
+      nvlBootstrap_,
       nvlRank,
       nvlRanks_,
       combinedSize,
@@ -140,11 +144,13 @@ MultimemNvlTransport::MultimemNvlTransport(
   // exchange()'s post-map barrier lets any peer signal into this region. This
   // mirrors MultiPeerNvlTransport, which zeroes its signal buffer at
   // construction.
-  auto* localSignalRegion =
-      static_cast<char*>(combinedHandler_->getLocalDeviceMemPtr()) +
-      signalRegionOffset_;
-  CUDA_CHECK(cudaMemset(localSignalRegion, 0, signalRegionBytes));
-  CUDA_CHECK(cudaStreamSynchronize(/*stream=*/0));
+  if (signalRegionBytes != 0) {
+    auto* localSignalRegion =
+        static_cast<char*>(combinedHandler_->getLocalDeviceMemPtr()) +
+        signalRegionOffset_;
+    CUDA_CHECK(cudaMemset(localSignalRegion, 0, signalRegionBytes));
+    CUDA_CHECK(cudaStreamSynchronize(/*stream=*/0));
+  }
 }
 
 MultimemNvlTransport::MultimemNvlTransport(
@@ -168,28 +174,87 @@ MultimemNvlTransport::MultimemNvlTransport(
           }(),
           config) {}
 
+std::unique_ptr<meta::comms::DeviceBuffer>
+MultimemNvlTransport::exchangeUnicastPeerViews() {
+  combinedHandler_->exchangeMemPtrs();
+
+  std::unique_ptr<meta::comms::DeviceBuffer> devicePeerInternalSignals;
+  std::exception_ptr localError;
+  try {
+    std::vector<SignalState*> peerInternalSignals(
+        static_cast<std::size_t>(nvlRanks_));
+    for (int rank = 0; rank < nvlRanks_; ++rank) {
+      auto* peerBase =
+          static_cast<char*>(combinedHandler_->getPeerDeviceMemPtr(rank));
+      auto* peerSignals =
+          reinterpret_cast<SignalState*>(peerBase + signalRegionOffset_);
+      peerInternalSignals[static_cast<std::size_t>(rank)] =
+          peerSignals + config_.userSignalCount;
+    }
+
+    devicePeerInternalSignals = std::make_unique<meta::comms::DeviceBuffer>(
+        peerInternalSignals.size() * sizeof(SignalState*));
+    FB_CUDACHECKTHROW(cudaMemcpy(
+        devicePeerInternalSignals->get(),
+        peerInternalSignals.data(),
+        peerInternalSignals.size() * sizeof(SignalState*),
+        cudaMemcpyHostToDevice));
+  } catch (...) {
+    localError = std::current_exception();
+  }
+
+  std::vector<detail::TeamStatus> status(static_cast<std::size_t>(nvlRanks_));
+  detail::allGatherAndAgree(
+      *nvlBootstrap_,
+      nvlRank_,
+      nvlRanks_,
+      status,
+      localError,
+      "MultimemNvlTransport::exchange: construct the unicast peer pointer "
+      "table");
+
+  return devicePeerInternalSignals;
+}
+
 void MultimemNvlTransport::exchange() {
-  if (exchanged_) {
+  if (exchangeState_ == ExchangeState::kReady) {
     return;
   }
-  if (broken_) {
+  if (exchangeState_ == ExchangeState::kFailed) {
     throw std::runtime_error(
         "MultimemNvlTransport::exchange: previous exchange() failed; "
         "rebuild the transport to retry (same-object retry is unsafe after "
         "a partial multicast setup)");
   }
   try {
+    const MulticastExchangeContract contract{
+        .protocol = kMultimemNvlTransportProtocol,
+        .version = kMultimemNvlTransportProtocolVersion,
+        .parameters =
+            {
+                config_.perChannelSize,
+                config_.pipelineDepth,
+                config_.maxChannels,
+                config_.maxBlocks,
+                config_.userSignalCount,
+                static_cast<uint64_t>(config_.enableUnicastPeerViews),
+            },
+    };
     combinedHandler_->exchangeMulticast(
-        commRank_, nvlRankToCommRank_, cudaDevice_);
+        nvlRank_, identityRankMap(nvlRanks_), cudaDevice_, contract);
+
+    if (config_.enableUnicastPeerViews) {
+      internalUnicastSignalsByRank_ = exchangeUnicastPeerViews();
+    }
   } catch (...) {
-    broken_ = true;
+    exchangeState_ = ExchangeState::kFailed;
     throw;
   }
-  exchanged_ = true;
+  exchangeState_ = ExchangeState::kReady;
 }
 
 MultimemNvlTransportDevice MultimemNvlTransport::getDeviceTransport() const {
-  if (!exchanged_) {
+  if (exchangeState_ != ExchangeState::kReady) {
     throw std::runtime_error(
         "MultimemNvlTransport: exchange() must complete before device use");
   }
@@ -203,7 +268,7 @@ MultimemNvlTransportDevice MultimemNvlTransport::getDeviceTransport() const {
   auto* multimemSignals =
       reinterpret_cast<SignalState*>(multimemBase + signalRegionOffset_);
   const auto userSignalCount = config_.userSignalCount;
-  const auto internalSignalCount = config_.internalSignalCount;
+  const auto internalSignalCount = internalSignalCount_;
 
   return MultimemNvlTransportDevice{
       .localData = localBase,
@@ -216,12 +281,23 @@ MultimemNvlTransportDevice MultimemNvlTransport::getDeviceTransport() const {
           localSignals + userSignalCount, internalSignalCount),
       .internalMultimemSignals = DeviceSpan<SignalState>(
           multimemSignals + userSignalCount, internalSignalCount),
-      .dataBufferSize = config_.dataBufferSize,
+      .dataBufferSize = dataBufferSize_,
+      .nvlRank = nvlRank_,
+      .nvlRanks = nvlRanks_,
+      .pipelineDepth = static_cast<uint32_t>(config_.pipelineDepth),
+      .maxChannels = static_cast<uint32_t>(config_.maxChannels),
+      .signalsPerChannel = signalsPerChannel_,
+      .internalUnicastSignalsByRank = internalUnicastSignalsByRank_
+          ? DeviceSpan<SignalState*>(
+                static_cast<SignalState**>(
+                    internalUnicastSignalsByRank_->get()),
+                static_cast<uint32_t>(nvlRanks_))
+          : DeviceSpan<SignalState*>{},
   };
 }
 
 std::size_t MultimemNvlTransport::getAllocatedDataBufferSize() const {
-  return config_.dataBufferSize;
+  return dataBufferSize_;
 }
 
 std::size_t MultimemNvlTransport::getAllocatedSignalBufferSize() const {
@@ -231,7 +307,7 @@ std::size_t MultimemNvlTransport::getAllocatedSignalBufferSize() const {
   // granularity, so combinedHandler_->getAllocatedSize() - signalRegionOffset_
   // would include trailing padding that is not addressable as SignalState.
   return getSignalBufferSize(
-      static_cast<int>(config_.userSignalCount + config_.internalSignalCount));
+      static_cast<int>(config_.userSignalCount + internalSignalCount_));
 }
 
 } // namespace comms::prims

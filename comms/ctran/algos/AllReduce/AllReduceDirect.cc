@@ -7,10 +7,11 @@
 
 #include "comms/ctran/algos/AllReduce/AllReduceImpl.h"
 #include "comms/ctran/algos/CtranAlgo.h"
+#include "comms/ctran/algos/common/OccupancyUtils.h"
 #include "comms/ctran/mapper/CtranMapper.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/utils/commSpecs.h"
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 CTRAN_DATATYPE_REDOP_TO_FUNC_MAPPER(typeToFunc, ncclKernelAllReduceCtranDirect);
 
@@ -52,21 +53,21 @@ static const auto myAlgo = NCCL_ALLREDUCE_ALGO::ctdirect;
  *         registers and reduces them into the receive buffer.
  */
 
-#define THROW_IF_ABORTED(code, ...)                                            \
-  do {                                                                         \
-    code;                                                                      \
-    if (comm->testAbort()) {                                                   \
-      auto _abort = comm->getAbort();                                          \
-      std::string _ctx =                                                       \
-          _abort->TimedOut() ? "comm aborted due to timeout" : "comm aborted"; \
-      std::string _desc{__VA_ARGS__};                                          \
-      throw ctran::utils::Exception(                                           \
-          _ctx,                                                                \
-          commRemoteError,                                                     \
-          comm->logMetaData_.rank,                                             \
-          comm->logMetaData_.commHash,                                         \
-          _desc.empty() ? std::nullopt : std::make_optional(_desc));           \
-    }                                                                          \
+#define THROW_IF_ABORTED(code, ...)                                           \
+  do {                                                                        \
+    code;                                                                     \
+    if (comm->testAbort()) {                                                  \
+      auto _abort = comm->getAbort();                                         \
+      std::string _ctx = _abort->isTimedOut() ? "comm aborted due to timeout" \
+                                              : "comm aborted";               \
+      std::string _desc{__VA_ARGS__};                                         \
+      throw ctran::utils::Exception(                                          \
+          _ctx,                                                               \
+          commRemoteError,                                                    \
+          comm->logMetaData_.rank,                                            \
+          comm->logMetaData_.commHash,                                        \
+          _desc.empty() ? std::nullopt : std::make_optional(_desc));          \
+    }                                                                         \
   } while (0)
 
 static commResult_t impl(
@@ -163,7 +164,7 @@ static commResult_t impl(
           intraNodeLocalSendbuffReq[lr].get()));
       if (intraNodeRemoteSendAccessKeys[lr].backend !=
           CtranMapperBackend::NVL) {
-        CLOGF(
+        CTRAN_LOG(
             WARN,
             "NVLink backend not available between rank {} and {}",
             rank,
@@ -199,8 +200,8 @@ static commResult_t impl(
           intraNodeLocalRecvbuffReq[lr].get()));
       if (intraNodeRemoteRecvAccessKeys[lr].backend !=
           CtranMapperBackend::NVL) {
-        CLOGF(
-            ERR,
+        CTRAN_ERR(
+            commInternalError,
             "NVLink backend not available between rank {} and {}",
             rank,
             statex->localRankToRank(lr));
@@ -576,8 +577,8 @@ commResult_t ctranAllReduceDirect(
 
   // Prevent buffer overflow in localReduce.srcs array
   if (nLocalRanks > CTRAN_MAX_NVL_PEERS) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInvalidUsage,
         "nLocalRanks ({}) exceeds CTRAN_MAX_NVL_PEERS ({}). This will cause buffer overflow in localReduce.srcs array! ",
         nLocalRanks,
         CTRAN_MAX_NVL_PEERS);
@@ -620,9 +621,12 @@ commResult_t ctranAllReduceDirect(
   op->allreduce.datatype = datatype;
   op->allreduce.op = redOp;
 
-  XCHECK(typeToFunc.contains(std::make_pair(datatype, redOp)))
-      << "typeToFunc does not contain datatype " << datatype << " with op "
-      << redOp;
+  CTRAN_LOG_IF(
+      FATAL,
+      !typeToFunc.contains(std::make_pair(datatype, redOp)),
+      "Check failed: typeToFunc.contains(std::make_pair(datatype, redOp)): typeToFunc does not contain datatype {} with op {}",
+      datatype,
+      redOp);
   const void* func = typeToFunc.at(std::make_pair(datatype, redOp));
 
   auto config = KernelConfig(
@@ -665,6 +669,12 @@ commResult_t ctranAllReduceDirect(
   if (config.numThreads > NCCL_CTRAN_ALLREDUCE_DIRECT_THREAD_BLOCK_SIZE) {
     config.numThreads = NCCL_CTRAN_ALLREDUCE_DIRECT_THREAD_BLOCK_SIZE;
   }
+  config.blocksPerSM = MCCL_COLLECTIVE_STATS_ENABLE
+      ? ctran::algos::getBlocksPerSM(
+            func,
+            static_cast<int>(config.numThreads),
+            config.launchSharedMemBytes())
+      : 0;
 
   // Prepare kElems for first segment symmetrically handled by each rank
   if (nSteps > 0) {

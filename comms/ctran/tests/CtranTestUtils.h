@@ -6,22 +6,23 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h> // @manual
 #include <gtest/gtest.h>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
 
 #include <folly/futures/Future.h>
 
+#include "comms/common/fault_tolerance/Abort.h"
 #include "comms/ctran/Ctran.h"
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/commstate/CommStateX.h"
 #include "comms/ctran/interfaces/ICtran.h"
-#include "comms/ctran/tests/bootstrap/IntraProcessBootstrap.h"
 #include "comms/ctran/tests/bootstrap/MockBootstrap.h"
-#include "comms/ctran/utils/Abort.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/CudaUtils.h"
 #include "comms/ctran/utils/CudaWrap.h"
@@ -69,8 +70,8 @@ inline CtranCommWithBootstrap createCtranCommWithBootstrap(
 
   COMMCHECK_TEST(ctran::utils::commCudaLibraryInit());
 
-  std::unique_ptr<CtranComm> ctranComm =
-      std::make_unique<CtranComm>(::ctran::utils::createAbort(abortEnabled));
+  std::unique_ptr<CtranComm> ctranComm = std::make_unique<CtranComm>(
+      ::comms::fault_tolerance::createAbort(abortEnabled));
 
   // Create and initialize bootstrap; needed for CTRAN backend initialization
   auto bootstrap = std::make_shared<mccl::bootstrap::Bootstrap>(
@@ -251,7 +252,7 @@ inline bool checkTcpStoreEnv() {
 //       bootstrap
 //       |
 //       +-- CtranIntraProcessFixture (multi-rank simulation in single process)
-//               - Uses threads + IntraProcessBootstrap
+//               - Uses threads + a real Bootstrap over loopback
 //               - Orchestrated work dispatch via run(rank, work)
 //
 // ============================================================================
@@ -288,18 +289,18 @@ class CtranStandaloneFixture : public CtranTestFixtureBase {
   // @param abort: Optional abort control for fault tolerance testing.
   //               Defaults to enabled abort.
   std::unique_ptr<CtranComm> makeCtranComm(
-      std::shared_ptr<::ctran::utils::Abort> abort =
-          ctran::utils::createAbort(/*enabled=*/true));
+      std::shared_ptr<::comms::fault_tolerance::Abort> abort =
+          comms::fault_tolerance::createAbort(/*enabled=*/true));
 
   int rank{0}; // Always 0 for standalone tests
 };
 
-// Intra-process multi-rank fixture for testing with IntraProcessBootstrap.
+// Intra-process multi-rank fixture using the real MCCL bootstrap over loopback.
 // This allows testing multi-rank scenarios within a single process using
 // threads, without requiring mpirun or external coordination.
 //
 // Use this fixture for:
-// - Unit tests that need multi-rank semantics without real networking
+// - Unit tests that need multi-rank semantics without a multi-host setup
 // - Tests where you need to orchestrate different work to different ranks
 // - Fast multi-rank tests without mpirun overhead
 //
@@ -311,17 +312,23 @@ class CtranIntraProcessFixture : public CtranTestFixtureBase {
   struct PerRankState;
   using Work = std::function<void(PerRankState&)>;
 
-  struct PerRankState {
-    // Ideally we could use the IBootstrap interface, but it makes UT debugging
-    // hard since the barriers are not named. We use the specific
-    // IntraProcessBootstrap class for namedBarriers.
-    ::ctran::testing::IntraProcessBootstrap* getBootstrap() {
-      return reinterpret_cast<::ctran::testing::IntraProcessBootstrap*>(
-          ctranComm->bootstrap_.get());
-    }
+  // One instance per test run, shared by every rank: the barrier counters and
+  // the URL table used to connect the ranks.
+  struct SharedState {
+    std::atomic<int> nArrivals{0};
+    std::atomic<bool> sense{false};
+    std::vector<std::string> urls;
 
-    std::shared_ptr<::ctran::testing::IntraProcessBootstrap::State>
-        sharedBootstrapState;
+    // Named barrier across all rank-threads.
+    void barrierNamed(
+        int rank,
+        int nRanks,
+        int timeoutSeconds,
+        const std::string& name = "");
+  };
+
+  struct PerRankState {
+    std::shared_ptr<SharedState> sharedState;
     std::unique_ptr<CtranComm> ctranComm{nullptr};
     int nRanks{1};
     int rank{0};
@@ -344,7 +351,8 @@ class CtranIntraProcessFixture : public CtranTestFixtureBase {
 
   void startWorkers(
       int nRanks,
-      const std::vector<std::shared_ptr<::ctran::utils::Abort>>& aborts);
+      const std::vector<std::shared_ptr<::comms::fault_tolerance::Abort>>&
+          aborts);
 
   void run(int rank, const Work& work) {
     perRankStates_[rank].workPromise.setValue(work);

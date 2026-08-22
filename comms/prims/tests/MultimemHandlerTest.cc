@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -158,17 +159,16 @@ std::shared_ptr<StrictMockBootstrap> makeDelegatingMock(
   return mock;
 }
 
-// Identifies one of the four bootstrap call sites inside
-// `MultimemHandler::exchange`. `ordinal` is the 0-based occurrence of the
-// chosen `Api` within a single `exchange()` invocation:
-//   (kAllGatherNvlDomain, 0) -> agreeOnHandleType
+// Identifies one of the four allGatherNvlDomain calls inside
+// `MultimemHandler::exchange`. `ordinal` is the 0-based occurrence within a
+// single `exchange()` invocation:
+//   (kAllGatherNvlDomain, 0) -> agreeOnSetup
 //   (kAllGatherNvlDomain, 1) -> exchangeMulticastHandle
-//   (kBarrierNvlDomain,   0) -> synchronizeRanks("pre-bind")
-//   (kBarrierNvlDomain,   1) -> synchronizeRanks("post-map")
+//   (kAllGatherNvlDomain, 2) -> agreeOnStage("join")
+//   (kAllGatherNvlDomain, 3) -> agreeOnStage("bind/map")
 struct FailureCase {
   // Short, gtest-name-safe label used in the parameterized test name.
   const char* name;
-  enum class Api { kAllGatherNvlDomain, kBarrierNvlDomain } api;
   int ordinal;
 };
 
@@ -186,10 +186,10 @@ enum class FailureMode {
 };
 
 constexpr FailureCase kAllFailureCases[] = {
-    {"agreeOnHandleType", FailureCase::Api::kAllGatherNvlDomain, 0},
-    {"exchangeMulticastHandle", FailureCase::Api::kAllGatherNvlDomain, 1},
-    {"preBindBarrier", FailureCase::Api::kBarrierNvlDomain, 0},
-    {"postMapBarrier", FailureCase::Api::kBarrierNvlDomain, 1},
+    {"agreeOnSetup", 0},
+    {"exchangeMulticastHandle", 1},
+    {"joinAgreement", 2},
+    {"bindMapAgreement", 3},
 };
 
 constexpr FailureMode kAllFailureModes[] = {
@@ -211,10 +211,24 @@ const char* describeMode(FailureMode mode) {
 }
 
 // Returns the gmock action that implements the chosen failure mode for an
-// allGatherNvlDomain invocation. Captured by reference where used.
-auto allGatherFailureAction(FailureMode mode) {
-  return [mode](void*, int, int, int, const std::vector<int>&)
+// allGatherNvlDomain invocation.
+auto allGatherFailureAction(
+    FailureMode mode,
+    const std::shared_ptr<meta::comms::IBootstrap>& real,
+    bool rendezvousBeforeFailure) {
+  return [mode, real, rendezvousBeforeFailure](
+             void*, int, int rank, int nRanks, const std::vector<int>& rankMap)
              -> folly::SemiFuture<int> {
+    // Symmetric injection must let every rank finish the preceding driver
+    // phase before the first injected failure tears down the shared multicast
+    // object.
+    if (rendezvousBeforeFailure) {
+      const int rendezvousResult =
+          real->barrierNvlDomain(rank, nRanks, rankMap).get();
+      if (rendezvousResult != 0) {
+        return folly::makeSemiFuture(rendezvousResult);
+      }
+    }
     switch (mode) {
       case FailureMode::kReturnNonZero:
         return folly::makeSemiFuture(-1);
@@ -231,26 +245,9 @@ auto allGatherFailureAction(FailureMode mode) {
   };
 }
 
-auto barrierFailureAction(FailureMode mode) {
-  return [mode](int, int, const std::vector<int>&) -> folly::SemiFuture<int> {
-    switch (mode) {
-      case FailureMode::kReturnNonZero:
-        return folly::makeSemiFuture(-1);
-      case FailureMode::kSyncThrowsStd:
-        throw std::runtime_error("simulated barrierNvlDomain failure");
-      case FailureMode::kSyncThrowsNonStd:
-        // See allGatherFailureAction above for the NOLINT rationale.
-        // NOLINTNEXTLINE(facebook-hte-ThrowNonStdExceptionIssue)
-        throw NonStdSimulatedFault{};
-    }
-    return folly::makeSemiFuture(-1);
-  };
-}
-
-// Programs the StrictMockBootstrap so the targeted (api, ordinal) call hits
-// `mode`, while every preceding ordinal of the same API delegates to `real`.
-// Other APIs are left to their ON_CALL defaults. Uses an InSequence so the
-// "succeed N-1 times then fail" pattern is unambiguous.
+// Programs the StrictMockBootstrap so the targeted ordinal hits `mode`, while
+// every preceding allGatherNvlDomain call delegates to `real`. Uses an
+// InSequence so the "succeed N-1 times then fail" pattern is unambiguous.
 //
 // `injectOnThisRank` lets the caller turn injection off for asymmetric tests.
 // When false, no EXPECT_CALL overrides are added; the makeDelegatingMock()
@@ -262,69 +259,36 @@ void programFailureInjection(
     const std::shared_ptr<meta::comms::IBootstrap>& real,
     const FailureCase& fail,
     FailureMode mode,
-    bool injectOnThisRank = true) {
+    bool injectOnThisRank,
+    bool rendezvousBeforeFailure) {
   using ::testing::_;
   using ::testing::AnyNumber;
   using ::testing::InSequence;
 
-  // Local delegation lambdas, captured per-API. Defined once and reused for
-  // every EXPECT_CALL / ON_CALL action below so the closures aren't repeated
-  // 5+ times inline.
+  // Define the delegation action once and reuse it for each preceding call.
   auto delegateAllGatherNvl =
       [real](
           void* buf, int len, int r, int n, const std::vector<int>& rankMap) {
         return real->allGatherNvlDomain(buf, len, r, n, rankMap);
       };
-  auto delegateBarrierNvl = [real](
-                                int r, int n, const std::vector<int>& rankMap) {
-    return real->barrierNvlDomain(r, n, rankMap);
-  };
 
   if (!injectOnThisRank) {
     // StrictMock treats any unmatched call as a test failure ("uninteresting
-    // mock function call"). Provide baseline AnyNumber expectations for the
-    // two NVL-domain APIs MultimemHandler::exchange() uses, all delegating to
-    // `real`. This lets the surviving rank actually run through exchange()
-    // with the real bootstrap and surface its failure via the lowered store
-    // timeout.
+    // mock function call"). Let every agreement delegate to `real` so the
+    // surviving rank surfaces its failure through the lowered store timeout.
     EXPECT_CALL(mock, allGatherNvlDomain(_, _, _, _, _))
         .Times(AnyNumber())
         .WillRepeatedly(delegateAllGatherNvl);
-    EXPECT_CALL(mock, barrierNvlDomain(_, _, _))
-        .Times(AnyNumber())
-        .WillRepeatedly(delegateBarrierNvl);
     return;
   }
 
-  // Allow the non-targeted API to be called by exchange() any number of times,
-  // always delegating to `real`. (For an allGatherNvlDomain failure, this lets
-  // any incidental barrierNvlDomain calls succeed, and vice versa.) Without
-  // this, StrictMock would flag those calls as uninteresting.
-  if (fail.api == FailureCase::Api::kAllGatherNvlDomain) {
-    EXPECT_CALL(mock, barrierNvlDomain(_, _, _))
-        .Times(AnyNumber())
-        .WillRepeatedly(delegateBarrierNvl);
-  } else {
+  InSequence sequence;
+  for (int i = 0; i < fail.ordinal; ++i) {
     EXPECT_CALL(mock, allGatherNvlDomain(_, _, _, _, _))
-        .Times(AnyNumber())
-        .WillRepeatedly(delegateAllGatherNvl);
+        .WillOnce(delegateAllGatherNvl);
   }
-
-  InSequence s;
-  if (fail.api == FailureCase::Api::kAllGatherNvlDomain) {
-    for (int i = 0; i < fail.ordinal; ++i) {
-      EXPECT_CALL(mock, allGatherNvlDomain(_, _, _, _, _))
-          .WillOnce(delegateAllGatherNvl);
-    }
-    EXPECT_CALL(mock, allGatherNvlDomain(_, _, _, _, _))
-        .WillOnce(allGatherFailureAction(mode));
-  } else {
-    for (int i = 0; i < fail.ordinal; ++i) {
-      EXPECT_CALL(mock, barrierNvlDomain(_, _, _)).WillOnce(delegateBarrierNvl);
-    }
-    EXPECT_CALL(mock, barrierNvlDomain(_, _, _))
-        .WillOnce(barrierFailureAction(mode));
-  }
+  EXPECT_CALL(mock, allGatherNvlDomain(_, _, _, _, _))
+      .WillOnce(allGatherFailureAction(mode, real, rendezvousBeforeFailure));
 }
 
 // Identifies which ranks should have their mock inject the failure for a
@@ -334,13 +298,13 @@ void programFailureInjection(
 enum class RankPattern {
   kAllRanks,
   kRank0Only,
-  kAllExceptRank0,
+  kRank1Only,
 };
 
 constexpr RankPattern kAllRankPatterns[] = {
     RankPattern::kAllRanks,
     RankPattern::kRank0Only,
-    RankPattern::kAllExceptRank0,
+    RankPattern::kRank1Only,
 };
 
 const char* describePattern(RankPattern p) {
@@ -349,8 +313,8 @@ const char* describePattern(RankPattern p) {
       return "AllRanks";
     case RankPattern::kRank0Only:
       return "Rank0Only";
-    case RankPattern::kAllExceptRank0:
-      return "AllExceptRank0";
+    case RankPattern::kRank1Only:
+      return "Rank1Only";
   }
   return "Unknown";
 }
@@ -361,8 +325,8 @@ bool shouldInject(RankPattern p, int globalRank) {
       return true;
     case RankPattern::kRank0Only:
       return globalRank == 0;
-    case RankPattern::kAllExceptRank0:
-      return globalRank != 0;
+    case RankPattern::kRank1Only:
+      return globalRank == 1;
   }
   return false;
 }
@@ -482,6 +446,98 @@ TEST_F(MultimemHandlerTestFixture, ExchangeSupportsNonIdentityRankMap) {
   ASSERT_EQ(bootstrap->barrier(globalRank, numRanks).get(), 0);
 }
 
+TEST_F(MultimemHandlerTestFixture, ExchangeRejectsMismatchedBackingSize) {
+  if (numRanks < 3) {
+    GTEST_SKIP() << "CUDA multimem transport is only useful for 3+ ranks";
+  }
+  auto bootstrap = makeBootstrap("multimem_mismatched_backing_size");
+  if (!allRanksMultimemSupported(bootstrap, globalRank, numRanks, localRank)) {
+    GTEST_SKIP() << "CUDA multimem/NVLS multicast is not supported";
+  }
+
+  const std::size_t granularity =
+      MultimemHandler::backingGranularity(localRank, numRanks);
+  ASSERT_GT(granularity, 0u);
+  const std::size_t requestedSize =
+      globalRank == 0 ? granularity : 2 * granularity;
+  auto backing = makeMulticastBacking(localRank, numRanks, requestedSize);
+  MultimemHandler handler(
+      backing, bootstrap, globalRank, identityRankMap(numRanks), localRank);
+
+  try {
+    handler.exchange();
+    FAIL() << "expected setup agreement to reject mismatched backing size";
+  } catch (const std::runtime_error& ex) {
+    EXPECT_NE(
+        std::string(ex.what()).find("ranks disagree on multicast setup"),
+        std::string::npos)
+        << ex.what();
+  }
+  ASSERT_EQ(bootstrap->barrier(globalRank, numRanks).get(), 0);
+}
+
+TEST_F(MultimemHandlerTestFixture, ExchangeRejectsMismatchedProtocol) {
+  if (numRanks < 3) {
+    GTEST_SKIP() << "CUDA multimem transport is only useful for 3+ ranks";
+  }
+  auto bootstrap = makeBootstrap("multimem_mismatched_protocol");
+  if (!allRanksMultimemSupported(bootstrap, globalRank, numRanks, localRank)) {
+    GTEST_SKIP() << "CUDA multimem/NVLS multicast is not supported";
+  }
+
+  auto backing = makeMulticastBacking(localRank, numRanks, 4096);
+  const MulticastExchangeContract contract{
+      .protocol = globalRank == 0 ? 1u : 2u, .version = 1};
+  MultimemHandler handler(
+      backing,
+      bootstrap,
+      globalRank,
+      identityRankMap(numRanks),
+      localRank,
+      contract);
+  try {
+    handler.exchange();
+    FAIL() << "expected setup agreement to reject mismatched protocol";
+  } catch (const std::runtime_error& ex) {
+    EXPECT_NE(
+        std::string(ex.what()).find("ranks disagree on multicast setup"),
+        std::string::npos)
+        << ex.what();
+  }
+  ASSERT_EQ(bootstrap->barrier(globalRank, numRanks).get(), 0);
+}
+
+TEST_F(MultimemHandlerTestFixture, ExchangeRejectsMismatchedVersion) {
+  if (numRanks < 3) {
+    GTEST_SKIP() << "CUDA multimem transport is only useful for 3+ ranks";
+  }
+  auto bootstrap = makeBootstrap("multimem_mismatched_version");
+  if (!allRanksMultimemSupported(bootstrap, globalRank, numRanks, localRank)) {
+    GTEST_SKIP() << "CUDA multimem/NVLS multicast is not supported";
+  }
+
+  auto backing = makeMulticastBacking(localRank, numRanks, 4096);
+  const MulticastExchangeContract contract{
+      .protocol = 1, .version = globalRank == 0 ? 1u : 2u};
+  MultimemHandler handler(
+      backing,
+      bootstrap,
+      globalRank,
+      identityRankMap(numRanks),
+      localRank,
+      contract);
+  try {
+    handler.exchange();
+    FAIL() << "expected setup agreement to reject mismatched version";
+  } catch (const std::runtime_error& ex) {
+    EXPECT_NE(
+        std::string(ex.what()).find("ranks disagree on multicast setup"),
+        std::string::npos)
+        << ex.what();
+  }
+  ASSERT_EQ(bootstrap->barrier(globalRank, numRanks).get(), 0);
+}
+
 TEST_F(MultimemHandlerTestFixture, SharingRejectsNullBacking) {
   auto bootstrap = makeBootstrap("multimem_null_backing_test");
   // A null backing must fail fast.
@@ -547,9 +603,9 @@ TEST_F(
 }
 
 // Locks down the bootstrap API surface used by `MultimemHandler::exchange()`:
-//   - allGatherNvlDomain: exactly 2 calls per exchange (agreeOnHandleType,
-//     then exchangeMulticastHandle).
-//   - barrierNvlDomain:   exactly 2 calls per exchange (pre-bind, post-map).
+//   - allGatherNvlDomain: exactly 4 calls per exchange (setup, handle, join,
+//     and bind/map agreements).
+//   - barrierNvlDomain:   never called by MultimemHandler itself.
 //   - allGather/barrier/send/recv: never called by MultimemHandler itself.
 // StrictMock + exact `.Times(...)` makes any future regression (an extra
 // barrier inserted, a stray allGather, a missing pre-bind sync) fail this
@@ -570,8 +626,8 @@ TEST_F(MultimemHandlerTestFixture, SuccessPathCoversAllBootstrapApis) {
   using ::testing::_;
   auto mock = makeDelegatingMock(realBootstrap);
 
-  EXPECT_CALL(*mock, allGatherNvlDomain(_, _, _, _, _)).Times(2);
-  EXPECT_CALL(*mock, barrierNvlDomain(_, _, _)).Times(2);
+  EXPECT_CALL(*mock, allGatherNvlDomain(_, _, _, _, _)).Times(4);
+  EXPECT_CALL(*mock, barrierNvlDomain(_, _, _)).Times(0);
   EXPECT_CALL(*mock, allGather(_, _, _, _)).Times(0);
   EXPECT_CALL(*mock, barrier(_, _)).Times(0);
   EXPECT_CALL(*mock, send(_, _, _, _)).Times(0);
@@ -588,7 +644,7 @@ TEST_F(MultimemHandlerTestFixture, SuccessPathCoversAllBootstrapApis) {
   EXPECT_NE(handler.getMultimemDeviceMemPtr(), nullptr);
 
   // Second call must early-return without touching the bootstrap; the exact
-  // .Times(2) expectations above would fail otherwise.
+  // .Times(4) expectation above would fail otherwise.
   handler.exchange();
   EXPECT_NE(handler.getMultimemDeviceMemPtr(), nullptr);
 
@@ -596,36 +652,15 @@ TEST_F(MultimemHandlerTestFixture, SuccessPathCoversAllBootstrapApis) {
 }
 
 // Parameterized failure-injection suite. The product is
-//   {4 phases of exchange()} x {3 failure modes} = 12 cases.
+//   {4 phases} x {3 failure modes} x {all, rank 0, rank 1} = 36 cases.
 //
 // For each case:
-//   - A real bootstrap is created with a per-case prefix so prior keys cannot
-//     leak between cases.
-//   - A StrictMockBootstrap is built that delegates every call to the real
-//     bootstrap, then the (api, ordinal) call site under test is overridden
-//     to fail with the chosen mode (return -1, throw std::runtime_error, or
-//     throw a non-std exception).
-//   - All ranks inject the same failure at the same ordinal, so every rank's
-//     exchange() throws together -- avoiding the asymmetric-failure deadlock
-//     scenario that would require a peer-side timeout to remain deterministic.
-//
-// Assertions per case:
-//   1. exchange() throws std::runtime_error.
-//   2. The message tags the right failedPhase (`failedPhase=<name>`), which
-//      proves `describeState` ran with the right phase label.
-//   3. The message contains the phase-specific substring (e.g. "pre-bind").
-//   4. For kSyncThrowsNonStd: the message contains the `catch (...)` prefix
-//      "MultimemHandler::exchange failed with unknown exception", confirming
-//      the unknown-exception fallback is reached. For std-throw / non-zero
-//      cases, the message uses the "MultimemHandler::exchange failed: " prefix.
-//   5. After the throw, both getters still throw "exchange() must complete",
-//      proving the partial-init state was not committed.
-//   6. The realBootstrap is still healthy: a subsequent barrier() returns 0.
-//      Proves cleanup() didn't leave any bootstrap state poisoned.
-//   7. Constructing a fresh handler over the *same* `backing` shared_ptr with
-//      a fresh bootstrap (different prefix) lets exchange() complete cleanly.
-//      Proves cleanup() released only the handler-owned multicast state and
-//      left the caller-owned physical backing intact and bindable.
+//   - The target API returns an error, throws std::runtime_error, or throws a
+//     non-std exception on every rank, rank 0 only, or rank 1 only.
+//   - exchange() and both post-exchange getters must throw.
+//   - Symmetric cases must leave the failure bootstrap usable.
+//   - Every case must reuse the same physical backing successfully through a
+//     fresh handler and bootstrap after cleanup.
 class MultimemHandlerFailureInjectionTest
     : public ::testing::TestWithParam<
           std::tuple<FailureCase, FailureMode, RankPattern>>,
@@ -659,6 +694,7 @@ TEST_P(MultimemHandlerFailureInjectionTest, ExchangeReportsAndCleansUp) {
     GTEST_SKIP() << "asymmetric failure tests require TCPStore env";
   }
 
+  std::shared_ptr<CuMemAllocation> backing;
   {
     std::optional<ScopedShortTimeoutBootstrap> shortBs;
     std::shared_ptr<meta::comms::IBootstrap> bootstrap;
@@ -676,7 +712,7 @@ TEST_P(MultimemHandlerFailureInjectionTest, ExchangeReportsAndCleansUp) {
       GTEST_SKIP() << "CUDA multimem/NVLS multicast is not supported";
     }
 
-    auto backing = makeMulticastBacking(localRank, numRanks, 4096);
+    backing = makeMulticastBacking(localRank, numRanks, 4096);
 
     {
       auto mock = makeDelegatingMock(bootstrap);
@@ -685,7 +721,8 @@ TEST_P(MultimemHandlerFailureInjectionTest, ExchangeReportsAndCleansUp) {
           bootstrap,
           failCase,
           failMode,
-          /*injectOnThisRank=*/shouldInject(rankPattern, globalRank));
+          /*injectOnThisRank=*/shouldInject(rankPattern, globalRank),
+          /*rendezvousBeforeFailure=*/rankPattern == RankPattern::kAllRanks);
 
       MultimemHandler handler(
           backing,
@@ -722,7 +759,7 @@ TEST_P(MultimemHandlerFailureInjectionTest, ExchangeReportsAndCleansUp) {
   // overlap with the failed exchange's keys.
   auto recoveryBootstrap = makeBootstrap(casePrefix + "_recovery");
   MultimemHandler recovery(
-      makeMulticastBacking(localRank, numRanks, 4096),
+      backing,
       recoveryBootstrap,
       globalRank,
       identityRankMap(numRanks),
@@ -750,6 +787,214 @@ INSTANTIATE_TEST_SUITE_P(
       return std::string(failCase.name) + "_" + describeMode(failMode) + "_" +
           describePattern(pattern);
     });
+
+#if CUDART_VERSION >= 12030
+template <typename Entry>
+class ScopedDriverEntryOverride {
+ public:
+  ScopedDriverEntryOverride(Entry& entry, Entry replacement, bool active)
+      : entry_(entry), saved_(entry), active_(active) {
+    if (active_) {
+      entry_ = replacement;
+    }
+  }
+
+  ~ScopedDriverEntryOverride() {
+    if (active_) {
+      entry_ = saved_;
+    }
+  }
+
+  ScopedDriverEntryOverride(const ScopedDriverEntryOverride&) = delete;
+  ScopedDriverEntryOverride& operator=(const ScopedDriverEntryOverride&) =
+      delete;
+
+ private:
+  Entry& entry_;
+  Entry saved_;
+  bool active_;
+};
+
+CUresult CUDAAPI failDeviceGet(CUdevice*, int) {
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult CUDAAPI failMulticastCreate(
+    CUmemGenericAllocationHandle*,
+    const CUmulticastObjectProp*) {
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult CUDAAPI
+failMemImport(CUmemGenericAllocationHandle*, void*, CUmemAllocationHandleType) {
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult CUDAAPI failMemSetAccess(
+    CUdeviceptr,
+    std::size_t,
+    const CUmemAccessDesc*,
+    std::size_t) {
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
+void appendExceptionChain(const std::exception& error, std::string& chain) {
+  if (!chain.empty()) {
+    chain += " | ";
+  }
+  chain += error.what();
+  try {
+    std::rethrow_if_nested(error);
+  } catch (const std::exception& nested) {
+    appendExceptionChain(nested, chain);
+  } catch (...) {
+    chain += " | non-std exception";
+  }
+}
+
+struct DriverFailureCase {
+  enum class Stage {
+    kInitialize,
+    kCreate,
+    kImport,
+    kSetAccess,
+  };
+
+  const char* name;
+  Stage stage;
+  int failedRank;
+  const char* expectedOperation;
+  const char* expectedLocalError;
+  const char* expectedLocalPhase;
+  const char* expectedCompletedPhase;
+};
+
+constexpr DriverFailureCase kDriverFailureCases[] = {
+    {"Initialize",
+     DriverFailureCase::Stage::kInitialize,
+     1,
+     "MultimemHandler setup",
+     "cuDeviceGet failed",
+     "failedPhase=initializeDevice",
+     "completedPhase=none"},
+    {"Create",
+     DriverFailureCase::Stage::kCreate,
+     0,
+     "MultimemHandler multicast create/export",
+     "cuMulticastCreate failed",
+     "failedPhase=createMulticastHandle",
+     "completedPhase=computeAllocationLayout"},
+    {"Import",
+     DriverFailureCase::Stage::kImport,
+     1,
+     "MultimemHandler multicast join",
+     "cuMemImportFromShareableHandle",
+     "failedPhase=importMulticastHandle",
+     "completedPhase=exchangeMulticastHandle"},
+    {"SetAccess",
+     DriverFailureCase::Stage::kSetAccess,
+     1,
+     "MultimemHandler multicast bind/map",
+     "cuMemSetAccess failed",
+     "failedPhase=mapMulticastMemory",
+     "completedPhase=bindLocalMemoryToMulticast"},
+};
+
+class MultimemHandlerDriverFailureTest
+    : public ::testing::TestWithParam<DriverFailureCase>,
+      public meta::comms::DistBaseTest {
+ protected:
+  void SetUp() override {
+    distSetUp();
+    CUDACHECK_TEST(cudaSetDevice(localRank));
+  }
+
+  void TearDown() override {
+    distTearDown();
+  }
+};
+
+TEST_P(MultimemHandlerDriverFailureTest, FailureReachesTeamAndRecoveryWorks) {
+  if (numRanks < 3) {
+    GTEST_SKIP() << "CUDA multimem transport is only useful for 3+ ranks";
+  }
+  const auto& failure = GetParam();
+  const std::string prefix =
+      std::string("multimem_handler_failure_") + failure.name;
+  auto bootstrap = makeBootstrap(prefix);
+  if (!allRanksMultimemSupported(bootstrap, globalRank, numRanks, localRank)) {
+    GTEST_SKIP() << "CUDA multimem/NVLS multicast is not supported";
+  }
+
+  auto backing = makeMulticastBacking(localRank, numRanks, 4096);
+  MultimemHandler handler(
+      backing, bootstrap, globalRank, identityRankMap(numRanks), localRank);
+
+  const bool inject = globalRank == failure.failedRank;
+  std::string error;
+  const auto captureExchange = [&] {
+    try {
+      handler.exchange();
+    } catch (const std::exception& exception) {
+      appendExceptionChain(exception, error);
+    }
+  };
+  const auto runExchange = [&](auto& entry, auto replacement) {
+    ScopedDriverEntryOverride guard(entry, replacement, inject);
+    captureExchange();
+  };
+
+  switch (failure.stage) {
+    case DriverFailureCase::Stage::kInitialize:
+      runExchange(pfn_cuDeviceGet, &failDeviceGet);
+      break;
+    case DriverFailureCase::Stage::kCreate:
+      runExchange(pfn_cuMulticastCreate, &failMulticastCreate);
+      break;
+    case DriverFailureCase::Stage::kImport:
+      runExchange(pfn_cuMemImportFromShareableHandle, &failMemImport);
+      break;
+    case DriverFailureCase::Stage::kSetAccess:
+      runExchange(pfn_cuMemSetAccess, &failMemSetAccess);
+      break;
+  }
+
+  EXPECT_THAT(
+      error,
+      ::testing::HasSubstr(
+          std::string(failure.expectedOperation) + " failed on rank " +
+          std::to_string(failure.failedRank)));
+  EXPECT_THAT(error, ::testing::HasSubstr("MultimemHandler state:"));
+  if (inject) {
+    EXPECT_THAT(error, ::testing::HasSubstr(failure.expectedLocalError));
+    EXPECT_THAT(error, ::testing::HasSubstr(failure.expectedLocalPhase));
+    EXPECT_THAT(error, ::testing::HasSubstr(failure.expectedCompletedPhase));
+  }
+
+  EXPECT_THROW(handler.exchange(), std::runtime_error);
+  EXPECT_THROW(handler.getMultimemDeviceMemPtr(), std::runtime_error);
+  EXPECT_THROW(handler.getAllocatedSize(), std::runtime_error);
+
+  auto recoveryBootstrap = makeBootstrap(prefix + "_recovery");
+  MultimemHandler recovery(
+      backing,
+      recoveryBootstrap,
+      globalRank,
+      identityRankMap(numRanks),
+      localRank);
+  recovery.exchange();
+  EXPECT_NE(recovery.getMultimemDeviceMemPtr(), nullptr);
+  ASSERT_EQ(recoveryBootstrap->barrier(globalRank, numRanks).get(), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    StageBoundaries,
+    MultimemHandlerDriverFailureTest,
+    ::testing::ValuesIn(kDriverFailureCases),
+    [](const ::testing::TestParamInfo<DriverFailureCase>& info) {
+      return info.param.name;
+    });
+#endif
 
 } // namespace comms::prims::tests
 

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -18,10 +19,11 @@
 #include "comms/ctran/transport/ib/HostCbTransport.h"
 #include "comms/ctran/transport/ib/HostZcTransport.h"
 #include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranIpc.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/utils/StrUtils.h"
 #include "comms/utils/commSpecs.h"
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 #include "comms/utils/memtrace/MemoryTrace.h"
 
 #ifdef ENABLE_META_COMPRESSION
@@ -49,7 +51,7 @@ std::vector<CtranMapperBackend> getToEnableBackends(
       enableBackends.emplace_back(NCCLCtranBackendMap.at(b));
     }
   } else {
-    CLOGF(
+    CTRAN_LOG(
         WARN,
         "CTRAN-MAPPER: Try to override backends through Ctran Config. Currently it is specific config for MCCL. If you are using NCCL with NCCL_CTRAN_BACKENDS, please report this to MCCL team");
     for (auto& b : overrideBackend) {
@@ -108,7 +110,7 @@ CtranMapper::CtranMapper(CtranComm* comm, ctran::Profiler* profiler) {
   this->comm = comm;
 
   if (NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET) {
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "CTRAN-MAPPER: IpcRegCache socket server enabled, initializing");
@@ -124,7 +126,7 @@ CtranMapper::CtranMapper(CtranComm* comm, ctran::Profiler* profiler) {
     // AllGather IPC server addresses after comm is set
     FB_COMMCHECKTHROW_EX(allGatherIpcServerAddrs(), comm->logMetaData_);
   } else {
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "CTRAN-MAPPER: IpcRegCache socket server disabled via NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET=0, skipping init");
@@ -134,6 +136,12 @@ CtranMapper::CtranMapper(CtranComm* comm, ctran::Profiler* profiler) {
 
   iPutCount = std::vector<int>(CtranMapperBackend::NUM_BACKENDS, 0);
   iGetCount = std::vector<int>(CtranMapperBackend::NUM_BACKENDS, 0);
+  ctrlMsgCount = std::vector<int>(CtranMapperBackend::NUM_BACKENDS, 0);
+
+  // Sized up front and left all-false when same-host socket ctrl is disabled,
+  // so "no peer is routed to socket" is an explicit state rather than an empty
+  // vector that useSocketCtrl() has to interpret.
+  sameHostPeers_.assign(statex->nRanks(), false);
 
   std::vector<std::string> enableBackendsStrs;
   for (auto b : backendsToEnable) {
@@ -141,7 +149,7 @@ CtranMapper::CtranMapper(CtranComm* comm, ctran::Profiler* profiler) {
     enableBackendsStrs.push_back(backendToStr(b));
   }
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-MAPPER: configure NCCL_CTRAN_BACKENDS [{}]",
@@ -164,7 +172,7 @@ CtranMapper::CtranMapper(CtranComm* comm, ctran::Profiler* profiler) {
     } catch ([[maybe_unused]] const std::bad_alloc& e) {
       ctranIb = nullptr;
       enableBackends_[CtranMapperBackend::IB] = false;
-      CLOGF(WARN, "CTRAN-MAPPER: IB backend not enabled");
+      CTRAN_LOG(WARN, "CTRAN-MAPPER: IB backend not enabled");
     }
   }
   if (enableBackends_[CtranMapperBackend::SOCKET]) {
@@ -172,16 +180,44 @@ CtranMapper::CtranMapper(CtranComm* comm, ctran::Profiler* profiler) {
       this->ctranSock = std::make_unique<class CtranSocket>(comm);
     } else {
       enableBackends_[CtranMapperBackend::SOCKET] = false;
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO,
           INIT,
           "CTRAN-MAPPER: SOCKET backend not enabled, since IB backend is enabled");
     }
   }
+
+  // Same-host ctrl over the frontend NIC. Stand up a socket alongside ib and
+  // mark which peers it serves; enableBackends_[SOCKET] stays false so socket
+  // remains out of the data path and getBackend() is unchanged.
+  if (NCCL_CTRAN_LOCAL_CTRL_BACKEND == NCCL_CTRAN_LOCAL_CTRL_BACKEND::socket &&
+      this->ctranIb) {
+    const int nRanks = statex->nRanks();
+    const int myRank = statex->rank();
+    const std::string myHost = statex->host(myRank);
+    int nSameHost = 0;
+    for (int peer = 0; peer < nRanks; peer++) {
+      if (peer != myRank && statex->host(peer) == myHost) {
+        sameHostPeers_[peer] = true;
+        nSameHost++;
+      }
+    }
+    if (nSameHost > 0) {
+      if (!this->ctranSock) {
+        this->ctranSock = std::make_unique<class CtranSocket>(comm);
+      }
+      CTRAN_LOG_SUBSYS(
+          INFO,
+          INIT,
+          "CTRAN-MAPPER: NCCL_CTRAN_LOCAL_CTRL_BACKEND=socket, routing ctrl for {} same-host peer(s) on {} over SOCKET",
+          nSameHost,
+          myHost);
+    }
+  }
   if (enableBackends_[CtranMapperBackend::TCPDM]) {
     this->ctranTcpDm =
         std::make_unique<class ctran::CtranTcpDm>(comm, profiler);
-    CLOGF(WARN, "CTRAN-MAPPER: TCPDM backend is enabled");
+    CTRAN_LOG(WARN, "CTRAN-MAPPER: TCPDM backend is enabled");
   }
 
   if (enableBackends_[CtranMapperBackend::NVL]) {
@@ -192,11 +228,11 @@ CtranMapper::CtranMapper(CtranComm* comm, ctran::Profiler* profiler) {
       } catch ([[maybe_unused]] const std::bad_alloc& e) {
         enableBackends_[CtranMapperBackend::NVL] = false;
         // FIXME: give more specific exception + error message
-        CLOGF(
+        CTRAN_LOG(
             WARN, "CTRAN-MAPPER: NVL backend not enabled. Error {}", e.what());
       }
     } else {
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "CTRAN-MAPPER: NVL backend not enabled. Require valid IB, TCPDM or Socket backend");
     }
@@ -230,7 +266,7 @@ CtranMapper::CtranMapper(CtranComm* comm, ctran::Profiler* profiler) {
       ::ctran::utils::rangesToStr(::ctran::utils::getRanges(sockRanks));
   const auto tcpRanksRangesStr =
       ::ctran::utils::rangesToStr(::ctran::utils::getRanges(tcpRanks));
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-MAPPER: NVL ranks: {}, IB ranks: {}, SOCKET ranks: {}, TCPDM ranks: {}",
@@ -303,7 +339,7 @@ void CtranMapper::reportProfiling(bool flush) {
              << std::endl;
         }
         if (NCCL_CTRAN_PROFILING == NCCL_CTRAN_PROFILING::info) {
-          CLOGF(INFO, "{}", ss.str());
+          CTRAN_LOG(INFO, "{}", ss.str());
           ss.str("");
           ss.clear();
         }
@@ -322,7 +358,7 @@ void CtranMapper::reportProfiling(bool flush) {
           std::to_string(this->rank) + "." + hostname + std::string(".comm") +
           hashToHexStr(this->logMetaData_.commHash) + std::string(".") +
           std::to_string(reportCnt++) + std::string(".json"));
-      CLOGF(INFO, "Dumping ctran profile to {}", filename);
+      CTRAN_LOG(INFO, "Dumping ctran profile to {}", filename);
 
       int id = 0;
       stream << "[" << std::endl;
@@ -498,7 +534,7 @@ commResult_t CtranMapper::allGatherIpcServerAddrs() {
       peerIpcServerAddrs_.data(), sizeof(sockaddr_storage), myRank, nRanks);
   FB_COMMCHECK(static_cast<commResult_t>(std::move(resFuture).get()));
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-MAPPER: AllGathered IPC server addresses from {} ranks",
@@ -526,7 +562,7 @@ commResult_t CtranMapper::remReleaseMem(ctran::regcache::RegElem* regElem) {
   // If peers have imported this memory but the async socket is disabled,
   // we cannot notify them to release. This is a fatal inconsistency.
   if (!NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET) {
-    CLOGF(
+    CTRAN_LOG(
         FATAL,
         "CTRAN-REGCACHE: ipcRegElem was exported to {} peers but "
         "NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET is disabled",
@@ -552,7 +588,7 @@ commResult_t CtranMapper::remReleaseMem(ctran::regcache::RegElem* regElem) {
         req.get(),
         exportCount));
 
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "CTRAN-MAPPER: Posted IPC release to rank {} with exportCount {}",
         peerRank,
@@ -780,12 +816,12 @@ commResult_t CtranMapper::regAsync(const void* buf, const size_t len) {
     bool dynamicRegist = false;
     FB_COMMCHECK(searchRegHandle(
         buf, len, &regHdl, &dynamicRegist, false /* allowDynamic */));
-    CLOGF_TRACE(COLL, "regAsync registered buf {} len {}", buf, len);
+    CTRAN_LOG_TRACE(COLL, "regAsync registered buf {} len {}", buf, len);
     return commSuccess;
   } else {
     FB_COMMCHECK(regCache->asyncRegRange(
         buf, len, cudaDev, logMetaData_, enableBackends_));
-    CLOGF_TRACE(COLL, "regAsync submitted buf {} len {}", buf, len);
+    CTRAN_LOG_TRACE(COLL, "regAsync submitted buf {} len {}", buf, len);
     return commInProgress;
   }
 }
@@ -822,8 +858,8 @@ commResult_t CtranMapper::searchRegHandle(
 
   if (!regHdl_) {
     if (!allowDynamic) {
-      CLOGF(
-          ERR,
+      CTRAN_ERR(
+          commInvalidUsage,
           "CTRAN-MAPPER: buffer {} len {} is not pre-registered by user. ",
           buf,
           len);
@@ -836,7 +872,7 @@ commResult_t CtranMapper::searchRegHandle(
     FB_COMMCHECK(regCache->regDynamic(
         buf, len, cudaDev, enableBackends_, &regHdl_, &logMetaData_));
     *dynamicRegist = true;
-    CLOGF(
+    CTRAN_LOG(
         WARN,
         "CTRAN-MAPPER: buffer {} len {} is not pre-registered by user. "
         "We have to one-time register it and deregister immediately after "
@@ -845,7 +881,7 @@ commResult_t CtranMapper::searchRegHandle(
         len);
   }
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "searchRegHandle buf {} len {} returned handle (regElem) {} dynamicRegist {}",
       buf,
@@ -888,7 +924,17 @@ commResult_t CtranMapper::icopy(
 
 commResult_t CtranMapper::preConnect(const std::unordered_set<int>& peerRanks) {
   if (this->ctranIb != nullptr) {
-    FB_COMMCHECK(this->ctranIb->preConnect(peerRanks));
+    // Split by the same control-backend rule the send/recv paths use, so a
+    // same-host peer does not also stand up an ib QP it will never send on.
+    std::unordered_set<int> ibPeers;
+    std::unordered_set<int> sockPeers;
+    for (int peer : peerRanks) {
+      (useSocketCtrl(peer) ? sockPeers : ibPeers).insert(peer);
+    }
+    FB_COMMCHECK(this->ctranIb->preConnect(ibPeers));
+    if (!sockPeers.empty() && this->ctranSock != nullptr) {
+      FB_COMMCHECK(this->ctranSock->preConnect(sockPeers));
+    }
   } else if (ctranSock != nullptr) {
     FB_COMMCHECK(this->ctranSock->preConnect(peerRanks));
   } else if (this->ctranTcpDm != nullptr) {
@@ -981,7 +1027,7 @@ ctran::transport::IP2pHostTransport* CtranMapper::getP2pTransport(
 
   CtranIb* ib = ctranIb.get();
   if (ib == nullptr) {
-    CLOGF(
+    CTRAN_LOG(
         WARN,
         "CTRAN-MAPPER: getP2pTransport(peer={}): no IB backend on this mapper",
         peerRank);
@@ -1335,6 +1381,39 @@ commResult_t CtranMapper::allGatherCtrlImpl(
     FB_COMMCHECK(waitRequest(req.get()));
   }
 
+  return commSuccess;
+}
+
+commResult_t CtranMapper::intraNvlDomainAllGather(
+    const void* sendData,
+    void* recvData,
+    size_t elemSize) {
+  const auto& statex = comm->statex_;
+  const int nLocalRanks = statex->nLocalRanks();
+  const int selfIdx = statex->localRank(); // our own NVL-domain rank
+  auto* recvBytes = static_cast<char*>(recvData);
+  std::memcpy(recvBytes + selfIdx * elemSize, sendData, elemSize);
+
+  // One round: post an irecv from + isend to every other domain member, then
+  // wait all. recvData is indexed by domain rank (localRankToRank order), so it
+  // matches the exec/IPC layout. unique_ptr keeps request addresses stable
+  // across vector growth (the IB layer holds references into them).
+  std::vector<std::unique_ptr<CtranMapperRequest>> reqs;
+  for (int i = 0; i < nLocalRanks; i++) {
+    if (i == selfIdx) {
+      continue;
+    }
+    const int peer = statex->localRankToRank(i);
+    reqs.push_back(std::make_unique<CtranMapperRequest>());
+    FB_COMMCHECK(this->irecvCtrlMsg(
+        recvBytes + i * elemSize, elemSize, peer, reqs.back().get()));
+    reqs.push_back(std::make_unique<CtranMapperRequest>());
+    FB_COMMCHECK(
+        this->isendCtrlMsg(sendData, elemSize, peer, reqs.back().get()));
+  }
+  for (auto& req : reqs) {
+    FB_COMMCHECK(this->waitRequest(req.get()));
+  }
   return commSuccess;
 }
 

@@ -12,8 +12,8 @@
 
 #include "comms/ctran/algos/CtranAlgoConsts.h"
 #include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranLogger.h"
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 namespace ctran::allreduce::ring {
 
@@ -59,6 +59,7 @@ getAutoTunedPipeline(size_t messageBytes, int nRanks, GpuArch arch) {
 
   static constexpr size_t kMinChunkSize = 1;
   static constexpr size_t kMaxChunkSize = 16ULL * 1024 * 1024;
+  static constexpr size_t kPreferredMaxChunkSize = 2ULL * 1024 * 1024;
 
   // clang-format off
   static constexpr size_t kMax = ~size_t{0};
@@ -114,6 +115,24 @@ getAutoTunedPipeline(size_t messageBytes, int nRanks, GpuArch arch) {
       (partitionMessageBytes + stagingBufSize - 1) / stagingBufSize;
   if (partitionMessageBytes > stagingBufSize) {
     numChunks = std::max(numChunks / scaleDown, size_t{1});
+
+    const int largeChunkRankThreshold =
+        NCCL_CTRAN_ALLREDUCE_RING_LARGE_CHUNK_RANK_THRESHOLD;
+    const size_t messageGrowth =
+        roundToNearestPow2(messageBytes) / partitionMessageBytes;
+    if (arch == GpuArch::Default && largeChunkRankThreshold > 0 &&
+        nRanks > largeChunkRankThreshold && messageGrowth > pipelineDepth &&
+        chunkSize < kPreferredMaxChunkSize) {
+      const size_t chunkGrowth = messageGrowth / pipelineDepth;
+      const size_t preferredChunkSize = std::min(
+          chunkGrowth >= kPreferredMaxChunkSize / chunkSize
+              ? kPreferredMaxChunkSize
+              : chunkSize * chunkGrowth,
+          kPreferredMaxChunkSize);
+      const size_t pipelineFootprint = chunkSize * numChunks;
+      chunkSize = preferredChunkSize;
+      numChunks = std::max(pipelineFootprint / chunkSize, size_t{1});
+    }
   }
 
   return {chunkSize, numChunks};
@@ -263,7 +282,7 @@ void logAutoTuneDecisions(
       sizeof(size_t) >= 8, "logAutoTuneDecisions assumes 64-bit size_t");
   auto qpThMin = NCCL_CTRAN_ALLREDUCE_RING_QP_SCALING_TH_MIN;
   auto qpThMax = NCCL_CTRAN_ALLREDUCE_RING_QP_SCALING_TH_MAX;
-  CLOGF(
+  CTRAN_LOG(
       DBG,
       "AutoTune QP scaling: ThMin={}, ThMax={}, {}",
       qpThMin,
@@ -280,7 +299,7 @@ void logAutoTuneDecisions(
         maxOccupancyBlockSize,
         typeSize,
         arch);
-    CLOGF(
+    CTRAN_LOG(
         DBG,
         "AutoTune ranks {}, msg {}B: blocks {}, chunks {} x {}B",
         nRanks,
@@ -299,7 +318,7 @@ void logAutoTuneDecisions(
           maxOccupancyBlockSize,
           typeSize,
           arch);
-      CLOGF(
+      CTRAN_LOG(
           DBG,
           "AutoTune ranks {}, msg {}B: blocks {}, chunks {} x {}B",
           nRanks,

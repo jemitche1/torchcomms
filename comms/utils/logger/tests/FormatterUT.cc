@@ -27,6 +27,7 @@
 #include <folly/portability/Stdlib.h>
 #include <folly/system/ThreadName.h>
 
+#include "comms/utils/logger/CommsLogFormatter.h"
 #include "comms/utils/logger/LoggingFormat.h"
 
 FOLLY_GNU_DISABLE_WARNING("-Wdeprecated-declarations")
@@ -53,11 +54,12 @@ std::string formatMsg(
     StringPiece functionName,
     // Default timestamp: 2017-04-17 13:45:56.123456 UTC
     uint64_t timestampNS = 1492436756123456789ULL,
-    StringPiece prefix = "NCCL") {
+    StringPiece prefix = "NCCL",
+    int threadContext = 0) {
   LoggerDB db{LoggerDB::TESTING};
   auto* category = db.getCategory("test");
   meta::comms::logger::NcclLogFormatter formatter(
-      prefix.str(), []() { return 0; });
+      prefix.str(), [threadContext]() { return threadContext; });
 
   std::chrono::system_clock::time_point logTimePoint{
       std::chrono::duration_cast<std::chrono::system_clock::duration>(
@@ -98,7 +100,7 @@ TEST(GlogFormatter, log) {
   constexpr std::string_view kPrefix = "NCCL";
 
   // Test a very simple single-line log message
-  auto expected = folly::sformat(
+  auto expected = fmt::format(
       "W0417 13:45:56.123456 {:5d} myfile.cpp:1234] {}:{}:{} [{}][{}] {} WARN hello world\n",
       tid,
       hostname,
@@ -113,6 +115,39 @@ TEST(GlogFormatter, log) {
           LogLevel::WARN, "hello world", "myfile.cpp", 1234, "testFunction"));
 }
 
+TEST(GlogFormatter, logCustomPrefixAndThreadContext) {
+  const auto formatted = formatMsg(
+      LogLevel::WARN,
+      "hello world",
+      "myfile.cpp",
+      1234,
+      "testFunction",
+      1492436756123456789ULL,
+      "CTRAN",
+      7);
+  EXPECT_NE(
+      formatted.find(" [7][main] CTRAN WARN hello world\n"), std::string::npos);
+}
+
+TEST(CommsLogFormatter, emptyLevelUsesPlaceholder) {
+  const meta::comms::logger::CommsLogMetadata metadata{
+      .timestamp = std::chrono::system_clock::time_point{},
+      .threadId = 1,
+      .filename = "test.cpp",
+      .lineNumber = 2,
+      .hostname = "host",
+      .processId = 3,
+      .threadContext = 4,
+      .threadName = "thread",
+      .prefix = "NCCL",
+  };
+
+  const auto formatted =
+      meta::comms::logger::formatCommsLogMessage("", "message", metadata);
+  EXPECT_EQ(formatted.front(), '?');
+  EXPECT_NE(formatted.find(" NCCL  message\n"), std::string::npos);
+}
+
 TEST(GlogFormatter, logThreadName) {
   auto tid = getOSThreadID();
   auto hostname = getHostName('.');
@@ -122,7 +157,7 @@ TEST(GlogFormatter, logThreadName) {
 
   meta::comms::logger::initThreadMetaData(kThreadName);
   // Test a very simple single-line log message
-  auto expected = folly::sformat(
+  auto expected = fmt::format(
       "W0417 13:45:56.123456 {:5d} myfile.cpp:1234] {}:{}:{} [{}][{}] {} WARN hello world\n",
       tid,
       hostname,
@@ -165,7 +200,7 @@ TEST(GlogFormatter, logThreadNameChanged) {
     });
     thread.join();
     // Test a very simple single-line log message
-    auto expected = folly::sformat(
+    auto expected = fmt::format(
         "W0417 13:45:56.123456 {:5d} myfile.cpp:1234] {}:{}:{} [{}][{}] {} WARN hello world\n",
         otherThreadID,
         hostname,
@@ -198,9 +233,9 @@ TEST(LoggingFormat, getLastCommsErrorBasic) {
 
   formatter.formatMessage(errorMsg, category);
 
-  const char* lastError = meta::comms::logger::getLastCommsError();
-  EXPECT_NE(lastError, nullptr);
-  std::string errorStr(lastError);
+  auto lastError = meta::comms::logger::getLastCommsError();
+  EXPECT_FALSE(lastError.empty());
+  const auto& errorStr = lastError;
   EXPECT_TRUE(errorStr.find("Test error message") != std::string::npos);
   EXPECT_TRUE(errorStr.find("NCCL Stack trace:") != std::string::npos);
 }
@@ -228,9 +263,9 @@ TEST(LoggingFormat, getLastCommsErrorWithStack) {
   meta::comms::logger::appendErrorToStack("Stack frame 2");
   meta::comms::logger::appendErrorToStack("Stack frame 3");
 
-  const char* lastError = meta::comms::logger::getLastCommsError();
-  EXPECT_NE(lastError, nullptr);
-  std::string errorStr(lastError);
+  auto lastError = meta::comms::logger::getLastCommsError();
+  EXPECT_FALSE(lastError.empty());
+  const auto& errorStr = lastError;
   EXPECT_TRUE(errorStr.find("Error with stack") != std::string::npos);
   EXPECT_TRUE(errorStr.find("NCCL Stack trace:") != std::string::npos);
   EXPECT_TRUE(errorStr.find("Stack frame 1") != std::string::npos);
@@ -261,9 +296,9 @@ TEST(LoggingFormat, appendErrorToStackOrder) {
   meta::comms::logger::appendErrorToStack("Second");
   meta::comms::logger::appendErrorToStack("Third");
 
-  const char* lastError = meta::comms::logger::getLastCommsError();
-  EXPECT_NE(lastError, nullptr);
-  std::string errorStr(lastError);
+  auto lastError = meta::comms::logger::getLastCommsError();
+  EXPECT_FALSE(lastError.empty());
+  const auto& errorStr = lastError;
 
   size_t firstPos = errorStr.find("First");
   size_t secondPos = errorStr.find("Second");
@@ -295,11 +330,31 @@ TEST(LoggingFormat, getLastCommsErrorEmptyStack) {
 
   formatter.formatMessage(errorMsg, category);
 
-  const char* lastError = meta::comms::logger::getLastCommsError();
-  EXPECT_NE(lastError, nullptr);
-  std::string errorStr(lastError);
+  auto lastError = meta::comms::logger::getLastCommsError();
+  EXPECT_FALSE(lastError.empty());
+  const auto& errorStr = lastError;
   EXPECT_TRUE(errorStr.find("Error without stack") != std::string::npos);
   EXPECT_TRUE(errorStr.find("NCCL Stack trace:") != std::string::npos);
+}
+
+TEST(LoggingFormat, setLastErrorPrefersNativeStack) {
+  meta::comms::logger::setLastError(
+      "net timeout", {"stackFrame1", "stackFrame2"});
+
+  auto lastError = meta::comms::logger::getLastCommsError();
+  const auto messagePos = lastError.find("net timeout");
+  const auto headerPos = lastError.find("NCCL Stack trace:");
+  const auto frame1Pos = lastError.find("stackFrame1");
+  const auto frame2Pos = lastError.find("stackFrame2");
+
+  EXPECT_NE(messagePos, std::string::npos);
+  EXPECT_NE(headerPos, std::string::npos);
+  EXPECT_NE(frame1Pos, std::string::npos);
+  EXPECT_NE(frame2Pos, std::string::npos);
+
+  // The native stack is recorded after the message, in order.
+  EXPECT_LT(messagePos, frame1Pos);
+  EXPECT_LT(frame1Pos, frame2Pos);
 }
 
 TEST(LoggingFormat, nonErrorMessageDoesNotUpdateLastError) {
@@ -331,9 +386,9 @@ TEST(LoggingFormat, nonErrorMessageDoesNotUpdateLastError) {
       "This is just info"};
   formatter.formatMessage(infoMsg, category);
 
-  const char* lastError = meta::comms::logger::getLastCommsError();
-  EXPECT_NE(lastError, nullptr);
-  std::string errorStr(lastError);
+  auto lastError = meta::comms::logger::getLastCommsError();
+  EXPECT_FALSE(lastError.empty());
+  const auto& errorStr = lastError;
   EXPECT_TRUE(errorStr.find("Initial error") != std::string::npos);
   EXPECT_FALSE(errorStr.find("This is just info") != std::string::npos);
 }

@@ -23,12 +23,14 @@
 #include "comms/ctran/algos/AllReduce/Types.h"
 #include "comms/ctran/algos/CtranAlgo.h"
 #include "comms/ctran/algos/CtranAlgoConsts.h"
+#include "comms/ctran/algos/common/OccupancyUtils.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/profiler/Profiler.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
+#include "comms/ctran/utils/CtranLogger.h"
 #include "comms/ctran/utils/CudaUtils.h"
 #include "comms/utils/commSpecs.h"
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 // Key for kernel function lookup: (datatype, redOp, enableBidirAg, unpack)
 using KernelFuncKey = std::tuple<commDataType_t, commRedOp_t, bool, bool>;
@@ -79,7 +81,7 @@ commResult_t getGpuArch(ctran::allreduce::ring::GpuArch* arch) {
   FB_CUDACHECK(cudaGetDevice(&cudaDev));
   auto cudaArch = ctran::utils::getCudaArch(cudaDev);
   if (!cudaArch.hasValue()) {
-    CLOGF(ERR, "{}", cudaArch.error());
+    CTRAN_ERR(commUnhandledCudaError, "{}", cudaArch.error());
     return commUnhandledCudaError;
   }
   if (cudaArch.value() < 1000) {
@@ -174,7 +176,7 @@ inline bool progressSendCheckSendBuf(const AlgoContext& algoCtx) {
 
   bool done = algoCtx.opRounds[Op::kSendTrans].done > prevRound;
   if (done) {
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "{} waited tmpChunkId {} algoCtx.numChunks {} prevRound {}",
         roundLogPrefix<Op::kSendCopy>(round, step, algoCtx),
@@ -229,7 +231,7 @@ inline bool progressSendCheckRemRecvBuf(
         resource.comm->logMetaData_);
     if (isComplete) {
       int tmpChunkId = getTmpChunkId(algoCtx, round);
-      CLOGF_TRACE(
+      CTRAN_LOG_TRACE(
           COLL,
           "{} done tmpChunkId {}",
           roundLogPrefix<Op::kSendTrans>(round, step, algoCtx),
@@ -259,7 +261,7 @@ inline void progressSendCheckTrans(
           resource.comm->ctran_->mapper->testRequest(resp.get(), &isComplete),
           resource.comm->logMetaData_);
       if (isComplete) {
-        CLOGF_TRACE(
+        CTRAN_LOG_TRACE(
             COLL,
             "progressSendCheckTrans {} done",
             roundLogPrefix<Op::kSendTrans>(r, step, algoCtx));
@@ -275,7 +277,7 @@ inline void progressSendPostCopyKern(
     const AlgoContext& algoCtx) {
   int round = algoCtx.opRounds[Op::kSendCopy].post;
   int step = algoCtx.opRounds[Op::kSendCopy].postStep.step;
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL, "{} posted", roundLogPrefix<Op::kSendCopy>(round, step, algoCtx));
   resource.sendCopySync->post(round);
 }
@@ -291,7 +293,7 @@ inline bool progressSendCheckCopyKern(
   bool done = resource.sendCopySync->isComplete(round);
 
   if (done) {
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "{} done: tmpChunkId {}",
         roundLogPrefix<Op::kSendCopy>(round, step, algoCtx),
@@ -341,7 +343,7 @@ inline void progressSendPostTrans(
       resource.comm->logMetaData_);
   dataSResps.at(round).reset(req);
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "{} from tmpSendBuf {} to tmpRemoteRecvBuf {} shardId {} shardDataChunkId {} dataOffsetElem {} tmpChunkId {} numel {}",
       roundLogPrefix<Op::kSendTrans>(round, step, algoCtx),
@@ -372,7 +374,7 @@ inline bool progressRecvCheckTrans(
       resource.comm->ctran_->mapper->checkNotify(args.leftNotify.get(), &done),
       resource.comm->logMetaData_);
   if (done) {
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "{} to tmpRecvBuf {} shardId {} shardDataChunkId {} dataOffsetElem {} tmpChunkId {}",
         roundLogPrefix<Op::kRecvTrans>(round, step, algoCtx),
@@ -431,7 +433,7 @@ inline bool progressRecvCheckFlush(
       resource.comm->ctran_->mapper->testRequest(resp.get(), &isComplete),
       resource.comm->logMetaData_);
   if (isComplete) {
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL, "{} done", roundLogPrefix<Op::kRecvFlush>(round, step, algoCtx));
   }
   return isComplete;
@@ -454,7 +456,7 @@ inline bool progressRecvCheckSendBuf(const AlgoContext& algoCtx) {
 
   bool done = algoCtx.opRounds[Op::kSendTrans].done > prevRound;
   if (done) {
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "{} waited tmpChunkId {} algoCtx.numChunks {} prevRound {}",
         roundLogPrefix<Op::kRecvRedCopy>(round, step, algoCtx),
@@ -472,7 +474,7 @@ inline void progressRecvPostRedCopyKern(
   int round = algoCtx.opRounds[Op::kRecvRedCopy].post;
   int step = algoCtx.opRounds[Op::kRecvRedCopy].postStep.step;
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "{} posted",
       roundLogPrefix<Op::kRecvRedCopy>(round, step, algoCtx));
@@ -493,7 +495,7 @@ inline bool progressRecvCheckRedCopyKern(
     int fwdRound = isRecvFwd_ ? getRecvFwdSendRound(algoCtx, round) : -1;
     int tmpFwdChunkId = isRecvFwd_ ? getTmpChunkId(algoCtx, fwdRound) : -1;
 
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "{} done: tmpChunkId {} fwdRound {} tmpFwdChunkId {} ",
         roundLogPrefix<Op::kRecvRedCopy>(round, opStep.step, algoCtx),
@@ -513,7 +515,7 @@ inline void progressRecvPostRecvBuf(
   int step = algoCtx.opRounds[Op::kRecvRedCopy].doneStep.step;
   int tmpChunkId = getTmpChunkId(algoCtx, round);
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "{} posted tmpChunkId {}",
       roundLogPrefix<Op::kRecvRedCopy>(round, step, algoCtx),
@@ -1030,17 +1032,17 @@ inline commResult_t completeHostResourceSetup(
 
 } // namespace
 
-#define HOST_ABORT(desc)                                                     \
-  if (comm->testAbort()) {                                                   \
-    auto _abort = comm->getAbort();                                          \
-    std::string _ctx =                                                       \
-        _abort->TimedOut() ? "comm aborted due to timeout" : "comm aborted"; \
-    throw ctran::utils::Exception(                                           \
-        _ctx,                                                                \
-        commRemoteError,                                                     \
-        comm->logMetaData_.rank,                                             \
-        comm->logMetaData_.commHash,                                         \
-        std::string(desc));                                                  \
+#define HOST_ABORT(desc)                                                       \
+  if (comm->testAbort()) {                                                     \
+    auto _abort = comm->getAbort();                                            \
+    std::string _ctx =                                                         \
+        _abort->isTimedOut() ? "comm aborted due to timeout" : "comm aborted"; \
+    throw ctran::utils::Exception(                                             \
+        _ctx,                                                                  \
+        commRemoteError,                                                       \
+        comm->logMetaData_.rank,                                               \
+        comm->logMetaData_.commHash,                                           \
+        std::string(desc));                                                    \
   }
 
 static commResult_t impl(
@@ -1115,7 +1117,7 @@ static commResult_t impl(
       profiler, profiler->startEvent(ctran::ProfilerEvent::ALGO_DATA));
   while (algoCtx.partitionOffset < algoCtx.numElements) {
     updatePartitionCtxHost(args, resource, algoCtx);
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         ALGO_CXT_LOG_FMT_HOST,
         ALGO_CXT_LOG_FIELDS(algoCtx, args.numBlocks));
@@ -1319,7 +1321,7 @@ commResult_t ctranAllReduceRing(
         count,
         count * typeSize,
         typeSize);
-    CLOGF(ERR, "{}", errorMsg);
+    CTRAN_ERR(commInvalidArgument, "{}", errorMsg);
     throw ctran::utils::Exception(errorMsg, commInvalidArgument);
   }
 
@@ -1433,7 +1435,7 @@ commResult_t ctranAllReduceRing(
   std::tie(hostResource.tmpRecvBufRev, hostResource.tmpRecvBufRevHdl) =
       comm->ctran_->algo->getTmpBufInfo(
           CtranAlgo::TmpbufType::RING_TMP_RECV_BUF_REV);
-  CLOGF(
+  CTRAN_LOG(
       DBG,
       "AutoTune: {} blocks of {} threads, tmpbuf {} x {} chunks, bidirAg={}",
       numBlocks,
@@ -1477,6 +1479,10 @@ commResult_t ctranAllReduceRing(
       opCount);
   config.numBlocks = numBlocks;
   config.numThreads = numThreads;
+  config.blocksPerSM = MCCL_COLLECTIVE_STATS_ENABLE
+      ? ctran::algos::getBlocksPerSM(
+            func, numThreads, config.launchSharedMemBytes())
+      : 0;
   config.args.devState_d = comm->ctran_->algo->getDevState();
   ctran::allreduce::ring::KernArgs kernArgs{
       .sendbuff = sendbuff,
@@ -1518,5 +1524,76 @@ commResult_t ctranAllReduceRing(
   FB_COMMCHECK(comm->ctran_->gpe->submit(
       std::move(opGroup), ctran::allreduce::ring::impl, config, func, timeout));
 
+  return commSuccess;
+}
+
+commResult_t ctranAllReduceRingSmallMsg(
+    const void* sendbuff,
+    void* recvbuff,
+    size_t count,
+    commDataType_t datatype,
+    commRedOp_t redOp,
+    CtranComm* comm,
+    cudaStream_t stream,
+    std::optional<std::chrono::milliseconds> timeout) {
+  const size_t nRanks = static_cast<size_t>(comm->statex_->nRanks());
+  const size_t typeSize = static_cast<size_t>(commTypeSize(datatype));
+
+  // Lazily allocate the persistent staging buffers owned by the comm, reused
+  // across collectives and freed in CtranComm::destroy(). They grow on demand,
+  // so one pair of buffers serves every datatype. (Not valid under CUDA-graph
+  // capture; the first padded call must run eagerly.)
+  const size_t requiredBytes = nRanks * typeSize;
+  if (comm->smallMsgStageBytes_ < requiredBytes) {
+    if (comm->smallMsgStageSrc_ != nullptr) {
+      FB_CUDACHECK(cudaFree(comm->smallMsgStageSrc_));
+      comm->smallMsgStageSrc_ = nullptr;
+    }
+    if (comm->smallMsgStageDst_ != nullptr) {
+      FB_CUDACHECK(cudaFree(comm->smallMsgStageDst_));
+      comm->smallMsgStageDst_ = nullptr;
+    }
+    FB_CUDACHECK(cudaMalloc(&comm->smallMsgStageSrc_, requiredBytes));
+    FB_CUDACHECK(cudaMalloc(&comm->smallMsgStageDst_, requiredBytes));
+    comm->smallMsgStageBytes_ = requiredBytes;
+  }
+
+  // Copy the real input in and zero-fill the padded tail.
+  if (count > 0) {
+    FB_CUDACHECK(cudaMemcpyAsync(
+        comm->smallMsgStageSrc_,
+        sendbuff,
+        count * typeSize,
+        cudaMemcpyDefault,
+        stream));
+  }
+  FB_CUDACHECK(cudaMemsetAsync(
+      static_cast<char*>(comm->smallMsgStageSrc_) + count * typeSize,
+      0,
+      (nRanks - count) * typeSize,
+      stream));
+
+  const commResult_t ret = ctranAllReduceRing(
+      comm->smallMsgStageSrc_,
+      comm->smallMsgStageDst_,
+      nRanks,
+      datatype,
+      redOp,
+      comm,
+      stream,
+      timeout);
+  if (ret != commSuccess) {
+    return ret;
+  }
+
+  // Copy the reduced result for the original element count back to recvbuff.
+  if (count > 0) {
+    FB_CUDACHECK(cudaMemcpyAsync(
+        recvbuff,
+        comm->smallMsgStageDst_,
+        count * typeSize,
+        cudaMemcpyDefault,
+        stream));
+  }
   return commSuccess;
 }

@@ -19,6 +19,7 @@
 #endif
 
 #include "comms/common/bootstrap/IBootstrap.h"
+#include "comms/common/fault_tolerance/AbortDevice.cuh"
 #include "comms/prims/memory/GpuMemHandler.h"
 #include "comms/prims/memory/NvlMemExchange.h"
 #include "comms/prims/topology/TopologyDiscovery.h"
@@ -29,10 +30,14 @@
 #include "comms/prims/transport/nvl/MultiPeerNvlTransport.h"
 #include "comms/prims/transport/self/P2pSelfTransportDevice.cuh"
 
+namespace comms::fault_tolerance {
+class Abort;
+} // namespace comms::fault_tolerance
+
 namespace comms::prims {
 
 // Forward declaration — include MultiPeerDeviceHandle.cuh to use
-// get_device_handle()
+// get_device_handle(peers).
 struct MultiPeerDeviceHandle;
 
 struct MultiPeerTransportConfig {
@@ -70,19 +75,23 @@ struct MultiPeerTransportConfig {
  * Usage:
  *   auto transport = MultiPeerTransport(myRank, nRanks, deviceId, bootstrap,
  * config); transport.exchange();                            // COLLECTIVE auto
- * handle = transport.get_device_handle();     // For kernels
+ * handle = transport.get_device_handle(peers); // For kernels
  */
 class MultiPeerTransport {
  public:
   /// When topo is provided, bypasses TopologyDiscovery and uses the
   /// pre-computed topology directly (primarily for unit testing).
+  ///
+  /// @throws std::runtime_error on topology discovery, transport construction,
+  /// or enabled FT abort-device handle creation failure.
   MultiPeerTransport(
       int myRank,
       int nRanks,
       int deviceId,
       std::shared_ptr<meta::comms::IBootstrap> bootstrap,
       const MultiPeerTransportConfig& config,
-      std::optional<TopologyResult> topo = std::nullopt);
+      std::optional<TopologyResult> topo = std::nullopt,
+      std::shared_ptr<comms::fault_tolerance::Abort> abort = nullptr);
 
   ~MultiPeerTransport();
 
@@ -188,6 +197,39 @@ class MultiPeerTransport {
   Transport* /*nullable*/ get_nvl_transports_array() const;
 
   /**
+   * @return True after collective multimem initialization succeeds.
+   *
+   * This is a cached local query and never starts a collective operation.
+   */
+  bool has_multimem_nvl_transport() const;
+
+  /**
+   * Collectively initialize the multimem NVL transport when all ranks are
+   * eligible. Returns false for disabled/ineligible communicators so the
+   * dispatcher can select a fallback algorithm.
+   *
+   * PRECONDITION: all NVL ranks call this in lockstep.
+   * @throws std::runtime_error on bootstrap or multicast setup failure.
+   */
+  bool initialize_multimem_nvl_transport() const;
+
+  /**
+   * Return the device handle for the copy-based (staging) multimem NVL
+   * transport. Delegates to
+   * MultiPeerNvlTransport::getMultimemNvlTransportDevice(). Used by the nvlmm
+   * staging path.
+   *
+   * Call initialize_multimem_nvl_transport() collectively before this cached
+   * getter. It throws when initialization has not succeeded.
+   *
+   * This getter is local and never touches bootstrap.
+   *
+   * @throws std::runtime_error if no NVL transport, multimem NVL is not
+   * initialized.
+   */
+  MultimemNvlTransportDevice get_multimem_nvl_transport_device() const;
+
+  /**
    * @param globalPeerRank Global rank of the IBGDA peer.
    * @return Non-owning pointer to GPU-allocated P2pIbgdaTransportDevice.
    */
@@ -200,22 +242,37 @@ class MultiPeerTransport {
   // --- Device handle (for passing to kernels) ---
 
   /**
-   * @return MultiPeerDeviceHandle suitable for passing to CUDA kernels.
-   * @throws std::runtime_error if lazy mode is enabled or exchange() not
-   * called.
-   */
-  MultiPeerDeviceHandle get_device_handle() const;
-
-  /**
    * Materialize the specified IBGDA peers, then return the device handle.
    * Use with lazy mode for DeviceWindow or direct Transport[] access.
    *
    * @param peers List of peer ranks to materialize
+   * @throws std::runtime_error if called before exchange() or if peer
+   * materialization fails.
    */
   MultiPeerDeviceHandle get_device_handle(const std::vector<int>& peers);
 
   bool is_lazy_mode() const;
 
+  /*
+   * Actual channel capacity of the configured IBGDA transport.
+   */
+  std::optional<int> ibgda_max_groups() const;
+
+  /*
+   * Resolved staging pipeline depth of the configured IBGDA transport.
+   */
+  std::optional<int> ibgda_pipeline_depth() const;
+
+  /*
+   * Channel capacity of whichever IB backend is configured. Empty when this
+   * rank has no IB peers.
+   */
+  std::optional<int> ib_max_num_channels() const;
+
+  /*
+   * Every requested edge must be requested by both endpoint ranks in the same
+   * connect round. Peer-vector order may differ between ranks.
+   */
   void materializePeers(const std::vector<int>& peers);
 
   void connectPeers();
@@ -231,6 +288,17 @@ class MultiPeerTransport {
    * @throws std::runtime_error if no IBGDA transport or registration fails
    */
   IbgdaLocalBuffer localRegisterIbgdaBuffer(void* ptr, size_t size);
+
+  IbBufferRegistrationLease registerIbBulkBuffer(void* ptr, std::size_t size);
+
+  std::optional<IbBufferRegistrationView> lookupIbBulkBuffer(
+      const IbBufferRegistrationLease& lease,
+      void* ptr,
+      std::size_t size) const;
+
+  void deregisterIbBulkBuffer(IbBufferRegistrationLease& lease);
+
+  bool isIbBulkBufferViewActive(const IbBufferRegistrationView& view) const;
 
   /**
    * Deregister a previously registered IBGDA buffer.
@@ -289,8 +357,9 @@ class MultiPeerTransport {
   const int myRank_;
   const int nRanks_;
   const int deviceId_;
-  const bool ibLazyConnect_{false};
   std::shared_ptr<meta::comms::IBootstrap> bootstrap_;
+  std::shared_ptr<comms::fault_tolerance::Abort> abort_;
+  comms::fault_tolerance::AbortDevice abortDevice_;
 
   // --- Topology (populated in constructor) ---
   std::vector<int> nvlPeerRanks_;

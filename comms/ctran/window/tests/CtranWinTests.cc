@@ -806,6 +806,404 @@ TEST_F(CtranWinTest, multiSegmentWindowRegister) {
   COMMCHECK_TEST(commMemFreeDisjoint(disjointBuf, segSizes));
 }
 
+// ipc_only window registration: exchanges CUDA-IPC handles for the data buffer
+// only among intra-node NVL peers and defers inter-node IB rkeys. Verifies that
+// NVL/local peers get a valid remWinInfo dataAddr + NVL key while self keeps
+// the local ptr (UNSET key) and non-NVL/remote peers stay empty (nullptr /
+// UNSET), and that a basic NVL read-back plus free() complete without error. On
+// configs where all peers are non-local (e.g. *_nolocal), every non-self peer
+// is empty.
+TEST_F(CtranWinTest, ipcOnlyUserBufferRegister) {
+  if (!ncclIsCuMemSupported()) {
+    GTEST_SKIP() << "CuMem not supported, skip ipc_only window test";
+  }
+
+  auto comm = makeCtranComm();
+  ASSERT_NE(comm, nullptr);
+
+  auto statex = comm->statex_.get();
+  ASSERT_NE(statex, nullptr);
+
+  constexpr size_t sizeBytes = 8192 * sizeof(int);
+  const MemAllocType bufType = MemAllocType::kMemCuMemAlloc;
+  void* userBuf = commMemAlloc(sizeBytes, bufType, segments);
+  ASSERT_NE(userBuf, nullptr);
+
+  // Fill the local buffer with a rank-specific pattern for the read-back below.
+  const size_t count = sizeBytes / sizeof(int);
+  std::vector<int> fillVals(count);
+  for (size_t i = 0; i < count; ++i) {
+    fillVals[i] = this->globalRank * 10000 + static_cast<int>(i);
+  }
+  CUDACHECK_TEST(
+      cudaMemcpy(userBuf, fillVals.data(), sizeBytes, cudaMemcpyHostToDevice));
+
+  // Simulate the CCA memory hook so acquireScopedRegister finds the segment.
+  COMMCHECK_TEST(
+      ctran::RegCache::getInstance()->globalRegister(userBuf, sizeBytes));
+
+  // Register the user buffer with the ipc_only window hint enabled.
+  CtranWin* win = nullptr;
+  meta::comms::Hints hints;
+  ASSERT_EQ(hints.set("win_register_ipc_only", "1"), commSuccess);
+  auto res = ctranWinRegister(userBuf, sizeBytes, comm.get(), &win, hints);
+  ASSERT_EQ(res, commSuccess);
+  ASSERT_NE(win, nullptr);
+  ASSERT_EQ(win->remWinInfo.size(), static_cast<size_t>(this->numRanks));
+
+  for (int peer = 0; peer < this->numRanks; ++peer) {
+    const auto& info = win->remWinInfo[peer];
+    if (peer == statex->rank()) {
+      EXPECT_EQ(info.dataAddr, userBuf);
+      // Self's local base/signal addr is still set under ipc_only.
+      EXPECT_THAT(info.signalAddr, ::testing::NotNull());
+    } else if (win->nvlEnabled(peer)) {
+      EXPECT_THAT(info.dataAddr, ::testing::NotNull());
+      EXPECT_EQ(info.dataRkey.backend, CtranMapperBackend::NVL);
+      // The base buffer is also NVL-only exchanged under ipc_only.
+      EXPECT_THAT(info.signalAddr, ::testing::NotNull());
+      EXPECT_EQ(info.signalRkey.backend, CtranMapperBackend::NVL);
+    } else {
+      EXPECT_THAT(info.dataAddr, ::testing::IsNull());
+      EXPECT_EQ(info.dataRkey.backend, CtranMapperBackend::UNSET);
+      // Non-NVL peers: base/signal IB rkey deferred, not exchanged.
+      EXPECT_THAT(info.signalAddr, ::testing::IsNull());
+      EXPECT_EQ(info.signalRkey.backend, CtranMapperBackend::UNSET);
+    }
+  }
+
+  oobBarrier();
+
+  // Basic access: read back an NVL peer's window over the IPC mapping.
+  for (int peer = 0; peer < this->numRanks; ++peer) {
+    if (peer == this->globalRank || !win->nvlEnabled(peer)) {
+      continue;
+    }
+    void* remoteAddr = win->remWinInfo[peer].dataAddr;
+    ASSERT_NE(remoteAddr, nullptr);
+    std::vector<int> readBack(count);
+    CUDACHECK_TEST(cudaMemcpy(
+        readBack.data(), remoteAddr, sizeBytes, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < count; ++i) {
+      const int expected = peer * 10000 + static_cast<int>(i);
+      EXPECT_EQ(readBack[i], expected) << "ipc_only NVL read-back mismatch at "
+                                       << i << " from peer " << peer;
+    }
+  }
+
+  oobBarrier();
+
+  res = ctranWinFree(win);
+  EXPECT_EQ(res, commSuccess);
+
+  const auto ipcRegCache = ctran::IpcRegCache::getInstance();
+  ASSERT_NE(ipcRegCache, nullptr);
+  EXPECT_EQ(ipcRegCache->maxRemRegRefCount(), 0)
+      << "IpcRegCache still holds live NVL IPC imports after ipc_only free";
+
+  COMMCHECK_TEST(
+      ctran::RegCache::getInstance()->globalDeregister(userBuf, sizeBytes));
+  commMemFree(userBuf, sizeBytes, bufType);
+  segments.erase(
+      std::remove_if(
+          segments.begin(),
+          segments.end(),
+          [userBuf](const TestMemSegment& seg) { return seg.ptr == userBuf; }),
+      segments.end());
+}
+
+// enable_signal=0 window registration: the window carries no signal buffer, so
+// signal-buffer allocation and the signal-related control exchange are skipped.
+// Verifies that registration succeeds, signalSize is 0 with a null signal
+// pointer, no signal rkey/addr is exchanged for any peer, a basic NVL data
+// read-back plus free() complete without leaking imports, and that a signal RMA
+// op is rejected with commInvalidUsage.
+TEST_F(CtranWinTest, enableSignalDisabledUserBufferRegister) {
+  if (!ncclIsCuMemSupported()) {
+    GTEST_SKIP() << "CuMem not supported, skip enable_signal window test";
+  }
+
+  auto comm = makeCtranComm();
+  ASSERT_NE(comm, nullptr);
+
+  auto statex = comm->statex_.get();
+  ASSERT_NE(statex, nullptr);
+
+  constexpr size_t sizeBytes = 8192 * sizeof(int);
+  const MemAllocType bufType = MemAllocType::kMemCuMemAlloc;
+  void* userBuf = commMemAlloc(sizeBytes, bufType, segments);
+  ASSERT_NE(userBuf, nullptr);
+
+  // Fill the local buffer with a rank-specific pattern for the read-back below.
+  const size_t count = sizeBytes / sizeof(int);
+  std::vector<int> fillVals(count);
+  for (size_t i = 0; i < count; ++i) {
+    fillVals[i] = this->globalRank * 10000 + static_cast<int>(i);
+  }
+  CUDACHECK_TEST(
+      cudaMemcpy(userBuf, fillVals.data(), sizeBytes, cudaMemcpyHostToDevice));
+
+  // Simulate the CCA memory hook so acquireScopedRegister finds the segment.
+  COMMCHECK_TEST(
+      ctran::RegCache::getInstance()->globalRegister(userBuf, sizeBytes));
+
+  // Register the user buffer with the signal buffer disabled.
+  CtranWin* win = nullptr;
+  meta::comms::Hints hints;
+  ASSERT_EQ(hints.set("win_register_enable_signal", "0"), commSuccess);
+  auto res = ctranWinRegister(userBuf, sizeBytes, comm.get(), &win, hints);
+  ASSERT_EQ(res, commSuccess);
+  ASSERT_NE(win, nullptr);
+  ASSERT_EQ(win->remWinInfo.size(), static_cast<size_t>(this->numRanks));
+
+  // No signal buffer exists.
+  EXPECT_FALSE(win->isSignalEnabled());
+  EXPECT_EQ(win->signalSize, 0u);
+  EXPECT_THAT(win->winSignalPtr, ::testing::IsNull());
+
+  // No signal rkey / addr was exchanged for any peer, while data addresses are
+  // still populated for NVL peers.
+  for (int peer = 0; peer < this->numRanks; ++peer) {
+    const auto& info = win->remWinInfo[peer];
+    EXPECT_THAT(info.signalAddr, ::testing::IsNull());
+    EXPECT_EQ(info.signalRkey.backend, CtranMapperBackend::UNSET);
+    if (peer == statex->rank()) {
+      EXPECT_EQ(info.dataAddr, userBuf);
+    }
+  }
+
+  oobBarrier();
+
+  // Basic access: read back an NVL peer's window over the IPC mapping.
+  for (int peer = 0; peer < this->numRanks; ++peer) {
+    if (peer == this->globalRank || !win->nvlEnabled(peer)) {
+      continue;
+    }
+    void* remoteAddr = win->remWinInfo[peer].dataAddr;
+    ASSERT_NE(remoteAddr, nullptr);
+    std::vector<int> readBack(count);
+    CUDACHECK_TEST(cudaMemcpy(
+        readBack.data(), remoteAddr, sizeBytes, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < count; ++i) {
+      const int expected = peer * 10000 + static_cast<int>(i);
+      EXPECT_EQ(readBack[i], expected)
+          << "enable_signal=0 NVL read-back mismatch at " << i << " from peer "
+          << peer;
+    }
+  }
+
+  // A signal RMA op must be rejected since there is no signal buffer.
+  cudaStream_t stream;
+  CUDACHECK_TEST(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  const int nextPeer = (this->globalRank + 1) % this->numRanks;
+  EXPECT_EQ(ctranWaitSignal(nextPeer, win, stream), commInvalidUsage);
+  CUDACHECK_TEST(cudaStreamDestroy(stream));
+
+  oobBarrier();
+
+  res = ctranWinFree(win);
+  EXPECT_EQ(res, commSuccess);
+
+  const auto ipcRegCache = ctran::IpcRegCache::getInstance();
+  ASSERT_NE(ipcRegCache, nullptr);
+  EXPECT_EQ(ipcRegCache->maxRemRegRefCount(), 0)
+      << "IpcRegCache still holds live NVL IPC imports after enable_signal free";
+
+  COMMCHECK_TEST(
+      ctran::RegCache::getInstance()->globalDeregister(userBuf, sizeBytes));
+  commMemFree(userBuf, sizeBytes, bufType);
+  segments.erase(
+      std::remove_if(
+          segments.begin(),
+          segments.end(),
+          [userBuf](const TestMemSegment& seg) { return seg.ptr == userBuf; }),
+      segments.end());
+}
+
+// win_register_symmetric hint: the flag is cached on the window (no exchange or
+// behavior change yet). Verifies that a window registered with the hint reports
+// isSymmetric()==true, a window registered without it reports false, and that
+// registration/free complete without leaking imports.
+TEST_F(CtranWinTest, symmetricUserBufferRegister) {
+  if (!ncclIsCuMemSupported()) {
+    GTEST_SKIP() << "CuMem not supported, skip symmetric window test";
+  }
+
+  auto comm = makeCtranComm();
+  ASSERT_NE(comm, nullptr);
+
+  auto statex = comm->statex_.get();
+  ASSERT_NE(statex, nullptr);
+
+  constexpr size_t sizeBytes = 8192 * sizeof(int);
+  const MemAllocType bufType = MemAllocType::kMemCuMemAlloc;
+  void* userBuf = commMemAlloc(sizeBytes, bufType, segments);
+  ASSERT_NE(userBuf, nullptr);
+
+  // Simulate the CCA memory hook so acquireScopedRegister finds the segment.
+  COMMCHECK_TEST(
+      ctran::RegCache::getInstance()->globalRegister(userBuf, sizeBytes));
+
+  // Register the user buffer with the symmetric window hint enabled.
+  CtranWin* win = nullptr;
+  meta::comms::Hints hints;
+  ASSERT_EQ(hints.set("win_register_symmetric", "1"), commSuccess);
+  auto res = ctranWinRegister(userBuf, sizeBytes, comm.get(), &win, hints);
+  ASSERT_EQ(res, commSuccess);
+  ASSERT_NE(win, nullptr);
+  EXPECT_TRUE(win->isSymmetric());
+
+  oobBarrier();
+
+  res = ctranWinFree(win);
+  EXPECT_EQ(res, commSuccess);
+
+  // A window registered without the hint defaults to non-symmetric.
+  CtranWin* winDefault = nullptr;
+  res = ctranWinRegister(userBuf, sizeBytes, comm.get(), &winDefault);
+  ASSERT_EQ(res, commSuccess);
+  ASSERT_NE(winDefault, nullptr);
+  EXPECT_FALSE(winDefault->isSymmetric());
+
+  oobBarrier();
+
+  res = ctranWinFree(winDefault);
+  EXPECT_EQ(res, commSuccess);
+
+  const auto ipcRegCache = ctran::IpcRegCache::getInstance();
+  ASSERT_NE(ipcRegCache, nullptr);
+  EXPECT_EQ(ipcRegCache->maxRemRegRefCount(), 0)
+      << "IpcRegCache still holds live NVL IPC imports after symmetric free";
+
+  COMMCHECK_TEST(
+      ctran::RegCache::getInstance()->globalDeregister(userBuf, sizeBytes));
+  commMemFree(userBuf, sizeBytes, bufType);
+  segments.erase(
+      std::remove_if(
+          segments.begin(),
+          segments.end(),
+          [userBuf](const TestMemSegment& seg) { return seg.ptr == userBuf; }),
+      segments.end());
+}
+
+// Window range cache: a symmetric window's range is resolvable by
+// findWindowForBuffer, including a sub-range within it, and stops resolving
+// once the window is freed.
+TEST_F(CtranWinTest, windowRangeLookup) {
+  if (!ncclIsCuMemSupported()) {
+    GTEST_SKIP() << "CuMem not supported, skip window range lookup test";
+  }
+
+  auto comm = makeCtranComm();
+  ASSERT_NE(comm, nullptr);
+
+  constexpr size_t sizeBytes = 8192 * sizeof(int);
+  const MemAllocType bufType = MemAllocType::kMemCuMemAlloc;
+  void* userBuf = commMemAlloc(sizeBytes, bufType, segments);
+  ASSERT_NE(userBuf, nullptr);
+
+  // Simulate the CCA memory hook so acquireScopedRegister finds the segment.
+  COMMCHECK_TEST(
+      ctran::RegCache::getInstance()->globalRegister(userBuf, sizeBytes));
+
+  // Register the user buffer with the symmetric window hint enabled.
+  CtranWin* win = nullptr;
+  meta::comms::Hints hints;
+  ASSERT_EQ(hints.set("win_register_symmetric", "1"), commSuccess);
+  auto res = ctranWinRegister(userBuf, sizeBytes, comm.get(), &win, hints);
+  ASSERT_EQ(res, commSuccess);
+  ASSERT_NE(win, nullptr);
+
+  // The full data buffer resolves to this window.
+  EXPECT_EQ(comm->findWindowForBuffer(userBuf, sizeBytes), win);
+  // A sub-range within the window also resolves to it.
+  auto* mid = static_cast<char*>(userBuf) + 128;
+  EXPECT_EQ(comm->findWindowForBuffer(mid, 256), win);
+  // A range extending one byte past the end resolves to nullptr.
+  EXPECT_EQ(comm->findWindowForBuffer(userBuf, sizeBytes + 1), nullptr);
+
+  oobBarrier();
+
+  ASSERT_EQ(ctranWinFree(win), commSuccess);
+
+  // After free the buffer no longer resolves to a window.
+  EXPECT_EQ(comm->findWindowForBuffer(userBuf, sizeBytes), nullptr);
+
+  freeWinBuf(true, userBuf, sizeBytes, bufType);
+}
+
+// Window range cache: overlapping symmetric windows registered over the same
+// buffer are all cached, and every rank resolves a given buffer to the SAME
+// window (verified via the per-comm window id), which is required for
+// consistent symmetric-offset math.
+TEST_F(CtranWinDistTest, windowRangeOverlapDeterministic) {
+  if (!ncclIsCuMemSupported()) {
+    GTEST_SKIP() << "CuMem not supported, skip window range overlap test";
+  }
+
+  auto comm = makeCtranComm();
+  ASSERT_NE(comm, nullptr);
+
+  auto statex = comm->statex_.get();
+  ASSERT_NE(statex, nullptr);
+
+  if (statex->nLocalRanks() < 2) {
+    GTEST_SKIP() << "need >=2 local ranks";
+  }
+
+  constexpr size_t sizeBytes = 8192 * sizeof(int);
+  const MemAllocType bufType = MemAllocType::kMemCuMemAlloc;
+  std::vector<TestMemSegment> distSegments;
+  void* userBuf = commMemAlloc(sizeBytes, bufType, distSegments);
+  ASSERT_NE(userBuf, nullptr);
+
+  // Simulate the CCA memory hook so acquireScopedRegister finds the segment.
+  COMMCHECK_TEST(
+      ctran::RegCache::getInstance()->globalRegister(userBuf, sizeBytes));
+
+  meta::comms::Hints hints;
+  ASSERT_EQ(hints.set("win_register_symmetric", "1"), commSuccess);
+
+  // Register two overlapping symmetric windows over the same buffer: one
+  // spanning the whole buffer, and one spanning only its prefix.
+  CtranWin* winWhole = nullptr;
+  auto res = ctranWinRegister(userBuf, sizeBytes, comm.get(), &winWhole, hints);
+  ASSERT_EQ(res, commSuccess);
+  ASSERT_NE(winWhole, nullptr);
+
+  CtranWin* winPrefix = nullptr;
+  res = ctranWinRegister(userBuf, sizeBytes / 2, comm.get(), &winPrefix, hints);
+  ASSERT_EQ(res, commSuccess);
+  ASSERT_NE(winPrefix, nullptr);
+
+  EXPECT_NE(winWhole->id(), winPrefix->id())
+      << "distinct windows must get distinct ids";
+
+  // A sub-range inside the overlap is contained by both windows; the cache
+  // must deterministically pick one.
+  auto* win = comm->findWindowForBuffer(userBuf, sizeBytes / 4);
+  ASSERT_NE(win, nullptr);
+
+  // Verify all ranks picked the same window via id.
+  std::vector<uint64_t> ids(statex->nLocalRanks(), 0);
+  ids[statex->localRank()] = win->id();
+  allGatherNvlDomain(comm.get(), ids);
+  for (int r = 0; r < statex->nLocalRanks(); ++r) {
+    EXPECT_EQ(ids[r], win->id())
+        << "rank " << r << " resolved the buffer to a different window";
+  }
+
+  oobBarrier();
+
+  ASSERT_EQ(ctranWinFree(winPrefix), commSuccess);
+  ASSERT_EQ(ctranWinFree(winWhole), commSuccess);
+
+  // Release the CCA-hook simulation registration and free the buffer.
+  COMMCHECK_TEST(
+      ctran::RegCache::getInstance()->globalDeregister(userBuf, sizeBytes));
+  commMemFree(userBuf, sizeBytes, bufType);
+}
+
 TEST_F(CtranWinTest, RegisterOverRangeUserBufferNoLeak) {
   // Reproduces a leak in ctranWinRegister: it constructs the CtranWin with a
   // raw `new`, then FB_COMMCHECK(exchange()). If exchange() fails, the early
@@ -902,6 +1300,32 @@ TEST_F(CtranWinTest, RegisterUncachedUserBufferReturnsInvalidUsageNoLeak) {
           segments.end(),
           [userBuf](const TestMemSegment& seg) { return seg.ptr == userBuf; }),
       segments.end());
+}
+
+// A non-symmetric window is not cached (window-based collectives only use
+// symmetric windows), so findWindowForBuffer never resolves to it.
+TEST_F(CtranWinTest, findWindowForBufferNonSymmetric) {
+  auto comm = makeCtranComm();
+  ASSERT_NE(comm, nullptr);
+
+  CtranWin* win = nullptr;
+  const size_t sizeBytes = 8192 * sizeof(int);
+  void* winBase = nullptr;
+  // Allocate a default (non-symmetric) window.
+  auto res = ctranWinAllocate(sizeBytes, comm.get(), &winBase, &win);
+  ASSERT_EQ(res, commSuccess);
+  ASSERT_NE(winBase, nullptr);
+  ASSERT_FALSE(win->isSymmetric());
+
+  // Not cached: neither the whole buffer nor a sub-range resolves.
+  EXPECT_EQ(comm->findWindowForBuffer(winBase, sizeBytes), nullptr);
+  auto* subRange = static_cast<char*>(winBase) + 128;
+  EXPECT_EQ(comm->findWindowForBuffer(subRange, 256), nullptr);
+
+  oobBarrier();
+
+  res = ctranWinFree(win);
+  EXPECT_EQ(res, commSuccess);
 }
 
 INSTANTIATE_TEST_SUITE_P(

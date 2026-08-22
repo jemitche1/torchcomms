@@ -5,12 +5,16 @@
 #include <torch/csrc/distributed/c10d/Backend.hpp> // @manual=//caffe2:torch-cpp-cpu
 #include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp-cpu
 #include <torch/csrc/distributed/c10d/Work.hpp> // @manual=//caffe2:torch-cpp-cpu
+#ifdef C10D_BACKEND_HAS_WINDOW
+#include <torch/csrc/distributed/c10d/Window.hpp> // @manual=//caffe2:torch-cpp-cpu
+#endif
 
 #include "comms/torchcomms/TorchCommBackend.hpp"
 #include "comms/torchcomms/TorchCommBatch.hpp"
 #include "comms/torchcomms/TorchCommTypes.hpp"
 #include "comms/torchcomms/TorchWork.hpp"
 
+#include <atomic>
 #include <optional>
 
 namespace torch::comms {
@@ -19,7 +23,8 @@ class WorkWrapper : public c10d::Work {
  public:
   explicit WorkWrapper(
       c10::intrusive_ptr<TorchWork> work,
-      std::vector<at::Tensor> outputTensors = {});
+      std::vector<at::Tensor> outputTensors = {},
+      bool hostBlocking = false);
   ~WorkWrapper() override = default;
 
   void synchronize() override;
@@ -32,6 +37,9 @@ class WorkWrapper : public c10d::Work {
   c10::intrusive_ptr<TorchWork> work_;
   c10::intrusive_ptr<c10::ivalue::Future> future_;
   std::vector<at::Tensor> outputTensors_;
+  // When set (synchronous barrier), wait()/synchronize() also host-block via
+  // work_->hostSynchronize() after the stream-ordered wait().
+  bool hostBlocking_;
 };
 
 using c10d::kUnsetTimeout;
@@ -115,6 +123,12 @@ class BackendWrapper : public c10d::Backend {
       const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
   c10::intrusive_ptr<c10d::Work> barrier(
       const c10d::BarrierOptions& opts = c10d::BarrierOptions()) override;
+  // Health-checking barrier used by torch.distributed.monitored_barrier. Only
+  // meaningful on the gloo (CPU) backend; reimplements
+  // c10d::ProcessGroupGloo::monitoredBarrier on top of TorchComms P2P.
+  void monitoredBarrier(
+      const c10d::BarrierOptions& opts = c10d::BarrierOptions(),
+      bool waitAllRanks = false) override;
   c10::intrusive_ptr<c10d::Work>
   send(std::vector<at::Tensor>& tensors, int dstRank, int tag) override;
   c10::intrusive_ptr<c10d::Work>
@@ -137,6 +151,12 @@ class BackendWrapper : public c10d::Backend {
   // Returns the symmetric (VMM-backed) CUDA allocator associated with this
   // communicator's backend. See `TorchComm::getMemAllocator()`.
   std::shared_ptr<c10::Allocator> getMemAllocator() override;
+
+#ifdef C10D_BACKEND_HAS_WINDOW
+  bool supportsWindow() const override;
+  c10::intrusive_ptr<c10d::Window> new_window(
+      const std::optional<at::Tensor>& tensor = std::nullopt) override;
+#endif
 
   c10::intrusive_ptr<Options> getOptions() {
     return options_;
@@ -185,6 +205,15 @@ class BackendWrapper : public c10d::Backend {
   // immediately. c10d's coalescing manager serializes per-PG, so a single
   // slot suffices.
   std::optional<BatchSendRecv> coalescing_batch_;
+
+  // Per-call tag sequence for monitoredBarrier's check-in/ack P2P. Kept
+  // per-BackendWrapper (not process-global) so each ProcessGroup owns its own
+  // counter: monitoredBarrier is collective per PG, so every rank advances
+  // this instance's counter in lockstep and derives identical tags. A shared
+  // process-global counter could instead be advanced a different number of
+  // times per rank when unrelated PGs run concurrent barriers, yielding
+  // mismatched send/recv tags across ranks.
+  std::atomic<uint32_t> monitoredBarrierTagCounter_{0};
 };
 
 } // namespace torch::comms

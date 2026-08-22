@@ -3,6 +3,7 @@
 #ifndef CTRAN_GPE_IMPL_H_
 #define CTRAN_GPE_IMPL_H_
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -18,15 +19,16 @@
 #include "comms/ctran/algos/common/GpeKernel.h"
 #include "comms/ctran/algos/common/GpeKernelSync.h"
 #include "comms/ctran/algos/common/GpeRing.h"
+#include "comms/ctran/algos/common/OrderedWorkStreamGuard.h"
 #include "comms/ctran/gpe/CtranChecksum.h"
 #include "comms/ctran/gpe/CtranGpe.h"
 #include "comms/ctran/gpe/GpeDeviceRing.h"
+#include "comms/ctran/gpe/GpeHostNodeSpine.h"
 #include "comms/ctran/profiler/GpeProfiler.h"
 #include "comms/ctran/profiler/IGpeProfilerReporter.h"
 #include "comms/ctran/utils/CudaGraphUtils.h"
 #include "comms/ctran/utils/ExtUtils.h"
 #include "comms/ctran/utils/PinnedHostPool.h"
-#include "comms/utils/GraphCaptureSideStream.h"
 
 struct CommLogData;
 
@@ -41,9 +43,10 @@ struct alignas(128) KernelFlagItem {
     for (int i = 0; i < numGroups_; i++) {
       dev.flag_[i] = KERNEL_UNSET;
     }
-    // Clear the full ring header so enabled==1 always implies ring/cmdId are
-    // current; submit() re-arms it per-cmd on the ring path.
+    // Clear the full ring + colltrace headers (not just enabled) so a stale
+    // ring/cmdId/collId can never be published; submit() re-arms them per-cmd.
     dev.gpeHdr = {};
+    dev.colltraceHdr = {};
   }
 
   bool inUse() {
@@ -63,9 +66,10 @@ struct alignas(128) KernelFlagItem {
       dev.flag_[i] = KERNEL_SCHEDULED;
     }
     numGroups_ = 1;
-    // Clear the full ring header (not just enabled) so a stale ring/cmdId can
-    // never be published; submit() re-arms it per-cmd on the ring path.
+    // Clear the full ring + colltrace headers (not just enabled) so a stale
+    // ring/cmdId/collId can never be published; submit() re-arms them per-cmd.
     dev.gpeHdr = {};
+    dev.colltraceHdr = {};
   }
 
   bool testFlagAllGroups(int flag) {
@@ -131,6 +135,8 @@ class CtranGpeCmd {
     opFunc func;
     std::shared_ptr<meta::comms::colltrace::ICollTraceHandle> collHandle;
     CtranComm* comm;
+    // Stats bucket, resolved at submit. Empty when stats are disabled.
+    CtranCollectiveStatsKey statsKey;
   } coll;
 
   // kernelFlag to assist device mem communication
@@ -211,67 +217,6 @@ commResult_t allocGpeKernelSyncs(
     int nworkers,
     std::vector<ctran::algos::GpeKernelSync*>& gpeKernelSyncs);
 
-class OrderedWorkStreamGuard {
- public:
-  ~OrderedWorkStreamGuard();
-
-  void init(const CommLogData& logMetaData);
-
-  class Scope {
-   public:
-    Scope(
-        OrderedWorkStreamGuard& guard,
-        cudaStream_t userStream,
-        const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo);
-    ~Scope();
-
-    Scope(const Scope&) = delete;
-    Scope& operator=(const Scope&) = delete;
-    Scope(Scope&& other) noexcept;
-    Scope& operator=(Scope&& other) noexcept;
-
-    commResult_t status() const {
-      return status_;
-    }
-    cudaStream_t stream() const {
-      return userStream_;
-    }
-
-   private:
-    OrderedWorkStreamGuard* guard_;
-    cudaStream_t userStream_;
-    ctran::utils::cudagraph::StreamCaptureInfo captureInfo_;
-    commResult_t status_;
-  };
-
-  Scope acquire(
-      cudaStream_t userStream,
-      const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo);
-
- private:
-  commResult_t doAcquire(
-      cudaStream_t userStream,
-      const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo);
-  commResult_t doRelease(
-      cudaStream_t userStream,
-      const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo);
-
-  cudaEvent_t execModeSyncEvent_{};
-  unsigned long long lastCaptureId_{0};
-  bool everCaptured_{false};
-  cudaStream_t lastUserStream_{nullptr};
-  cudaGraphNode_t lastRecordNode_{};
-
-  // Side stream used during capture to host the external cudaEventRecord
-  // node for execModeSyncEvent_ off the user stream's critical path, so
-  // its release fence doesn't stall compute between ctran submissions.
-  // The next doAcquire still adds lastRecordNode_ (now on the side) as
-  // an explicit capture dependency of userStream, preserving ordering.
-  std::unique_ptr<meta::comms::GraphSideStream> sideStream_;
-
-  const CommLogData* logMetaData_{nullptr};
-};
-
 class CtranGpe::Impl {
  public:
   Impl();
@@ -336,6 +281,9 @@ class CtranGpe::Impl {
   // Used only by the GPE thread.
   std::unique_ptr<ctran::GpeProfiler> gpeProfiler_;
 
+  // Written by the GPE thread per collective; drained via getAndClear.
+  comms::CollectiveStats collectiveStats_;
+
  private:
   struct CmdQueue {
     std::queue<CtranGpeCmd*> queue;
@@ -343,7 +291,10 @@ class CtranGpe::Impl {
   folly::Synchronized<CmdQueue, std::mutex> cmdQueue_;
   std::condition_variable cmdQueueCv_;
   std::thread thread_;
-  OrderedWorkStreamGuard ws_;
+  // Set by terminate() so the worker's kernel-start waits bail out during
+  // teardown instead of blocking forever on a cmd whose kernel never launches.
+  std::atomic<bool> terminating_{false};
+  ctran::algos::OrderedWorkStreamGuard ws_;
 
   // Device-ring dispatch state (NCCL_CTRAN_GPE_DEVICE_RING). Ring + reader are
   // null unless the ring path is enabled. The reader and ringPending_ are
@@ -352,6 +303,22 @@ class CtranGpe::Impl {
   std::unique_ptr<ctran::gpe::GpeRingReader> deviceRingReader_;
   std::queue<CtranGpeCmd*> ringPending_;
   GpeDeviceRingCmdRegistry deviceRingCmdRegistry_;
+
+  // Host-node placement for captured submits: inline on the user stream, or on
+  // a per-graph side stream when NCCL_CTRAN_GPE_HOST_NODE_SIDE_STREAM is on
+  // (mixing=0 only). Touched only on the submit (capture) thread; see
+  // GpeHostNodeSpine.h.
+  ctran::gpe::HostNodeSpine hostNodeSpine_;
+
+  // In-kernel colltrace grouping: a multi-submit collective (e.g. AllGatherP's
+  // PipeStart..PipeSync..PipeEnd) records one CollTrace event whose start is
+  // written by the group's Begin kernel and end by its End kernel. Begin
+  // stashes the device handle (ring + collId) here so the following End submit
+  // arms its kernel with the same collId. A default (null-ring, !valid())
+  // handle means no group is open. Written and read only on the submit
+  // (capture) thread, and a group's submits are always contiguous, so a single
+  // pending slot suffices.
+  meta::comms::colltrace::ColltraceDeviceHandle pendingColltraceGroup_{};
 
   // Main function called by the GPE thread. It waits and handles any  commands
   // submitted to cmdQueue until the TERMINATE command is received.

@@ -9,7 +9,6 @@
 
 #include "comms/prims/collectives/ReduceScatterDirectIb.cuh"
 #include "comms/prims/core/Checks.h"
-#include "comms/prims/core/TimeoutUtils.h"
 
 namespace comms::prims {
 
@@ -28,16 +27,10 @@ void validate_direct_ib(const DirectReduceScatterIbLaunchParams& params) {
         "direct IB reduce-scatter requires num_blocks >= 1, got " +
         std::to_string(params.num_blocks));
   }
-}
-
-Timeout make_launch_timeout(float timeout_ms) {
-  Timeout timeout;
-  if (timeout_ms > 0) {
-    int device = 0;
-    PIPES_CUDA_CHECK(cudaGetDevice(&device));
-    timeout = makeTimeout(timeout_ms, device);
+  if (params.quantized && params.seed_ptr == nullptr) {
+    throw std::runtime_error(
+        "quantized direct IB reduce-scatter requires a device seed pointer");
   }
-  return timeout;
 }
 
 DirectReduceScatterIbArgs<float> make_args(
@@ -51,6 +44,7 @@ DirectReduceScatterIbArgs<float> make_args(
   args.signaling_data_size = params.signaling_data_size;
   args.input = params.input;
   args.output = params.output;
+  args.seed_ptr = params.seed_ptr;
   args.in_place = params.in_place;
 
   for (int peer = 0; peer < params.num_ranks; ++peer) {
@@ -67,11 +61,14 @@ DirectReduceScatterIbArgs<float> make_args(
 
 void launch_direct_reduce_scatter_ib(
     const DirectReduceScatterIbLaunchParams& params) {
-  launch_direct_reduce_scatter_ib_impl(
-      make_args(params),
-      params.num_blocks,
-      params.stream,
-      make_launch_timeout(params.timeout_ms));
+  const auto args = make_args(params);
+  if (params.quantized) {
+    launch_direct_reduce_scatter_ib_quantized_impl(
+        args, params.num_blocks, params.use_tma, params.stream, params.abort);
+  } else {
+    launch_direct_reduce_scatter_ib_impl(
+        args, params.num_blocks, params.stream, params.abort);
+  }
 }
 
 } // namespace comms::prims

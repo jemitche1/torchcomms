@@ -16,6 +16,7 @@
 #endif
 
 #include <sys/types.h>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -24,6 +25,26 @@
 #include "comms/prims/memory/CuMemMapping.h"
 
 namespace comms::prims {
+
+/**
+ * Fixed-width identity for a protocol layered over a multicast allocation.
+ *
+ * Every rank in an NVLink team must supply the same value. The owning protocol
+ * assigns `protocol`, versions its parameter schema with `version`, and owns
+ * the interpretation of `parameters`. The all-zero default identifies raw
+ * multicast users with no additional protocol contract; it is still compared
+ * across ranks.
+ */
+struct MulticastExchangeContract {
+  uint64_t protocol{0};
+  uint64_t version{0};
+  std::array<uint64_t, 6> parameters{};
+
+  bool operator==(const MulticastExchangeContract& other) const {
+    return protocol == other.protocol && version == other.version &&
+        parameters == other.parameters;
+  }
+};
 
 #if defined(__HIP_PLATFORM_AMD__)
 // Stub the one CUDA driver-API type unique to this header (the shared
@@ -144,11 +165,11 @@ struct NvlPeerMem {
 /**
  * VMM (fabric / POSIX FD) peer exchange.
  *
- * Exports `localHandle` (as fabric when `preferFabric`, else POSIX FD),
- * all-gathers every rank's shareable handle + allocated size, imports and maps
- * each peer's backing allocation, holds a post-import barrier so no rank closes
- * its exported POSIX FD before peers have duplicated it, then closes the local
- * exported fd.
+ * Exports `localHandle` (as fabric when `preferFabric`, else POSIX FD) and
+ * all-gathers export status with every rank's shareable handle + allocated
+ * size. It then imports and maps each peer's backing allocation and all-gathers
+ * import status. These agreements propagate rank-local failures and keep every
+ * exported POSIX FD open until all peers have finished their import attempts.
  *
  * `peerPtrs[rank]` is null for self; the caller fills the self slot with
  * `localPtr`. Throws std::runtime_error on any failure. Requires CUDA 12.3+.

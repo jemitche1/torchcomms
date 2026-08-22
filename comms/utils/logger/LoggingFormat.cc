@@ -6,13 +6,21 @@
 #include <cstring>
 #include <sstream>
 
-#include <fmt/chrono.h>
 #include <fmt/format.h>
 #include <folly/String.h>
 #include <folly/Synchronized.h>
+#include <folly/logging/LogCategory.h>
 #include <folly/logging/LogMessage.h>
 #include <folly/logging/LogName.h>
 #include <folly/synchronization/CallOnce.h>
+
+#include "comms/utils/Conversion.h"
+#include "comms/utils/cvars/nccl_cvars.h" // @manual=fbcode//comms/utils/cvars:ncclx-cvars
+#include "comms/utils/logger/CommsLogFormatter.h"
+#include "comms/utils/logger/ErrorStackUtil.h"
+#include "comms/utils/logger/EventsScubaUtil.h"
+#include "comms/utils/logger/NcclScubaSample.h"
+#include "comms/utils/logger/SpdlogLogger.h"
 
 namespace {
 std::string getHostName(const char delim) {
@@ -38,20 +46,18 @@ static thread_local std::string myThreadName = "main";
 
 struct LastErrorInfo {
   std::string lastErrorMessage;
+  // Legacy per-frame error chain, still appended by v2_27/v2_29's debug.cc via
+  // appendErrorToStack(). Kept for backward compatibility.
+  // TODO: remove once ncclx v2_29 is retired -- only v2_29 populates this;
+  // v2_30 is native-stack-only (lastErrorNativeStack), so this field and the
+  // getLastCommsError() fallback that reads it become dead.
   std::vector<std::string> lastErrorStack;
+  // Native symbolized stack captured at the error site by logErrorToScuba().
+  // Preferred by getLastCommsError() when present.
+  std::vector<std::string> lastErrorNativeStack;
 };
 
 static folly::Synchronized<LastErrorInfo> lastCommsError{};
-
-// Using char array to ensure compatibility with NCCL GetLastError API. Note
-// that since we will return the pointer to the array, reading the array while
-// another thread is writing to it is not safe.
-static folly::Synchronized<std::array<char, 4096>> lastCommsErrorStr{
-    std::array<char, 4096>{'\0'}};
-
-void logLastError(std::string_view message) {
-  lastCommsError.wlock()->lastErrorMessage = message;
-}
 } // Anonymous namespace
 
 namespace meta::comms::logger {
@@ -240,7 +246,10 @@ void initProcMetaData() {
 
 void initThreadMetaData(std::string_view threadName) {
   static thread_local folly::once_flag threadNameFlag;
-  folly::call_once(threadNameFlag, [&]() { myThreadName = threadName; });
+  folly::call_once(threadNameFlag, [&]() {
+    myThreadName = threadName;
+    setSpdlogThreadName(threadName);
+  });
 }
 
 std::string NcclLogFormatter::formatMessage(
@@ -250,113 +259,97 @@ std::string NcclLogFormatter::formatMessage(
 
   bool isErrorMessage = message.getLevel() >= folly::LogLevel::ERR;
   if (isErrorMessage) {
-    logLastError(message.getMessage());
+    // Errors are recorded to Scuba at their call sites (ncclMetaDebugLogError
+    // for NCCL, CERR for CTRAN), each of which captures a fresh native stack
+    // via logErrorToScuba(). Clear any stale cached native stack here so
+    // getLastCommsError() does not pair this message with an unrelated stack;
+    // the call site's logErrorToScuba(), which runs after this formatter,
+    // re-sets it when present, and a bare XLOG(ERR) correctly falls back to the
+    // legacy per-frame chain.
+    auto lockedError = lastCommsError.wlock();
+    lockedError->lastErrorMessage = message.getMessage();
+    lockedError->lastErrorNativeStack.clear();
   }
-
-  auto timeSinceEpoch = message.getTimestamp().time_since_epoch();
-  auto epochSeconds =
-      std::chrono::duration_cast<std::chrono::seconds>(timeSinceEpoch);
-  std::chrono::microseconds usecs =
-      std::chrono::duration_cast<std::chrono::microseconds>(timeSinceEpoch) -
-      epochSeconds;
 
   // At least for now, formatter is called in the same thread as the logging
   // thread. So we don't need to worry about getting the information of another
   // thread here.
   int cudaDev = threadContextFn_();
 
-  auto basename = message.getFileBaseName();
-  // Format: <Glog format> <hostname>:<pid>:<tid> [<threadCtx>][<threadName>]
-  // <prefix> <logLevel>
-  // Example: W0414 11:46:56.369712 4115466 Logger.cc:25]
-  // devvm2605:4115466:4115466 [-1][main] NCCL WARN
-  auto header = fmt::format(
-      "{}{:%m%d %H:%M:%S}.{:06d} {:5d} {}:{}] {}:{}:{} [{}][{}] {} {} ",
-      getGlogLevelName(message.getLevel())[0],
-      message.getTimestamp(),
-      usecs.count(),
-      message.getThreadID(),
-      basename,
-      message.getLineNumber(),
-      procMetaData.hostname,
-      procMetaData.pid,
-      message.getThreadID(),
-      cudaDev,
-      myThreadName,
-      prefix_,
-      getGlogLevelName(message.getLevel()));
-
-  // The fixed portion of the header takes up 31 bytes.
-  //
-  // The variable portions that we can't account for here include the line
-  // number and the thread ID (just in case it is larger than 6 digits long).
-  // Here we guess that 40 bytes will be long enough to include room for this.
-  //
-  // If this still isn't long enough the string will grow as necessary, so the
-  // code will still be correct, but just slightly less efficient than if we
-  // had allocated a large enough buffer the first time around.
-  size_t headerLengthGuess = 90 + basename.size();
-
-  // Format the data into a buffer.
-  std::string buffer;
-  std::string_view msgData{message.getMessage()};
-  if (message.containsNewlines()) {
-    // If there are multiple lines in the log message, add a header
-    // before each one.
-
-    buffer.reserve(
-        ((header.size() + 1) * message.getNumNewlines()) + msgData.size());
-
-    size_t idx = 0;
-    while (true) {
-      auto end = msgData.find('\n', idx);
-      if (end == std::string_view::npos) {
-        end = msgData.size();
-      }
-
-      buffer.append(header);
-      auto line = msgData.substr(idx, end - idx);
-      buffer.append(line.data(), line.size());
-      buffer.push_back('\n');
-
-      if (end == msgData.size()) {
-        break;
-      }
-      idx = end + 1;
-    }
-  } else {
-    buffer.reserve(headerLengthGuess + msgData.size());
-    buffer.append(header);
-    buffer.append(msgData.data(), msgData.size());
-    buffer.push_back('\n');
-  }
-
-  return buffer;
+  const auto basename = message.getFileBaseName();
+  return formatCommsLogMessage(
+      getGlogLevelName(message.getLevel()),
+      message.getMessage(),
+      {.timestamp = message.getTimestamp(),
+       .threadId = message.getThreadID(),
+       .filename = std::string_view{basename.data(), basename.size()},
+       .lineNumber = message.getLineNumber(),
+       .hostname = procMetaData.hostname,
+       .processId = procMetaData.pid,
+       .threadContext = cudaDev,
+       .threadName = myThreadName,
+       .prefix = prefix_});
 }
 
-const char* getLastCommsError() {
-  // Only write the error message to the buffer once requested
+void logErrorToScuba(
+    const std::string& message,
+    const int code,
+    const std::string& errorName,
+    const std::vector<std::string>& stack) {
+  // Build one Scuba record for the whole error; the guard flushes it to
+  // nccl_structured_logging on scope exit and keeps the sticky-context columns.
+  auto sampleGuard = EVENTS_SCUBA_UTIL_SAMPLE_GUARD("ERROR");
+  auto& sample = sampleGuard.sample();
+  sample.setError(message, stack);
+  if (code != 0) {
+    sample.addNormal("error_code", fmt::format("{}:{}", code, errorName));
+  }
+}
+
+void setLastError(const std::string& message, std::vector<std::string> stack) {
+  auto w = lastCommsError.wlock();
+  w->lastErrorMessage = message;
+  w->lastErrorNativeStack = std::move(stack);
+}
+
+void logCommErrorToScuba(commResult_t code, const std::string& message) {
+  if (!NCCL_SCUBA_LOG_ERROR_ENABLED) {
+    return;
+  }
+  std::vector<std::string> stack;
+  if (NCCL_SCUBA_STACK_TRACE_ON_ERROR_ENABLED) {
+    stack = captureNativeErrorStack();
+  }
+  logErrorToScuba(
+      message,
+      static_cast<int>(code),
+      ::meta::comms::commCodeToString(code),
+      stack);
+}
+
+std::string getLastCommsError() {
   std::ostringstream ss;
   {
     auto lastCommsErrorRLocked = lastCommsError.rlock();
     ss << lastCommsErrorRLocked->lastErrorMessage << "\nNCCL Stack trace:";
-    for (const auto& stack : lastCommsErrorRLocked->lastErrorStack) {
+    // Prefer the native captured stack; fall back to the legacy per-frame
+    // chain (still populated by v2_27/v2_29) when no native stack is present.
+    // TODO: remove the lastErrorStack fallback once ncclx v2_29 is retired --
+    // v2_30 is native-only, so this can collapse to lastErrorNativeStack.
+    const auto& stackTrace =
+        !lastCommsErrorRLocked->lastErrorNativeStack.empty()
+        ? lastCommsErrorRLocked->lastErrorNativeStack
+        : lastCommsErrorRLocked->lastErrorStack;
+    for (const auto& stack : stackTrace) {
       ss << '\n' << stack;
     }
   }
-
-  auto fullError = std::move(ss).str();
-
-  // Write the error message to the buffer
-  auto lastCommsErrorStrWLocked = lastCommsErrorStr.wlock();
-  std::snprintf(
-      lastCommsErrorStrWLocked->data(),
-      lastCommsErrorStrWLocked->size(),
-      "%s",
-      fullError.c_str());
-  return lastCommsErrorStrWLocked->data();
+  return ss.str();
 }
 
+// TODO: remove once ncclx v2_29 is retired (see appendErrorToStack decl in
+// LoggingFormat.h) -- v2_30/ctran use captureNativeErrorStack() +
+// setLastError().
 void appendErrorToStack(std::string error) {
   lastCommsError.wlock()->lastErrorStack.push_back(std::move(error));
 }

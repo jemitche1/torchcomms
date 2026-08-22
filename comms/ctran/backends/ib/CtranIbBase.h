@@ -6,8 +6,8 @@
 #include <folly/String.h>
 #include "comms/ctran/backends/CtranCtrl.h"
 #include "comms/ctran/ibverbx/Ibverbx.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/utils/commSpecs.h"
-#include "comms/utils/logger/LogUtils.h"
 
 struct CtranIbRemoteAccessKey {
   std::array<uint32_t, CTRAN_MAX_IB_DEVICES_PER_RANK> rkeys{};
@@ -41,6 +41,12 @@ struct CtranIbDevice {
   ibverbx::IbvCq* ibvCq;
   uint8_t port{0};
   std::string devName;
+
+  // Max recv WRs the mlx5 provider will place out-of-order per RC QP when
+  // MLX5DV_QP_CREATE_OOO_DP is set. Populated from mlx5dv_query_device's
+  // ooo_recv_wrs_caps.max_rc when NCCL_CTRAN_IB_ENABLE_OOO_RQ is true; 0
+  // means the device does not advertise OOO recv-wrs capability.
+  uint32_t oooRqSize{0};
 };
 
 /**
@@ -62,7 +68,8 @@ class CtranIbRequest {
   inline commResult_t complete() {
     this->refCount_--;
     if (this->refCount_ < 0) {
-      CLOGF(ERR, "CTRAN-IB: req {} refCount_ < 0", (void*)this);
+      CTRAN_ERR(
+          commInternalError, "CTRAN-IB: req {} refCount_ < 0", (void*)this);
       return commInternalError;
     }
     if (this->refCount_ == 0) {

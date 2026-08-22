@@ -19,6 +19,7 @@
 #include "comms/prims/core/Timeout.cuh"
 #include "comms/prims/memory/DeviceSpan.cuh"
 #include "comms/prims/transport/P2pIbTransportDeviceDecl.cuh"
+#include "comms/prims/transport/P2pIbTransportDeviceImpl.cuh"
 #include "comms/prims/transport/ibgda/IbgdaBuffer.h"
 #include "comms/prims/transport/ibrc/IbrcTypes.h"
 
@@ -63,6 +64,8 @@ inline constexpr uint64_t kIbrcDefaultDeviceTimeoutCycles = 10'000'000'000ULL;
  * ordering. The CPU progress thread consumes descriptors, posts the verbs work
  * requests on the matching QP, and advances ci after polling the CQE. Optional
  * local counters are updated by the CPU proxy after polling that CQE.
+ * Group-scope put() returns a completion ticket in the leader thread; a later
+ * group-scope wait_local() consumes that leader's ticket collectively.
  */
 class P2pIbrcTransportDevice {
  public:
@@ -106,8 +109,8 @@ class P2pIbrcTransportDevice {
   // detail::wait_recv_data_ready), which removes the cross-lane hazard where a
   // fast lane's later chunk masks a slow lane's not-yet-landed data.
 
-  __device__ void put(
-      ThreadGroup& group,
+  __device__ IbLocalCompletionTicket
+  put(ThreadGroup& group,
       const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
       std::size_t nbytes,
@@ -119,7 +122,8 @@ class P2pIbrcTransportDevice {
         (signalId >= 0) ? remote_signal_slot(signalId) : IbgdaRemoteBuffer{};
     IbgdaLocalBuffer ctrSlot =
         (counterId >= 0) ? counter_host_slot(counterId) : IbgdaLocalBuffer{};
-    put(group,
+    return put(
+        group,
         localBuf,
         remoteBuf,
         nbytes,
@@ -129,8 +133,8 @@ class P2pIbrcTransportDevice {
         counterVal);
   }
 
-  __device__ void put(
-      const IbgdaLocalBuffer& localBuf,
+  __device__ IbLocalCompletionTicket
+  put(const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
       std::size_t nbytes,
       int signalId = -1,
@@ -138,7 +142,8 @@ class P2pIbrcTransportDevice {
       int counterId = -1,
       uint64_t counterVal = 1) {
     ThreadGroup solo = make_thread_solo();
-    put(solo,
+    return put(
+        solo,
         localBuf,
         remoteBuf,
         nbytes,
@@ -270,8 +275,8 @@ class P2pIbrcTransportDevice {
     signal(solo, signalBuf, signalVal, direction);
   }
 
-  __device__ void put(
-      ThreadGroup& group,
+  __device__ IbLocalCompletionTicket
+  put(ThreadGroup& group,
       const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
       std::size_t nbytes,
@@ -287,11 +292,14 @@ class P2pIbrcTransportDevice {
       if (localBuf.ptr == nullptr || remoteBuf.ptr == nullptr) {
         trap("P2pIbrcTransportDevice: put data buffer is null");
       }
-      threadfence_system();
     }
     group.sync();
 
+    IbLocalCompletionTicket completion;
     if (group.is_leader()) {
+      if (hasData) {
+        threadfence_system();
+      }
       validate_group_scope(group);
       const uint32_t queueId = select_put_queue_id(group, IbDirection::Send);
       // queue_for_lane encodes the lane ordinal modulo the total lane count.
@@ -335,13 +343,18 @@ class P2pIbrcTransportDevice {
         desc.flags |= IBRC_HAS_COUNTER;
       }
 
-      enqueue(queueId, desc);
+      const uint64_t seq = enqueue(queueId, desc);
+      completion = IbLocalCompletionTicket{
+          .completionId = laneOrdinal,
+          .value = seq + 1,
+      };
     }
     group.sync();
+    return completion;
   }
 
-  __device__ void put(
-      const IbgdaLocalBuffer& localBuf,
+  __device__ IbLocalCompletionTicket
+  put(const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
       std::size_t nbytes,
       const IbgdaRemoteBuffer& signalBuf,
@@ -349,7 +362,8 @@ class P2pIbrcTransportDevice {
       const IbgdaLocalBuffer& counterBuf = {},
       uint64_t counterVal = 1) {
     ThreadGroup solo = make_thread_solo();
-    put(solo,
+    return put(
+        solo,
         localBuf,
         remoteBuf,
         nbytes,
@@ -357,6 +371,60 @@ class P2pIbrcTransportDevice {
         signalVal,
         counterBuf,
         counterVal);
+  }
+
+  __device__ void wait_local(
+      ThreadGroup& group,
+      const IbLocalCompletionTicket& ticket,
+      const Timeout& timeout = Timeout()) const {
+    if (group.is_leader()) {
+      const auto& queue = cmdQueues[queue_for_lane(
+          group.group_id, IbDirection::Send, ticket.completionId)];
+      while (static_cast<int64_t>(
+                 load_acquire_system_u64(queue.ci) - ticket.value) < 0) {
+        check_status(queue);
+        FT_ABORT_BREAK(
+            timeout,
+            "P2pIbrcTransportDevice: wait_local lane=%u expected=%llu",
+            ticket.completionId,
+            static_cast<unsigned long long>(ticket.value));
+      }
+    }
+    group.sync();
+  }
+
+  __device__ __forceinline__ bool is_local_completion_ready(
+      uint32_t channelId,
+      const IbLocalCompletionTicket& ticket) const {
+    const auto& queue = cmdQueues[queue_for_lane(
+        channelId, IbDirection::Send, ticket.completionId)];
+    check_status(queue);
+    return static_cast<int64_t>(
+               load_acquire_system_u64(queue.ci) - ticket.value) >= 0;
+  }
+
+  __device__ __forceinline__ void wait_local_completion(
+      uint32_t channelId,
+      const IbLocalCompletionTicket& ticket,
+      const Timeout& timeout) const {
+    const auto& queue = cmdQueues[queue_for_lane(
+        channelId, IbDirection::Send, ticket.completionId)];
+    while (static_cast<int64_t>(
+               load_acquire_system_u64(queue.ci) - ticket.value) < 0) {
+      check_status(queue);
+      if (timeout.checkExpired()) {
+        printf(
+            "P2pIbrcTransportDevice: local completion timed out lane=%u "
+            "expected=%llu\n",
+            ticket.completionId,
+            static_cast<unsigned long long>(ticket.value));
+        PIPES_DEVICE_TRAP();
+      }
+    }
+  }
+
+  __device__ __forceinline__ uint32_t send_completion_lane_count() const {
+    return num_qp_lanes();
   }
 
   __device__ void put_cooperative(
@@ -490,7 +558,7 @@ class P2pIbrcTransportDevice {
   // ===========================================================================
   //
   // The send/recv algorithm is transport-agnostic and lives in private helpers
-  // in P2pIbTransportDeviceDecl.cuh. The protocol state is owned by this
+  // in P2pIbTransportDeviceImpl.cuh. The protocol state is owned by this
   // backend device; each method routes every transport op through `*this`, so
   // IBRC reuses IBGDA's send/recv unchanged.
 
@@ -501,6 +569,25 @@ class P2pIbrcTransportDevice {
 
   __device__ __forceinline__ IbLocalChannel& local_channel(ThreadGroup& group) {
     return local_channel(group.group_id);
+  }
+
+  // Per-protocol resources on a channel. `P::kProtoSlot` is a compile-time
+  // constant, so this resolves to a fixed offset. What stays on the channel
+  // itself is the state every protocol shares: sendQp, recvQp, and
+  // recvDataReadyLaneCursor.
+  //
+  // No default on P: omitting the protocol must be a compile error, not a
+  // silent read of the default protocol's cursors.
+  template <typename P>
+  __device__ __forceinline__ IbChannelProtoSlot& local_channel_slot(
+      uint32_t channelId) {
+    return local_channel(channelId).protos[P::kProtoSlot];
+  }
+
+  template <typename P>
+  __device__ __forceinline__ IbChannelProtoSlot& local_channel_slot(
+      ThreadGroup& group) {
+    return local_channel_slot<P>(group.group_id);
   }
 
   __host__ __device__ IbChannelLayout& channel_layout() {
@@ -535,21 +622,28 @@ class P2pIbrcTransportDevice {
         static_cast<std::size_t>(channelLayout_.pipelineDepth);
   }
 
+  template <typename Proto = protocol::Simple>
   __device__ __forceinline__ void init_send_progress(
       ThreadGroup& group,
       std::size_t nbytes,
       std::size_t max_signal_bytes = 0) {
-    detail::init_send_progress(*this, group, nbytes, max_signal_bytes);
+    detail::init_send_progress<P2pIbrcTransportDevice, Proto>(
+        *this, group, nbytes, max_signal_bytes);
   }
 
+  template <typename Proto = protocol::Simple>
   __device__ __forceinline__ void init_recv_progress(
       ThreadGroup& group,
       std::size_t nbytes,
       std::size_t max_signal_bytes = 0) {
-    detail::init_recv_progress(*this, group, nbytes, max_signal_bytes);
+    detail::init_recv_progress<P2pIbrcTransportDevice, Proto>(
+        *this, group, nbytes, max_signal_bytes);
   }
 
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ IbgdaSendRecvProgressStatus progress_send_once(
       ThreadGroup& group,
       const void* __restrict__ src,
@@ -557,11 +651,14 @@ class P2pIbrcTransportDevice {
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    return detail::progress_send_once<P2pIbrcTransportDevice, CopyOp>(
+    return detail::progress_send_once<P2pIbrcTransportDevice, CopyOp, Proto>(
         *this, group, src, nbytes, max_signal_bytes, timeout, args...);
   }
 
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ IbgdaSendRecvProgressStatus progress_recv_once(
       ThreadGroup& group,
       void* __restrict__ dst,
@@ -569,8 +666,37 @@ class P2pIbrcTransportDevice {
       std::size_t max_signal_bytes = 0,
       const Timeout& timeout = Timeout(),
       Args... args) {
-    return detail::progress_recv_once<P2pIbrcTransportDevice, CopyOp>(
+    return detail::progress_recv_once<P2pIbrcTransportDevice, CopyOp, Proto>(
         *this, group, dst, nbytes, max_signal_bytes, timeout, args...);
+  }
+
+  // Templated for the same reason P2pIbTransportDevice templates its
+  // dispatchers: the definitions live in the progress-impl header, which this
+  // header deliberately does not include. A non-template body is compiled
+  // eagerly in every translation unit, so the HIP/ROCm build -- which never
+  // pulls in that impl header -- failed with -Werror,-Wundefined-inline. A
+  // template body is only instantiated where it is actually called, i.e. where
+  // the definition is visible.
+  template <typename = void>
+  __device__ __forceinline__ IbgdaSendRecvProgressStatus
+  progress_recv_acquire_once(
+      ThreadGroup& group,
+      std::size_t nbytes,
+      std::size_t max_signal_bytes,
+      const Timeout& timeout,
+      detail::RecvChunkAcquisition& out) {
+    return detail::
+        progress_recv_acquire_once<P2pIbrcTransportDevice, protocol::Simple>(
+            *this, group, nbytes, max_signal_bytes, timeout, out);
+  }
+
+  template <typename = void>
+  __device__ __forceinline__ void progress_recv_release_once(
+      ThreadGroup& group,
+      const detail::RecvChunkAcquisition& view) {
+    detail::
+        progress_recv_release_once<P2pIbrcTransportDevice, protocol::Simple>(
+            *this, group, view);
   }
 
   template <typename CopyOp = Memcpy, typename... Args>
@@ -727,11 +853,10 @@ class P2pIbrcTransportDevice {
 
   __device__ void drain_queue(const IbrcCmdQueueDevice& queue) const {
     const uint64_t target = load_acquire_system_u64(queue.pi);
-    Timeout timeout{kIbrcDefaultDeviceTimeoutCycles};
-    timeout.start();
+    const uint64_t start = gpu_clock64();
     while (load_acquire_system_u64(queue.ci) < target) {
       check_status(queue);
-      if (timeout.checkExpired()) {
+      if (gpu_clock64() - start >= kIbrcDefaultDeviceTimeoutCycles) {
         printf("P2pIbrcTransportDevice: flush timed out\n");
         PIPES_DEVICE_TRAP();
       }
@@ -763,11 +888,10 @@ class P2pIbrcTransportDevice {
 
   __device__ __forceinline__ uint64_t reserve(IbrcCmdQueueDevice& queue) const {
     const uint64_t seq = fetch_add_system_u64(queue.pi, 1);
-    Timeout timeout{kIbrcDefaultDeviceTimeoutCycles};
-    timeout.start();
+    const uint64_t start = gpu_clock64();
     while (seq - load_acquire_system_u64(queue.ci) >= queue.depth) {
       check_status(queue);
-      if (timeout.checkExpired()) {
+      if (gpu_clock64() - start >= kIbrcDefaultDeviceTimeoutCycles) {
         printf("P2pIbrcTransportDevice: reserve timed out\n");
         PIPES_DEVICE_TRAP();
       }
@@ -775,15 +899,15 @@ class P2pIbrcTransportDevice {
     return seq;
   }
 
-  __device__ __forceinline__ void enqueue(
-      uint32_t queueId,
-      const IbrcDesc& desc) const {
+  __device__ __forceinline__ uint64_t
+  enqueue(uint32_t queueId, const IbrcDesc& desc) const {
     IbrcCmdQueueDevice& queue = cmdQueues[queueId];
     check_status(queue);
     const uint64_t seq = reserve(queue);
     IbrcDesc& slot = queue.descs[seq & queue.mask];
     slot = desc;
     store_release_system_u64(&slot.ready_seq, seq);
+    return seq;
   }
 
   __device__ __forceinline__ void check_status(
@@ -813,13 +937,11 @@ class P2pIbrcTransportDevice {
       validate_group_scope(group);
       while (load_acquire_system_u64(ptr) < expected) {
         check_channel_status(group.group_id);
-        if (timeout.checkExpired()) {
-          printf(
-              "P2pIbrcTransportDevice: wait_%s timed out expected=%llu\n",
-              kind,
-              static_cast<unsigned long long>(expected));
-          PIPES_DEVICE_TRAP();
-        }
+        FT_ABORT_BREAK(
+            timeout,
+            "P2pIbrcTransportDevice: wait_%s expected=%llu",
+            kind,
+            static_cast<unsigned long long>(expected));
       }
     }
     group.sync();

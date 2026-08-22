@@ -11,8 +11,9 @@
 #else
 #include "comms/ctran/backends/tcpdevmem/CtranTcpDm.h"
 #endif
-#include "comms/ctran/mapper/CtranMapperTypes.h"
+#include "comms/ctran/mapper/CtranMapperTypes.h" // @manual=//comms/ctran:mapper_types
 #include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/Debug.h"
 #include "comms/ctran/utils/ExtUtils.h"
 #include "comms/utils/CudaRAII.h"
@@ -125,7 +126,7 @@ void ctran::regcache::Profiler::record(ctran::regcache::EventType type) {
 void ctran::regcache::Profiler::reportSnapshot(void) const {
   const std::string prefix = "CTRAN-REGCACHE RegCache Snapshot";
   for (const auto type : totalEvents) {
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "[{}] Total count of {}: {}",
@@ -135,7 +136,7 @@ void ctran::regcache::Profiler::reportSnapshot(void) const {
   }
   for (const auto type : latencyEvents) {
     auto count = totalCountMap.at(type);
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "[{}] Average latency (us) of {}: {:.2f}",
@@ -145,7 +146,7 @@ void ctran::regcache::Profiler::reportSnapshot(void) const {
   }
 
   for (const auto type : currentEvents) {
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "[{}] Current count of {}: {}",
@@ -204,7 +205,7 @@ void ctran::RegCache::init() {
         break;
     }
   }
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-REGCACHE: Global backends initialized from NCCL_CTRAN_BACKENDS: "
@@ -225,7 +226,7 @@ void ctran::RegCache::init() {
     try {
       ibSingleton_ = CtranIbSingleton::getInstance();
     } catch (const ctran::utils::Exception& e) {
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           WARN,
           INIT,
           "CTRAN-REGCACHE: IB backend not available, disabling. {}",
@@ -251,7 +252,7 @@ commResult_t ctran::RegCache::destroy() {
         folly::acquireLocked(segmentsAvl_, regElemsMaps_);
     auto& regHdlToElemMap = regElemsMaps->regHdlToElemMap;
     if (segmentsAvl->size() > 0 || regHdlToElemMap.size() > 0) {
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "Total {}/{} remaining segments are still in RegCache at destroy time. ",
           segmentsAvl->size(),
@@ -261,7 +262,7 @@ commResult_t ctran::RegCache::destroy() {
     auto it = regHdlToElemMap.begin();
     while (!regHdlToElemMap.empty()) {
       auto& regElem = it->second;
-      CLOGF_TRACE(
+      CTRAN_LOG_TRACE(
           ALLOC,
           "Remaining regElem {} buf {} len {} isDynamic {} in regHdlToElemMap",
           (void*)regElem.get(),
@@ -279,7 +280,7 @@ commResult_t ctran::RegCache::destroy() {
     for (auto avlHdl : segmentsAvl->getAllElems()) {
       auto seg = reinterpret_cast<ctran::regcache::Segment*>(
           segmentsAvl->lookup(avlHdl));
-      CLOGF_TRACE(
+      CTRAN_LOG_TRACE(
           ALLOC,
           "Remaining avlHdl {} range {} ncclManaged {} in segmentsAvl",
           (void*)avlHdl,
@@ -475,7 +476,7 @@ void ctran::RegCache::asyncRegThreadFn(int cudaDev) {
     }
 
     if (cmd.stopFlag) {
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO, INIT, "CTranMapperRegCache asyncRegThreadFn: terminate");
       return;
     }
@@ -518,7 +519,7 @@ void ctran::RegCache::asyncRegThreadFn(int cudaDev) {
 
     // NOTE: regHdl may already be released by concurrent deregMem from main
     // thread; unsafe to read its content
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         ALLOC,
         "CTRAN-REGCACHE: async registered buf {} len {} didRegister {} regHdl {}",
         cmd.buf,
@@ -542,8 +543,8 @@ commResult_t ctran::RegCache::asyncRegRange(
     const struct CommLogData& logMetaData,
     const std::vector<bool>& backend) {
   if (!asyncRegThread_.joinable()) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInvalidUsage,
         "AsyncReg thread is not running. Check whether NCCL_CTRAN_REGISTER=async is set.");
     return commInvalidUsage;
   }
@@ -580,7 +581,7 @@ void ctran::RegCache::registerExternalRegMemFn(
     externalRegMemFn_ = std::move(regMem);
     externalDeregMemFn_ = std::move(deregMem);
   } else {
-    XLOGF(
+    CTRAN_LOG(
         WARN,
         "RegCache: registerExternalRegMemFn called with null callback(s), "
         "both regMem and deregMem are required — ignoring");
@@ -750,7 +751,7 @@ commResult_t ctran::regcache::SegmentRange::pinRange(
   DevMemType memType{DevMemType::kCumem};
   FB_COMMCHECK(getDevMemType(ptr, cudaDev, memType));
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       ALLOC,
       "CTRAN-MAPPER pinRange: input ptr={} len={} cudaDev={} fbMemType={}",
@@ -763,7 +764,7 @@ commResult_t ctran::regcache::SegmentRange::pinRange(
   // entire range as a single segment
   if (memType != DevMemType::kCumem) {
     segRangs.emplace_back(ptr, len, memType);
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         ALLOC,
         "CTRAN-MAPPER pinRange: non-cumem single segment ptr={} len={}",
@@ -780,7 +781,7 @@ commResult_t ctran::regcache::SegmentRange::pinRange(
   FB_CUCHECK(cuMemGetAddressRange(&curPbase, &curRange, ptr_));
   segRangs.emplace_back(
       reinterpret_cast<const void*>(curPbase), curRange, memType);
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       ALLOC,
       "CTRAN-MAPPER pinRange: discovered segment[0] pbase={:#x} range={}",
@@ -797,7 +798,7 @@ commResult_t ctran::regcache::SegmentRange::pinRange(
         cuMemGetAddressRange(&curPbase, &curRange, (CUdeviceptr)curPtr_));
     segRangs.emplace_back(
         reinterpret_cast<const void*>(curPbase), curRange, memType);
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         ALLOC,
         "CTRAN-MAPPER pinRange: discovered segment[{}] pbase={:#x} range={} (offset={})",
@@ -811,7 +812,7 @@ commResult_t ctran::regcache::SegmentRange::pinRange(
     segmentIdx++;
   }
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       ALLOC,
       "CTRAN-MAPPER pinRange: total {} segments discovered for input len={}",
@@ -839,7 +840,7 @@ commResult_t ctran::RegCache::cacheSegment(
   FB_COMMCHECK(
       ctran::regcache::SegmentRange::pinRange(ptr, cudaDev, len, ranges));
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       ALLOC,
       "CTRAN-MAPPER cacheSegment: ptr={} len={} discovered {} physical segments",
@@ -870,7 +871,7 @@ commResult_t ctran::RegCache::cacheSegment(
         segments.push_back(foundSeg);
         segHdls.push_back(foundSeg->avlHdl_);
 
-        CLOGF_TRACE(
+        CTRAN_LOG_TRACE(
             ALLOC,
             "CTRAN-MAPPER cacheSegment: segment[{}] already cached ptr={} len={} refCount={}",
             i,
@@ -887,7 +888,7 @@ commResult_t ctran::RegCache::cacheSegment(
         newSegmentCreated = true;
 
         const auto type = newSeg->getType();
-        CLOGF_TRACE(
+        CTRAN_LOG_TRACE(
             ALLOC,
             "CTRAN-MAPPER cacheSegment: segment[{}] cached type={} ({}) segHdl={} ptr={} len={} ncclManaged={} cudaDev={}, cache size={}",
             i,
@@ -1039,7 +1040,7 @@ commResult_t ctran::RegCache::regRangeCachedImpl(
       auto& segRange = ranges.at(i);
       void* avlHdl = segmentsAvl->search(segRange.buf, segRange.len);
       if (!avlHdl) {
-        CLOGF(
+        CTRAN_LOG(
             WARN,
             "CTRAN-REGCACHE:[pbase {} range {}] associated with [ptr {} len {}] is not pre-registered by user",
             (void*)segRange.buf,
@@ -1216,7 +1217,7 @@ commResult_t ctran::RegCache::freeSegment(
         if (inUseCnt > 0) {
           // Intentionally error logging as this is invalid usage to free buffer
           // before releasing all registrations.
-          CLOGF(
+          CTRAN_LOG(
               ERR,
               "freeSegment: RegElem [buf {} len {}] still has {} live ScopedRegHdl owner(s)",
               regIt->second->buf,
@@ -1255,7 +1256,7 @@ commResult_t ctran::RegCache::freeSegment(
     // - Remove segment from cache
     segmentState->refCount = 0;
     FB_COMMCHECK(segmentsAvl->remove(segment->avlHdl_));
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         ALLOC,
         "Removed segment {} segHdl {} ptr {} len {} ncclManaged {} cudaDev {}, cache size {}",
         (void*)segment,
@@ -1318,7 +1319,7 @@ void ctran::RegCache::releaseScopedRegHdl(
   auto it = regElemsMaps->regHdlToElemMap.find(regHdl);
   if (it == regElemsMaps->regHdlToElemMap.end() ||
       it->second->regId_ != regId) {
-    CLOGF(
+    CTRAN_LOG(
         WARN,
         "releaseScopedRegHdl: regElem {} not found or its address was reused (may have been force-freed by a buffer-release path)",
         (void*)regHdl);
@@ -1340,9 +1341,14 @@ commResult_t ctran::RegCache::acquireScopedRegister(
     size_t len,
     int cudaDev,
     const std::vector<bool>& backends,
+    const CommLogData& logMetaData,
     ctran::ScopedRegHdl& scopedRegHdl) {
   if (buf == nullptr || len == 0) {
-    CLOGF(ERR, "acquireScopedRegister: invalid buf {} len {}", (void*)buf, len);
+    CTRAN_ERR(
+        commInvalidUsage,
+        "acquireScopedRegister: invalid buf {} len {}",
+        (void*)buf,
+        len);
     return commInvalidUsage;
   }
 
@@ -1350,14 +1356,12 @@ commResult_t ctran::RegCache::acquireScopedRegister(
   // allocator; regRangeCachedImpl returns nullptr otherwise.
   bool didRegister = false;
   ctran::regcache::RegElem* regHdl = nullptr;
-  CommLogData scopedLogData{};
-  scopedLogData.commDesc = "scopedRegister";
   const auto regResult = regRangeCachedImpl(
       buf,
       len,
       cudaDev,
       "scopedRegister",
-      scopedLogData,
+      logMetaData,
       backends,
       didRegister,
       &regHdl,
@@ -1365,8 +1369,8 @@ commResult_t ctran::RegCache::acquireScopedRegister(
       true /* acquireRef */);
 
   if (regResult != commSuccess || regHdl == nullptr) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInvalidUsage,
         "acquireScopedRegister: buffer [buf {} len {}] is not backed by a cached "
         "segment. Scoped registration requires the buffer's memory to be pre-registered "
         "by the allocator (globalRegister / CCA memory hook) before use. Ensure the "
@@ -1427,7 +1431,7 @@ ctran::ScopedRegHdl::~ScopedRegHdl() {
   try {
     regCache_->releaseScopedRegHdl(regHdl_, regId_);
   } catch (const std::exception& e) {
-    CLOGF(ERR, "~ScopedRegHdl: cleanup failed: {}", e.what());
+    CTRAN_LOG(ERR, "~ScopedRegHdl: cleanup failed: {}", e.what());
   }
   regCache_ = nullptr;
   regHdl_ = nullptr;
@@ -1572,7 +1576,8 @@ commResult_t ctran::RegCache::deregRange(ctran::regcache::RegElem* regHdl) {
 
     auto it = regHdlToElemMap.find(regHdl);
     if (it == regHdlToElemMap.end()) {
-      CLOGF(ERR, "deregRange: regElem {} not found", (void*)regHdl);
+      CTRAN_ERR(
+          commInvalidUsage, "deregRange: regElem {} not found", (void*)regHdl);
       return commInvalidUsage;
     }
 
@@ -1581,8 +1586,8 @@ commResult_t ctran::RegCache::deregRange(ctran::regcache::RegElem* regHdl) {
       // The caller may already have performed mapper-side remote release, so
       // this error is not a retry contract. Keep regcache state intact and let
       // higher-level failure cleanup or allocator force-free reclaim memory.
-      CLOGF(
-          ERR,
+      CTRAN_ERR(
+          commInvalidUsage,
           "deregRange: RegElem {} still has {} live use-side owner(s)",
           (void*)regHdl,
           inUseCnt);
@@ -1670,7 +1675,7 @@ std::vector<std::vector<ctran::regcache::Segment*>> getContiguousRegions(
         reinterpret_cast<uintptr_t>(region.back()->range.buf) +
         region.back()->range.len;
     size_t regionLen = regionEnd - regionStart;
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         ALLOC,
         "getContiguousRegions: region[{}] ptr=0x{:x} len={} ({} segments)",
         i,
@@ -1687,7 +1692,7 @@ std::vector<std::vector<ctran::regcache::Segment*>> getContiguousRegions(
 commResult_t ctran::RegCache::regAll() {
   auto regCache = ctran::RegCache::getInstance();
   if (!regCache) {
-    CLOGF(ERR, "regAll: RegCache instance not available");
+    CTRAN_ERR(commInternalError, "regAll: RegCache instance not available");
     return commInternalError;
   }
 
@@ -1709,7 +1714,7 @@ commResult_t ctran::RegCache::regAll() {
     // Get all segment values directly from AVL tree
     auto allSegmentVals = segmentsAvl->getAllElemVals();
     if (allSegmentVals.empty()) {
-      CLOGF(WARN, "regAll: no cached segments found");
+      CTRAN_LOG(WARN, "regAll: no cached segments found");
       return commSuccess;
     }
 
@@ -1725,13 +1730,15 @@ commResult_t ctran::RegCache::regAll() {
     auto contiguousRegions = getContiguousRegions(std::move(segments));
 
     if (contiguousRegions.empty()) {
-      CLOGF(WARN, "regAll: no cached segments found");
+      CTRAN_LOG(WARN, "regAll: no cached segments found");
       return commSuccess;
     }
 
     int cudaDev = contiguousRegions[0].front()->cudaDev;
     if (cudaDev < 0) {
-      CLOGF(ERR, "regAll: could not determine cudaDev from cached segments");
+      CTRAN_ERR(
+          commInternalError,
+          "regAll: could not determine cudaDev from cached segments");
       return commInternalError;
     }
 
@@ -1753,7 +1760,7 @@ commResult_t ctran::RegCache::regAll() {
           regionSegments.back()->range.len;
       size_t regionLen = regionEndAddr - regionStartAddr;
 
-      CLOGF_TRACE(
+      CTRAN_LOG_TRACE(
           ALLOC,
           "regAll: registering region {} with {} segments, ptr {} len {}",
           regionIdx,
@@ -1804,7 +1811,7 @@ commResult_t ctran::RegCache::regAll() {
             : std::nullopt);
   }
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       ALLOC,
       "regAll: completed - registered {} contiguous regions, "
       "total {} segments, {} bytes",
@@ -1820,7 +1827,7 @@ commResult_t ctran::RegCache::regAll() {
 commResult_t ctran::RegCache::deregAll() {
   auto regCache = ctran::RegCache::getInstance();
   if (!regCache) {
-    CLOGF(ERR, "deregAll: RegCache instance not available");
+    CTRAN_ERR(commInternalError, "deregAll: RegCache instance not available");
     return commInternalError;
   }
 
@@ -1872,7 +1879,7 @@ commResult_t ctran::RegCache::deregAll() {
   for (auto& regElem : toDeregister) {
     auto res = regCache->deregElem(regElem.get());
     if (res != commSuccess) {
-      CLOGF(
+      CTRAN_LOG(
           ERR,
           "deregAll: failed to deregister regElem ptr {} len {}",
           regElem->buf,
@@ -1880,7 +1887,7 @@ commResult_t ctran::RegCache::deregAll() {
     }
   }
 
-  CLOGF(
+  CTRAN_LOG(
       INFO,
       "deregAll: completed - deregistered {} registrations, "
       "skipped {} dynamic",
@@ -1902,7 +1909,7 @@ commResult_t ctran::regcache::RegElem::doRegister(
     try {
       FB_COMMCHECK(externalRegMemFn(buf, len, cudaDev_, &externalRegElem));
     } catch (const std::exception& e) {
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "CTRAN-REGCACHE: external backend registration failed for buf {} len {}, error: {}",
           (void*)buf,
@@ -1929,7 +1936,7 @@ commResult_t ctran::regcache::RegElem::doRegister(
           ctran::IpcRegCache::regMem(
               buf, len, cudaDev_, &ipcRegElem, ncclManaged_));
     } catch ([[maybe_unused]] const std::bad_alloc& e) {
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "CTRAN-REGCACHE: NVL backend not enabled. Skip IPC registration for buf {} len {}",
           (void*)buf,
@@ -1942,7 +1949,7 @@ commResult_t ctran::regcache::RegElem::doRegister(
     try {
       FB_COMMCHECK(CtranIb::regMem(buf, len, cudaDev_, &ibRegElem));
     } catch ([[maybe_unused]] const std::bad_alloc& e) {
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "CTRAN-REGCACHE: IB backend not enabled. Skip IB registration for buf {} len {}",
           (void*)buf,
@@ -1958,7 +1965,7 @@ commResult_t ctran::regcache::RegElem::doRegister(
 
 exit:
   stat->state = ctran::regcache::RegElemState::REGISTERED;
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       ALLOC,
       "CTRAN-REGCACHE: registered RegElem {} [{}] ",
@@ -1998,7 +2005,7 @@ commResult_t ctran::regcache::RegElem::doDeregister(
   }
 
   stat->state = ctran::regcache::RegElemState::DEREGISTERED;
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       ALLOC,
       "CTRAN-REGCACHE: deregistered RegElem {} [{}] ",

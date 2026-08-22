@@ -1,13 +1,13 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include <folly/String.h>
-#include <folly/logging/xlog.h>
 #include <string>
 
 #include "CommStateX.h"
 #include "comms/ctran/commstate/Topology.h"
 #include "comms/ctran/utils/Alloc.h"
 #include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/utils/cvars/nccl_cvars.h"
 
 namespace ncclx {
@@ -118,7 +118,7 @@ void CommStateX::initRankStatesTopology(meta::comms::IBootstrap* bootstrap) {
         fmt::format("Failed to load topology from {}", NCCL_TOPO_FILE_PATH));
   } else {
     networkTopo_ = std::move(myTopo->networkTopo);
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "Load topology for rank {} commHash {:x} commDesc {}, nRanks {}, host {}, dc {} zone {} rackSerial {} networkTopo {}",
@@ -147,7 +147,7 @@ void CommStateX::initRankStatesTopology(meta::comms::IBootstrap* bootstrap) {
   // Create statex variable
   setRankStatesTopologies(std::move(allTopos));
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "Rank topology for rank {} commHash {:x} commDesc {}, nRanks {}, nLocalRanks {}, nNodes {}",
@@ -161,9 +161,9 @@ void CommStateX::initRankStatesTopology(meta::comms::IBootstrap* bootstrap) {
 
 void CommStateX::setNvlFabricTopos(
     std::vector<NvlFabricTopology> nvlFabricTopologies,
-    std::optional<bool> fabricHwSupportedForTest) {
-  bool fabricHwSupported =
-      fabricHwSupportedForTest.value_or(ctran::utils::isCuMemFabricEnabled());
+    std::optional<bool> fabricHwSupportedOverride) {
+  const bool fabricHwSupported =
+      fabricHwSupportedOverride.value_or(ctran::utils::isCuMemFabricEnabled());
   FB_CHECKABORT(
       nvlFabricTopologies.size() == nRanks_,
       "size of nvlFabricTopologies not equal to nRanks_: {}",
@@ -171,6 +171,9 @@ void CommStateX::setNvlFabricTopos(
   nvlFabricTopos_ = std::move(nvlFabricTopologies);
   nvlFabricRankStates_.clear();
   nvlDomainRanks_.clear();
+  cliqueRanks_.clear();
+  myNvlFabricRankState_ = {};
+  nvlFabricCliqueEnabled_ = false;
   nvlFabricEnabled_ =
       fabricHwSupported && nvlFabricTopos_.at(rank_).supportNvlFabric;
   if (!nvlFabricEnabled_) {
@@ -184,7 +187,17 @@ void CommStateX::setNvlFabricTopos(
   std::unordered_map<std::string, int> clusterIdToNvlDomainIndex;
   // cliqueIds might not be contiguous, within the same communicator.
   // CliqueIndex is contiguous fron 0 to nCliqueIds - 1.
-  std::unordered_map<int64_t, int> cliqueIdToCliqueIndex;
+  //
+  // Keyed on (clusterId, cliqueId), NOT cliqueId alone. A cliqueId is only
+  // meaningful WITHIN an NVL fabric cluster: it is a partition index, not a
+  // globally unique id, and GB200/GB300 hosts commonly report the same sentinel
+  // value (32766) across entirely unrelated racks. Keying on cliqueId alone
+  // therefore merges ranks from different clusters into one clique, which makes
+  // nLocalRanks span hosts that share no NVLink domain -- CTRAN then attempts a
+  // fabric IPC import across them and fails with CUDA_ERROR_INVALID_HANDLE.
+  // Observed in production: 3 ranks, 3 distinct clusterIds, collapsed into one
+  // 3-rank clique with nNodes=1.
+  std::unordered_map<std::string, int> clusterCliqueToCliqueIndex;
 
   nvlFabricRankStates_.resize(nRanks_);
   for (int i = 0; i < nRanks_; i++) {
@@ -207,12 +220,13 @@ void CommStateX::setNvlFabricTopos(
       nvlFabricRankStates_.at(i).nvlDomainRank = nvlDomainRank;
       if (nvlFabricCliqueEnabled_) {
         // update clique level info if clique is enabled
-        if (!cliqueIdToCliqueIndex.contains(cliqueId)) {
+        const auto cliqueKey = fmt::format("{}:{}", clusterId, cliqueId);
+        if (!clusterCliqueToCliqueIndex.contains(cliqueKey)) {
           // new clique found
-          cliqueIdToCliqueIndex[cliqueId] = cliqueRanks_.size();
+          clusterCliqueToCliqueIndex[cliqueKey] = cliqueRanks_.size();
           cliqueRanks_.emplace_back();
         }
-        int cliqueIndex = cliqueIdToCliqueIndex.at(cliqueId);
+        int cliqueIndex = clusterCliqueToCliqueIndex.at(cliqueKey);
         int cliqueRank = cliqueRanks_.at(cliqueIndex).size();
         cliqueRanks_.at(cliqueIndex).emplace_back(i);
 
@@ -249,9 +263,9 @@ void CommStateX::setNvlFabricTopos(
       nvlDomainRanks_.size());
 
   FB_CHECKABORT(
-      cliqueIdToCliqueIndex.size() == cliqueRanks_.size(),
-      "size of cliqueIdToCliqueIndex : {} not equal to size cliqueRanks_: {}",
-      cliqueIdToCliqueIndex.size(),
+      clusterCliqueToCliqueIndex.size() == cliqueRanks_.size(),
+      "size of clusterCliqueToCliqueIndex : {} not equal to size cliqueRanks_: {}",
+      clusterCliqueToCliqueIndex.size(),
       cliqueRanks_.size());
 
   // Step 2: noLocal is equivalent to vCliqueSize=1. When either is set,
@@ -307,13 +321,13 @@ void CommStateX::setNvlFabricTopos(
       state.cliqueRankToRank = cliqueRanks_.at(state.cliqueIndex);
     }
     myNvlFabricRankState_ = nvlFabricRankStates_.at(rank_);
-    XLOGF(
+    CTRAN_LOG(
         INFO,
         "CommStateX: effectiveVCliqueSize={} override NVL fabric topology",
         effectiveVCliqueSize);
   }
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "NVL fabric topology for rank {} commHash {:x} commDesc {}, nRanks {}, nLocalRanks {}, nNodes {}, nvlFabricEnabled {}, nvlFabricCliqueEnabled {}, nvlDomainIndex {}, nvlDomainRank {}, nNvlDomainRanks {}, nNvlDomains {}, clusterId {}, cliqueIndex {}, cliqueRank {}, nCliqueRanks {}, nCliques {}",
@@ -403,7 +417,7 @@ void CommStateX::setRankStatesTopologies(
     state.nLocalRanks = state.localRankToRanks.size();
   }
 
-  XLOGF(
+  CTRAN_LOG(
       INFO,
       "CommStateX: set rankTopology with {}",
       topoNameMap[NCCL_COMM_STATE_DEBUG_TOPO]);

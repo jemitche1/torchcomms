@@ -30,7 +30,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::signal(
   }
 }
 
-__device__ __forceinline__ void P2pIbTransportDevice::put(
+__device__ __forceinline__ IbLocalCompletionTicket P2pIbTransportDevice::put(
     ThreadGroup& group,
     const IbgdaLocalBuffer& localBuf,
     const IbgdaRemoteBuffer& remoteBuf,
@@ -40,7 +40,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
     int counterId,
     uint64_t counterVal) {
   if (type == P2pIbBackendType::IBRC) {
-    ibrc->put(
+    return ibrc->put(
         group,
         localBuf,
         remoteBuf,
@@ -50,7 +50,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
         counterId,
         counterVal);
   } else {
-    ibgda->put(
+    return ibgda->put(
         group,
         localBuf,
         remoteBuf,
@@ -62,7 +62,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
   }
 }
 
-__device__ __forceinline__ void P2pIbTransportDevice::put(
+__device__ __forceinline__ IbLocalCompletionTicket P2pIbTransportDevice::put(
     const IbgdaLocalBuffer& localBuf,
     const IbgdaRemoteBuffer& remoteBuf,
     std::size_t nbytes,
@@ -71,7 +71,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
     int counterId,
     uint64_t counterVal) {
   if (type == P2pIbBackendType::IBRC) {
-    ibrc->put(
+    return ibrc->put(
         localBuf,
         remoteBuf,
         nbytes,
@@ -80,7 +80,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
         counterId,
         counterVal);
   } else {
-    ibgda->put(
+    return ibgda->put(
         localBuf,
         remoteBuf,
         nbytes,
@@ -169,6 +169,17 @@ __device__ __forceinline__ void P2pIbTransportDevice::wait_counter(
   }
 }
 
+__device__ __forceinline__ void P2pIbTransportDevice::wait_local(
+    ThreadGroup& group,
+    const IbLocalCompletionTicket& ticket,
+    const Timeout& timeout) {
+  if (type == P2pIbBackendType::IBRC) {
+    ibrc->wait_local(group, ticket, timeout);
+  } else {
+    ibgda->wait_local(group, ticket, timeout);
+  }
+}
+
 __device__ __forceinline__ void P2pIbTransportDevice::reset_signal(
     ThreadGroup& group,
     int signalId) {
@@ -244,7 +255,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::signal(
   }
 }
 
-__device__ __forceinline__ void P2pIbTransportDevice::put(
+__device__ __forceinline__ IbLocalCompletionTicket P2pIbTransportDevice::put(
     ThreadGroup& group,
     const IbgdaLocalBuffer& localBuf,
     const IbgdaRemoteBuffer& remoteBuf,
@@ -255,7 +266,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
     uint64_t counterVal,
     bool signalPerLane) {
   if (type == P2pIbBackendType::IBRC) {
-    ibrc->put(
+    return ibrc->put(
         group,
         localBuf,
         remoteBuf,
@@ -266,7 +277,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
         counterVal,
         signalPerLane);
   } else {
-    ibgda->put(
+    return ibgda->put(
         group,
         localBuf,
         remoteBuf,
@@ -279,7 +290,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
   }
 }
 
-__device__ __forceinline__ void P2pIbTransportDevice::put(
+__device__ __forceinline__ IbLocalCompletionTicket P2pIbTransportDevice::put(
     const IbgdaLocalBuffer& localBuf,
     const IbgdaRemoteBuffer& remoteBuf,
     std::size_t nbytes,
@@ -288,7 +299,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
     const IbgdaLocalBuffer& counterBuf,
     uint64_t counterVal) {
   if (type == P2pIbBackendType::IBRC) {
-    ibrc->put(
+    return ibrc->put(
         localBuf,
         remoteBuf,
         nbytes,
@@ -297,7 +308,7 @@ __device__ __forceinline__ void P2pIbTransportDevice::put(
         counterBuf,
         counterVal);
   } else {
-    ibgda->put(
+    return ibgda->put(
         localBuf,
         remoteBuf,
         nbytes,
@@ -464,35 +475,52 @@ P2pIbTransportDevice::read_counter(const IbgdaLocalBuffer& counterBuf) const {
   return ibgda->read_counter(counterBuf);
 }
 
+// IBRC still drains under its own fixed device deadline; wiring it to the
+// abort handle is a separate change, so the handle stops at IBGDA for now.
 __device__ __forceinline__ void P2pIbTransportDevice::flush(
-    ThreadGroup& group) {
+    ThreadGroup& group,
+    const Timeout& timeout) {
   if (type == P2pIbBackendType::IBRC) {
     ibrc->flush(group);
   } else {
-    ibgda->flush(group);
+    ibgda->flush(group, IbDirection::Send, timeout);
   }
 }
 
-__device__ __forceinline__ void P2pIbTransportDevice::flush() {
+__device__ __forceinline__ void P2pIbTransportDevice::flush(
+    const Timeout& timeout) {
   if (type == P2pIbBackendType::IBRC) {
     ibrc->flush();
   } else {
-    ibgda->flush();
+    ibgda->flush(timeout);
   }
 }
 
 __device__ __forceinline__ void P2pIbTransportDevice::fence(
-    ThreadGroup& group) {
-  flush(group);
+    ThreadGroup& group,
+    const Timeout& timeout) {
+  flush(group, timeout);
 }
 
-__device__ __forceinline__ void P2pIbTransportDevice::fence() {
-  flush();
+__device__ __forceinline__ void P2pIbTransportDevice::fence(
+    const Timeout& timeout) {
+  flush(timeout);
 }
 
 // ===========================================================================
 // Pipelined send/recv — forwarded to the active backend.
 // ===========================================================================
+
+__device__ __forceinline__ void P2pIbTransportDevice::require_ibgda(
+    ThreadGroup& group,
+    const char* operation) const {
+  if (type == P2pIbBackendType::IBRC) {
+    if (group.is_leader()) {
+      printf("[PIPES] FATAL: %s requires IBGDA\n", operation);
+    }
+    PIPES_DEVICE_TRAP();
+  }
+}
 
 template <typename CopyOp, typename... Args>
 __device__ __forceinline__ void P2pIbTransportDevice::send(
@@ -507,6 +535,17 @@ __device__ __forceinline__ void P2pIbTransportDevice::send(
   } else {
     ibgda->send<CopyOp>(group, src, nbytes, max_signal_bytes, timeout, args...);
   }
+}
+
+template <typename>
+__device__ __forceinline__ void P2pIbTransportDevice::send_registered(
+    ThreadGroup& group,
+    const IbgdaLocalBuffer& src,
+    std::size_t nbytes,
+    std::size_t max_signal_bytes,
+    const Timeout& timeout) {
+  require_ibgda(group, "registered-source send");
+  ibgda->send_registered(group, src, nbytes, max_signal_bytes, timeout);
 }
 
 template <typename CopyOp, typename... Args>
@@ -572,29 +611,41 @@ __device__ __forceinline__ std::size_t P2pIbTransportDevice::pipeline_chunk()
   return ibgda->pipeline_chunk();
 }
 
+template <typename Proto>
 __device__ __forceinline__ void P2pIbTransportDevice::init_send_progress(
     ThreadGroup& group,
     std::size_t nbytes,
     std::size_t max_signal_bytes) {
   if (type == P2pIbBackendType::IBRC) {
-    ibrc->init_send_progress(group, nbytes, max_signal_bytes);
+    ibrc->init_send_progress<Proto>(group, nbytes, max_signal_bytes);
   } else {
-    ibgda->init_send_progress(group, nbytes, max_signal_bytes);
+    ibgda->init_send_progress<Proto>(group, nbytes, max_signal_bytes);
   }
 }
 
+template <typename>
+__device__ __forceinline__ void
+P2pIbTransportDevice::init_registered_send_progress(
+    ThreadGroup& group,
+    std::size_t nbytes,
+    std::size_t max_signal_bytes) {
+  require_ibgda(group, "registered-source send progress");
+  ibgda->init_registered_send_progress(group, nbytes, max_signal_bytes);
+}
+
+template <typename Proto>
 __device__ __forceinline__ void P2pIbTransportDevice::init_recv_progress(
     ThreadGroup& group,
     std::size_t nbytes,
     std::size_t max_signal_bytes) {
   if (type == P2pIbBackendType::IBRC) {
-    ibrc->init_recv_progress(group, nbytes, max_signal_bytes);
+    ibrc->init_recv_progress<Proto>(group, nbytes, max_signal_bytes);
   } else {
-    ibgda->init_recv_progress(group, nbytes, max_signal_bytes);
+    ibgda->init_recv_progress<Proto>(group, nbytes, max_signal_bytes);
   }
 }
 
-template <typename CopyOp, typename... Args>
+template <typename CopyOp, typename Proto, typename... Args>
 __device__ __forceinline__ IbgdaSendRecvProgressStatus
 P2pIbTransportDevice::progress_send_once(
     ThreadGroup& group,
@@ -604,14 +655,62 @@ P2pIbTransportDevice::progress_send_once(
     const Timeout& timeout,
     Args... args) {
   if (type == P2pIbBackendType::IBRC) {
-    return ibrc->progress_send_once<CopyOp>(
+    return ibrc->progress_send_once<CopyOp, Proto>(
         group, src, nbytes, max_signal_bytes, timeout, args...);
   }
-  return ibgda->progress_send_once<CopyOp>(
+  return ibgda->progress_send_once<CopyOp, Proto>(
       group, src, nbytes, max_signal_bytes, timeout, args...);
 }
 
+template <typename>
+__device__ __forceinline__ IbgdaRegisteredSendProgressStatus
+P2pIbTransportDevice::progress_registered_send_once(
+    ThreadGroup& group,
+    const IbgdaLocalBuffer& src,
+    std::size_t nbytes,
+    std::size_t max_signal_bytes,
+    const Timeout& timeout) {
+  require_ibgda(group, "registered-source send progress");
+  return ibgda->progress_registered_send_once(
+      group, src, nbytes, max_signal_bytes, timeout);
+}
+
+template <typename>
+__device__ __forceinline__ IbgdaRegisteredSendProgressStatus
+P2pIbTransportDevice::progress_registered_send_drain_once(
+    ThreadGroup& group,
+    const Timeout& timeout) {
+  require_ibgda(group, "registered-source send drain");
+  return ibgda->progress_registered_send_drain_once(group, timeout);
+}
+
 template <typename CopyOp, typename... Args>
+__device__ __forceinline__ IbgdaSendRecvProgressStatus
+P2pIbTransportDevice::progress_send_once_with_trace(
+    ThreadGroup& group,
+    const void* __restrict__ src,
+    std::size_t nbytes,
+    std::size_t max_signal_bytes,
+    const Timeout& timeout,
+    const PipesTraceAllReduceContext& traceContext,
+    PipesTraceProgressState& traceState,
+    Args... args) {
+  if (type == P2pIbBackendType::IBRC) {
+    return ibrc->progress_send_once<CopyOp>(
+        group, src, nbytes, max_signal_bytes, timeout, args...);
+  }
+  return ibgda->progress_send_once_with_trace<CopyOp>(
+      group,
+      src,
+      nbytes,
+      max_signal_bytes,
+      timeout,
+      traceContext,
+      traceState,
+      args...);
+}
+
+template <typename CopyOp, typename Proto, typename... Args>
 __device__ __forceinline__ IbgdaSendRecvProgressStatus
 P2pIbTransportDevice::progress_recv_once(
     ThreadGroup& group,
@@ -621,11 +720,65 @@ P2pIbTransportDevice::progress_recv_once(
     const Timeout& timeout,
     Args... args) {
   if (type == P2pIbBackendType::IBRC) {
+    return ibrc->progress_recv_once<CopyOp, Proto>(
+        group, dst, nbytes, max_signal_bytes, timeout, args...);
+  }
+  return ibgda->progress_recv_once<CopyOp, Proto>(
+      group, dst, nbytes, max_signal_bytes, timeout, args...);
+}
+
+template <typename CopyOp, typename... Args>
+__device__ __forceinline__ IbgdaSendRecvProgressStatus
+P2pIbTransportDevice::progress_recv_once_with_trace(
+    ThreadGroup& group,
+    void* __restrict__ dst,
+    std::size_t nbytes,
+    std::size_t max_signal_bytes,
+    const Timeout& timeout,
+    const PipesTraceAllReduceContext& traceContext,
+    PipesTraceProgressState& traceState,
+    Args... args) {
+  if (type == P2pIbBackendType::IBRC) {
     return ibrc->progress_recv_once<CopyOp>(
         group, dst, nbytes, max_signal_bytes, timeout, args...);
   }
-  return ibgda->progress_recv_once<CopyOp>(
-      group, dst, nbytes, max_signal_bytes, timeout, args...);
+  return ibgda->progress_recv_once_with_trace<CopyOp>(
+      group,
+      dst,
+      nbytes,
+      max_signal_bytes,
+      timeout,
+      traceContext,
+      traceState,
+      args...);
+}
+
+template <typename>
+__device__ __forceinline__ IbgdaSendRecvProgressStatus
+P2pIbTransportDevice::progress_recv_acquire_once(
+    ThreadGroup& group,
+    std::size_t nbytes,
+    std::size_t max_signal_bytes,
+    const Timeout& timeout,
+    detail::RecvChunkAcquisition& out) {
+  if (type == P2pIbBackendType::IBRC) {
+    return ibrc->progress_recv_acquire_once(
+        group, nbytes, max_signal_bytes, timeout, out);
+  }
+  return ibgda->progress_recv_acquire_once(
+      group, nbytes, max_signal_bytes, timeout, out);
+}
+
+template <typename>
+__device__ __forceinline__ void
+P2pIbTransportDevice::progress_recv_release_once(
+    ThreadGroup& group,
+    const detail::RecvChunkAcquisition& view) {
+  if (type == P2pIbBackendType::IBRC) {
+    ibrc->progress_recv_release_once(group, view);
+  } else {
+    ibgda->progress_recv_release_once(group, view);
+  }
 }
 
 } // namespace comms::prims

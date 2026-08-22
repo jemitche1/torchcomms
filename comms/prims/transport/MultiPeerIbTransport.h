@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -115,6 +117,10 @@ struct MultipeerIbTransportConfig {
   // qpsPerConnection.
   int qpsPerConnection{1};
 
+  // IBGDA-only reliable-doorbell policy; ignored by IBRC and AMD. nullopt
+  // auto-detects NIC support, true requires support, and false disables it.
+  std::optional<bool> enableReliableDoorbell;
+
   int numQpsPerPeerPerNic() const {
     if (maxGroups < 0 || qpsPerBlockPerNic < 0) {
       throw std::invalid_argument(
@@ -127,15 +133,29 @@ struct MultipeerIbTransportConfig {
     return maxGroups * qpsPerBlockPerNic;
   }
 
-  std::size_t fixedChannelDataBufferSize() const {
+  // Slot-indexed storage is reserved per (logical channel, protocol slot).
+  // max_num_channels stays the LOGICAL channel count a caller selects with
+  // group_id; slot p owns [p * max_num_channels, (p+1) * max_num_channels).
+  // The slot count is kNumProtoSlots (IbgdaBuffer.h) rather than runtime
+  // config, so host sizing and device indexing cannot disagree. QPs are NOT
+  // multiplied: a channel is one QP pair shared by every protocol on it.
+  int totalChannelSlots() const {
     if (max_num_channels < 0) {
       throw std::invalid_argument("max_num_channels must be >= 0");
     }
-    const auto channels = static_cast<std::size_t>(max_num_channels);
+    if (max_num_channels > std::numeric_limits<int>::max() / kNumProtoSlots) {
+      throw std::overflow_error(
+          "max_num_channels * kNumProtoSlots overflows int");
+    }
+    return max_num_channels * kNumProtoSlots;
+  }
+
+  std::size_t fixedChannelDataBufferSize() const {
+    const auto channels = static_cast<std::size_t>(totalChannelSlots());
     if (channels != 0 &&
         perChannelSize > std::numeric_limits<std::size_t>::max() / channels) {
       throw std::overflow_error(
-          "perChannelSize * max_num_channels overflows size_t");
+          "perChannelSize * totalChannelSlots overflows size_t");
     }
     return perChannelSize * channels;
   }
@@ -216,13 +236,9 @@ struct MultipeerIbTransportConfig {
   // RNR retry count (ibv_qp_attr.rnr_retry); 7 means infinite.
   uint8_t rnrRetry{7};
 
-  // When true, defer per-peer state (QPs, staging, signal buffers) to first
-  // use via materializePeer(). When false (default), allocate eagerly at
-  // exchange() time.
-  bool ibLazyConnect{false};
-
-  // Timeout (ms) for the bilateral exchange in materializePeer().
-  uint32_t materializePeerTimeoutMs{30000};
+  // Deprecated compatibility setting. Per-peer state is always materialized
+  // on demand; false no longer enables eager all-peer allocation.
+  bool ibLazyConnect{true};
 };
 
 // Whether Data-Direct MR registration applies for a NIC: Data-Direct is
@@ -248,6 +264,106 @@ inline bool relaxedOrderingActiveForNic(
   return config.enablePciRelaxedOrdering !=
       MultipeerIbTransportConfig::PciRelaxedOrderingMode::Disabled &&
       nicRelaxedOrderingCapable;
+}
+
+// Explicit-release token for one transport-owned registration. Callers must
+// pass every valid lease to deregisterIbBulkBuffer() before destroying it; the
+// lease does not own the transport and therefore cannot release itself safely.
+class IbBufferRegistrationLease {
+ public:
+  IbBufferRegistrationLease() = default;
+  ~IbBufferRegistrationLease() = default;
+  IbBufferRegistrationLease(const IbBufferRegistrationLease&) = delete;
+  IbBufferRegistrationLease& operator=(const IbBufferRegistrationLease&) =
+      delete;
+  IbBufferRegistrationLease(IbBufferRegistrationLease&& other) noexcept
+      : generation_(std::exchange(other.generation_, 0)) {}
+  // Assignment could silently discard a registration that still requires an
+  // explicit release.
+  IbBufferRegistrationLease& operator=(IbBufferRegistrationLease&&) = delete;
+
+  bool valid() const {
+    return generation_ != 0;
+  }
+
+  uint64_t generation() const {
+    return generation_;
+  }
+
+ private:
+  friend class MultiPeerIbTransportBase;
+
+  explicit IbBufferRegistrationLease(uint64_t generation)
+      : generation_(generation) {}
+
+  void reset() {
+    generation_ = 0;
+  }
+
+  uint64_t generation_{0};
+};
+
+struct IbBufferRegistrationView {
+  uint64_t leaseGeneration{0};
+  IbgdaLocalBuffer localBuffer;
+  std::size_t size{0};
+  bool relaxedOrdering{false};
+
+  bool valid() const {
+    return leaseGeneration != 0 && localBuffer.ptr != nullptr && size != 0;
+  }
+};
+
+inline bool reliableDoorbellActiveForNic(
+    const MultipeerIbTransportConfig& config,
+    bool nicReliableDoorbellCapable) {
+  if (config.enableReliableDoorbell.value_or(false) &&
+      !nicReliableDoorbellCapable) {
+    throw std::invalid_argument(
+        "enableReliableDoorbell requires reliable-doorbell NIC support");
+  }
+  return config.enableReliableDoorbell.value_or(nicReliableDoorbellCapable);
+}
+
+inline bool reliableDoorbellNeedsCapabilityQuery(
+    const MultipeerIbTransportConfig& config) {
+  return config.enableReliableDoorbell.value_or(true);
+}
+
+// Order in which connectPeers() walks a rank's pending peers.
+// doMaterializePeer() is a rendezvous, so an edge only progresses while both
+// ends are working on each other. Deadlock freedom needs a key that is
+// symmetric (k(a,b) == k(b,a)) and injective in the peer for a fixed rank: the
+// globally lowest-keyed pending edge then always has both ends selecting it.
+// Both properties hold for XOR; the caller-side precondition is unchanged and
+// still the one documented on MultiPeerTransport::materializePeers.
+//
+// The key also decides how much of the graph pairs up at once. Ordering by peer
+// rank is equally deadlock-free but serializes a ring into nRanks - 1 rounds,
+// because rank r takes r-1 before r+1 and so edge (r, r+1) cannot start until
+// (r-1, r) has finished. XOR distance instead puts every (2i, 2i+1) edge at
+// key 1 and every (2i+1, 2i+2) edge above it, collapsing a contiguous ring to
+// two rounds when nRanks is even and three when it is odd. Rings the collective
+// layer actually builds are strided (node * nvlSize + nvlRank), and a stride
+// that is not a power of two costs a round or two more; the win is that the
+// round count stays a small constant instead of scaling with nRanks. XOR is not
+// optimal for every graph -- a few strided and irregular shapes need one to
+// three rounds more than rank order -- but no topology in comms regresses more
+// than that, against O(nRanks) rounds saved on every ring.
+//
+// Free function so the schedule is unit-testable without a NIC.
+constexpr int peerMaterializationKey(int myRank, int peerRank) {
+  return myRank ^ peerRank;
+}
+
+// Order a rank's pending peers into the sequence connectPeers() materializes
+// them in. Free function so the schedule the transport actually runs is
+// unit-testable without a NIC.
+inline void sortPendingPeers(int myRank, std::vector<int>& peers) {
+  std::sort(peers.begin(), peers.end(), [myRank](int lhs, int rhs) {
+    return peerMaterializationKey(myRank, lhs) <
+        peerMaterializationKey(myRank, rhs);
+  });
 }
 
 /**
@@ -326,7 +442,8 @@ struct IbTransportExchInfoAll {
   int qpsPerBlockPerNic{1};
 };
 
-// Bootstrap tags for the two-phase bilateral exchange in lazy materialization.
+// Phases within the peer-pair-specific bootstrap tag computed by
+// exchangeRawWithPeer().
 constexpr int kIbPeerQpExchangeTag = 0;
 constexpr int kIbPeerBufferExchangeTag = 1;
 
@@ -421,6 +538,19 @@ class MultiPeerIbTransportBase {
     return numNics_;
   }
 
+  /** @return Configured send/recv staging pipeline depth. */
+  int pipelineDepth() const {
+    return config_.pipelineDepth;
+  }
+
+  /**
+   * @return Logical IB channels per peer; device code requires
+   * group_id < this. Cross-validated across ranks at materialization.
+   */
+  int maxNumChannels() const {
+    return config_.max_num_channels;
+  }
+
   /**
    * registerBuffer - Register a user GPU buffer for RDMA, refcounted per
    * allocation. Containment fast-path returns cached per-NIC lkeys without any
@@ -440,6 +570,29 @@ class MultiPeerIbTransportBase {
   void deregisterBuffer(void* ptr);
 
   /**
+   * Register a logical bulk-data range and return its move-only ownership
+   * token. The underlying allocation MR is shared with other registrations,
+   * while the lease preserves the exact caller-visible range.
+   */
+  IbBufferRegistrationLease registerIbBulkBuffer(void* ptr, std::size_t size);
+
+  /**
+   * Return a non-owning RDMA view when the requested range is fully contained
+   * in the active lease. The view remains valid only while its lease is active.
+   */
+  std::optional<IbBufferRegistrationView> lookupIbBulkBuffer(
+      const IbBufferRegistrationLease& lease,
+      void* ptr,
+      std::size_t size) const;
+
+  /** Release one logical bulk registration and invalidate its ownership token.
+   */
+  void deregisterIbBulkBuffer(IbBufferRegistrationLease& lease);
+
+  /** Return whether a previously resolved view still names its active lease. */
+  bool isIbBulkBufferViewActive(const IbBufferRegistrationView& view) const;
+
+  /**
    * exchangeBuffer - COLLECTIVE. allGather a registered buffer's addr + per-NIC
    * rkeys; return one IbgdaRemoteBuffer per peer (indexed by peerIndexToRank).
    */
@@ -449,7 +602,23 @@ class MultiPeerIbTransportBase {
   /** Queue a peer for lazy materialization (no network I/O). */
   void queuePeerForMaterialization(int peerRank);
 
-  /** @return true if the peer is ready for kernel use (always true eager). */
+  /**
+   * Report the outcome of a connectPeers() round. Defined out-of-line so this
+   * header, which every IB backend includes, does not pull in glog.
+   */
+  void logPeersMaterialized(
+      std::size_t peerCount,
+      std::int64_t elapsedMs,
+      bool failed) const;
+
+  static std::int64_t elapsedMsSince(
+      std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+  }
+
+  /** @return true if the peer is materialized and ready for kernel use. */
   bool isPeerMaterialized(int peerRank) const;
 
  protected:
@@ -498,8 +667,10 @@ class MultiPeerIbTransportBase {
 
   // Bilateral bootstrap exchange of a fixed-size payload with one peer. The
   // typed wrapper is header-only (so it can instantiate with backend-private
-  // payload types); the heavy logic (lower-rank-recvs-first to avoid deadlock,
-  // honoring materializePeerTimeoutMs) lives in exchangeRawWithPeer in the .cc.
+  // payload types); the heavy logic (lower-rank-recvs-first to avoid deadlock)
+  // lives in exchangeRawWithPeer in the .cc. The bootstrap implementation owns
+  // timeout and cancellation so caller-owned payloads remain live until the
+  // exchange completes.
   template <typename T>
   T exchangeWithPeer(int peerRank, const T& localPayload, int tag) {
     T remotePayload{};
@@ -594,6 +765,13 @@ class MultiPeerIbTransportBase {
     bool relaxedOrdering{false};
   };
 
+  struct BulkBufferRegistration {
+    void* ptr{nullptr};
+    std::size_t size{0};
+    IbgdaLocalBuffer localBuffer;
+    bool relaxedOrdering{false};
+  };
+
   const int myRank_{-1};
   const int nRanks_{0};
   std::shared_ptr<meta::comms::IBootstrap> bootstrap_;
@@ -639,6 +817,11 @@ class MultiPeerIbTransportBase {
   // Ordered map enables O(log n) containment lookup via upper_bound.
   std::map<uintptr_t, CachedMr> registeredBuffers_;
 
+  // Logical bulk-data registrations are keyed by a monotonically increasing
+  // generation. Their underlying MRs remain owned by registeredBuffers_.
+  std::map<uint64_t, BulkBufferRegistration> bulkBufferRegistrations_;
+  uint64_t nextBulkBufferGeneration_{1};
+
   // Shared send/recv staging-ring state (eager mode). Owns the bulk
   // allocations; sendRecvPeerBuffers_ slices them per peer.
   std::vector<IbSendRecvPeerBuffers> sendRecvPeerBuffers_;
@@ -655,6 +838,9 @@ class MultiPeerIbTransportBase {
   IbCounterStorage sendRecvCounterStorage_{IbCounterStorage::Device};
 
   // Lazy materialization state machine.
+  // connectPeers() holds this lock through the backend/bootstrap exchange so
+  // fixed bootstrap tags cannot be reused concurrently on one communicator.
+  mutable std::mutex materializationMutex_;
   std::vector<int> pendingPeers_;
   std::vector<bool> peerMaterialized_;
   bool materializationFailed_{false};
@@ -763,13 +949,16 @@ class MultiPeerIbTransportBase {
 template <typename Backend>
 class MultiPeerIbTransport : public MultiPeerIbTransportBase {
  public:
-  /** Materialize one peer (queue + connect). No-op in eager mode. */
+  /** Materialize one peer (queue + connect). */
   void materializePeer(int peerRank) {
     queuePeerForMaterialization(peerRank);
     connectPeers();
   }
 
-  /** Connect all queued peers in sorted order (deadlock-safe for >2 ranks). */
+  /**
+   * Connect all queued peers in peerMaterializationKey order (deadlock-safe for
+   * >2 ranks, given the symmetric request graph materializePeers requires).
+   */
   void connectPeers();
 
  protected:
@@ -797,6 +986,9 @@ class MultiPeerIbTransport : public MultiPeerIbTransportBase {
 
 template <typename Backend>
 void MultiPeerIbTransport<Backend>::connectPeers() {
+  // queuePeerForMaterialization() releases this mutex before entering here;
+  // backend hooks must not recursively call materializePeer()/connectPeers().
+  const std::lock_guard<std::mutex> lock(materializationMutex_);
   if (materializationFailed_) {
     pendingPeers_.clear();
     throw std::runtime_error(
@@ -806,18 +998,18 @@ void MultiPeerIbTransport<Backend>::connectPeers() {
   if (pendingPeers_.empty()) {
     return;
   }
-  // Sorted order avoids deadlock for >2 ranks (both sides connect in the same
-  // global order).
-  std::sort(pendingPeers_.begin(), pendingPeers_.end());
+  // Deadlock-free on a symmetric request graph; see peerMaterializationKey.
+  sortPendingPeers(myRank_, pendingPeers_);
 
   std::vector<int> peers;
   peers.swap(pendingPeers_);
   std::vector<int> touchedPeerIndexes;
   touchedPeerIndexes.reserve(peers.size());
 
+  const auto startTime = std::chrono::steady_clock::now();
   try {
     for (int peerRank : peers) {
-      if (isPeerMaterialized(peerRank)) {
+      if (peerMaterialized_[rankToPeerIndex(peerRank)]) {
         continue;
       }
       touchedPeerIndexes.push_back(rankToPeerIndex(peerRank));
@@ -825,11 +1017,20 @@ void MultiPeerIbTransport<Backend>::connectPeers() {
     }
   } catch (...) {
     materializationFailed_ = true;
+    // Report elapsed on the way out too: a rendezvous that stalls and then
+    // errors is the case where the timing matters most.
+    logPeersMaterialized(
+        touchedPeerIndexes.size(), elapsedMsSince(startTime), /*failed=*/true);
     for (int peerIndex : touchedPeerIndexes) {
       backend().cleanupPeerOnFailure(peerIndex);
     }
     throw;
   }
+  // A rank blocks here until each peer reaches the matching rendezvous, so this
+  // reports queue wait as well as local work. Elapsed far above the per-peer
+  // cost means peers are arriving late, not that materialization is slow.
+  logPeersMaterialized(
+      touchedPeerIndexes.size(), elapsedMsSince(startTime), /*failed=*/false);
 }
 
 } // namespace comms::prims

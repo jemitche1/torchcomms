@@ -7,6 +7,7 @@
 #include <sstream>
 #include <vector>
 
+#include "comms/ctran/utils/CtranLogger.h"
 #include "comms/ctran/utils/CudaWrap.h"
 #include "comms/ctran/utils/DevMemType.h"
 #include "comms/utils/commSpecs.h"
@@ -29,7 +30,7 @@ static inline bool CtranIpcSupport() {
   return true;
 #else
 #if CUDART_VERSION < 11030
-  CLOGF(
+  CTRAN_LOG(
       WARN, "CTRAN-IPC: CTran IPC memory support requires CUDA 11.3 or later");
   return false;
 #endif
@@ -359,6 +360,23 @@ class CtranIpcRemMem {
   const DevMemType memType_{DevMemType::kHostUnregistered};
   const CUmemAllocationHandleType cuMemHandleType_{CU_MEM_HANDLE_TYPE_NONE};
 };
+
+// Export/import a single cuMem (VMM) allocation handle to/from a shareable
+// handle: FABRIC (`isFabric=true` -- the multicast object, or MNNVL buffers) or
+// POSIX file descriptor (`isFabric=false`). Shared by the regular per-segment
+// buffer registration (CtranIpcMem) and the multicast rendezvous in
+// CtranMapper::allGatherCtrlImpl, which moves the object handle over the same
+// control channel as the buffer handles. For fabric, `out.handle` carries the
+// fabric bytes; for posix-fd, `out.fd`/`in.fd` carries the descriptor (the
+// caller owns the pidfd import/close dance around the fd itself).
+commResult_t exportShareableHandle(
+    CUmemGenericAllocationHandle handle,
+    CtranIpcHandle& out,
+    bool isFabric);
+commResult_t importShareableHandle(
+    const CtranIpcHandle& in,
+    CUmemGenericAllocationHandle& out,
+    bool isFabric);
 
 // Return the number of active IPC memory objects and IPC remote memory objects.
 // Used to check resource leak in UT.

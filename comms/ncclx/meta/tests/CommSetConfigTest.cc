@@ -35,6 +35,7 @@ TEST_F(CommSetConfigTest, SetAllAlgoHints) {
       {"allgatherAlgo", "ctring"},
       {"allreduceAlgo", "ctdirect"},
       {"sendrecvAlgo", "ctran"},
+      {"alltoallAlgo", "ctran"},
       {"alltoallvAlgo", "ctran"},
       {"rmaAlgo", "ctran"},
   });
@@ -50,6 +51,9 @@ TEST_F(CommSetConfigTest, SetAllAlgoHints) {
   EXPECT_EQ(
       NCCL_SENDRECV_ALGO::ctran,
       NCCLX_CONFIG_FIELD(comm->config, sendrecvAlgo));
+  EXPECT_EQ(
+      NCCL_ALLTOALL_ALGO::ctran,
+      NCCLX_CONFIG_FIELD(comm->config, alltoallAlgo));
   EXPECT_EQ(
       NCCL_ALLTOALLV_ALGO::ctran,
       NCCLX_CONFIG_FIELD(comm->config, alltoallvAlgo));
@@ -261,6 +265,144 @@ TEST_F(CommSetConfigTest, SetConfigAfterCollective) {
 
   cudaStreamDestroy(stream);
   cudaFree(buf);
+}
+
+TEST_F(CommSetConfigTest, SetWinRegisterIpcOnly) {
+  ncclx::test::NcclCommRAII comm(
+      globalRank, numRanks, localRank, bootstrap_.get());
+  ASSERT_NE(nullptr, comm.get());
+
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"win_register_ipc_only", "1"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_TRUE(NCCLX_CONFIG_FIELD(comm->config, winRegisterIpcOnly));
+  }
+
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"win_register_ipc_only", "0"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_FALSE(NCCLX_CONFIG_FIELD(comm->config, winRegisterIpcOnly));
+  }
+}
+
+TEST_F(CommSetConfigTest, WinRegisterIpcOnlyNotResetByUnrelatedUpdate) {
+  ncclx::test::NcclCommRAII comm(
+      globalRank, numRanks, localRank, bootstrap_.get());
+  ASSERT_NE(nullptr, comm.get());
+
+  // Enable win_register_ipc_only.
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"win_register_ipc_only", "1"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_TRUE(NCCLX_CONFIG_FIELD(comm->config, winRegisterIpcOnly));
+  }
+
+  // An unrelated update must not reset it (key absent and not pre-seeded).
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"allgatherAlgo", "ctdirect"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_TRUE(NCCLX_CONFIG_FIELD(comm->config, winRegisterIpcOnly));
+  }
+}
+
+TEST_F(CommSetConfigTest, SetWinRegisterEnableSignal) {
+  ncclx::test::NcclCommRAII comm(
+      globalRank, numRanks, localRank, bootstrap_.get());
+  ASSERT_NE(nullptr, comm.get());
+
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"win_register_enable_signal", "0"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_FALSE(NCCLX_CONFIG_FIELD(comm->config, winRegisterEnableSignal));
+  }
+
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"win_register_enable_signal", "1"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_TRUE(NCCLX_CONFIG_FIELD(comm->config, winRegisterEnableSignal));
+  }
+}
+
+TEST_F(CommSetConfigTest, WinRegisterEnableSignalNotResetByUnrelatedUpdate) {
+  ncclx::test::NcclCommRAII comm(
+      globalRank, numRanks, localRank, bootstrap_.get());
+  ASSERT_NE(nullptr, comm.get());
+
+  // Disable signals first.
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"win_register_enable_signal", "0"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_FALSE(NCCLX_CONFIG_FIELD(comm->config, winRegisterEnableSignal));
+  }
+
+  // An unrelated update must not reset it (key absent and not pre-seeded).
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"allgatherAlgo", "ctdirect"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_FALSE(NCCLX_CONFIG_FIELD(comm->config, winRegisterEnableSignal));
+  }
+}
+
+TEST_F(CommSetConfigTest, SetWinRegisterSymmetric) {
+  ncclx::test::NcclCommRAII comm(
+      globalRank, numRanks, localRank, bootstrap_.get());
+  ASSERT_NE(nullptr, comm.get());
+
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"win_register_symmetric", "1"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_TRUE(NCCLX_CONFIG_FIELD(comm->config, winRegisterSymmetric));
+  }
+
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"win_register_symmetric", "0"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_FALSE(NCCLX_CONFIG_FIELD(comm->config, winRegisterSymmetric));
+  }
+}
+
+TEST_F(CommSetConfigTest, WinRegisterSymmetricNotResetByUnrelatedUpdate) {
+  ncclx::test::NcclCommRAII comm(
+      globalRank, numRanks, localRank, bootstrap_.get());
+  ASSERT_NE(nullptr, comm.get());
+
+  // Enable symmetric first.
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"win_register_symmetric", "1"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_TRUE(NCCLX_CONFIG_FIELD(comm->config, winRegisterSymmetric));
+  }
+
+  // An unrelated update must not reset it (key absent and not pre-seeded).
+  {
+    ncclConfig_t newConfig = NCCL_CONFIG_INITIALIZER;
+    ncclx::Hints hints({{"allgatherAlgo", "ctdirect"}});
+    newConfig.hints = &hints;
+    EXPECT_EQ(ncclSuccess, ncclx::commSetConfig(comm, &newConfig));
+    EXPECT_TRUE(NCCLX_CONFIG_FIELD(comm->config, winRegisterSymmetric));
+  }
 }
 
 int main(int argc, char* argv[]) {

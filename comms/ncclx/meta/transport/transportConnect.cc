@@ -11,6 +11,7 @@
 #include "comms/ctran/utils/Utils.h"
 
 #include "comms/utils/logger/EventsScubaUtil.h"
+#include "meta/NcclxLogUtils.h"
 #include "meta/transport/transportConnect.h"
 #include "meta/transport/transportExt.h"
 #include "meta/transport/transportProxy.h"
@@ -204,11 +205,33 @@ ncclResult_t transportPatConnect(struct ncclComm* comm, int nChannels) {
   return ncclSuccess;
 }
 
-/* TODO: extend lazy channel setup to other algorithms, e.g., NVSL, currently
- * support Ring, Tree and PAT */
+ncclResult_t transportNvlsConnect(struct ncclComm* comm) {
+  if (!comm || comm->nRanks == 1 || !comm->nvlsSupport) {
+    return ncclSuccess;
+  }
+  NCCLCHECK(ncclNvlsBufferSetup(comm));
+  comm->algoConnectedChannels[NCCL_ALGO_NVLS] = comm->nvlsChannels;
+  comm->initAlgoChannels[NCCL_ALGO_NVLS] = true;
+  return ncclSuccess;
+}
+
+ncclResult_t transportNvlsTreeConnect(struct ncclComm* comm) {
+  if (!comm || comm->nRanks == 1 || !comm->nvlsSupport) {
+    return ncclSuccess;
+  }
+  NCCLCHECK(ncclNvlsBufferSetup(comm));
+  NCCLCHECK(ncclNvlsTreeConnect(comm));
+  comm->algoConnectedChannels[NCCL_ALGO_NVLS_TREE] = comm->nvlsChannels;
+  comm->initAlgoChannels[NCCL_ALGO_NVLS_TREE] = true;
+  return ncclSuccess;
+}
+
+/* TODO: extend lazy channel setup to other algorithms, currently support Ring,
+ * Tree, PAT, NVLS and NVLS_TREE */
 bool algoCanLazySetupChannel(struct ncclComm* comm, struct ncclTaskColl* task) {
   if (task->algorithm == NCCL_ALGO_RING || task->algorithm == NCCL_ALGO_TREE ||
-      task->algorithm == NCCL_ALGO_PAT) {
+      task->algorithm == NCCL_ALGO_PAT || task->algorithm == NCCL_ALGO_NVLS ||
+      task->algorithm == NCCL_ALGO_NVLS_TREE) {
     return true;
   } else {
     /* update nMaxChannelsNeedInit and algoMaxChannelsNeedConnect to ensure all
@@ -222,14 +245,15 @@ bool algoCanLazySetupChannel(struct ncclComm* comm, struct ncclTaskColl* task) {
 
 bool algoNeedConnect(struct ncclComm* comm, struct ncclTaskColl* task) {
   if (comm->planner.nTasksColl > 1) {
-    /* FIXME: cannot support aggregated collectives now because it may use more
-     * channels at scheduling time, update nMaxChannelsNeedInit and
-     * algoMaxChannelsNeedConnect in planner to ensure all channels will be
-     * setup and the selected algorithm will be connected */
-    comm->planner.nMaxChannelsNeedInit = comm->nChannels;
+    /* Aggregated collectives may use more channels at scheduling time than any
+     * individual task requests, so ensure all channels are initialized and the
+     * selected algorithm is connected for the full channel set. */
+    const int nChannelsNeedConnect = comm->nChannels;
+    comm->planner.nMaxChannelsNeedInit = nChannelsNeedConnect;
     comm->planner.algoMaxChannelsNeedConnect.at(task->algorithm) =
-        comm->nChannels;
-    return comm->nChannelsReady < comm->nChannels;
+        nChannelsNeedConnect;
+    return comm->nChannelsReady < nChannelsNeedConnect ||
+        comm->algoConnectedChannels[task->algorithm] < nChannelsNeedConnect;
   }
   // update the maximal number of channels need to be initialized later
   if (task->nMaxChannels > comm->nChannelsReady) {
@@ -568,7 +592,7 @@ ncclResult_t transportReConnect(
         myReconnInfo,
         sizeof(ncclxPeerReConnInfo)));
 
-    CLOGF_SUBSYS(
+    NCCLX_LOG_SUBSYS(
         INFO,
         ALLOC,
         "rank-{} sent reconnect state to peer-{} (tag {}): [{}]",
@@ -608,7 +632,7 @@ ncclResult_t transportReConnect(
         &peerReconnInfo,
         sizeof(ncclxPeerReConnInfo)));
 
-    CLOGF_SUBSYS(
+    NCCLX_LOG_SUBSYS(
         INFO,
         ALLOC,
         "rank-{} received reconnect state from peer-{} (tag {}): [{}]",
@@ -643,7 +667,7 @@ ncclResult_t transportReConnect(
 
   if (collNeedReConnect || p2pNeedReConnect) {
     NCCLCHECK(setupTransports(comm, p2pNeedReConnect, algoNeedReConnect));
-    CLOGF_SUBSYS(
+    NCCLX_LOG_SUBSYS(
         INFO,
         ALLOC,
         "{}: comm {} re-connected all peers for current plan",
@@ -836,13 +860,11 @@ ncclResult_t collPreconnect(
           break;
         }
         case NCCL_ALGO_NVLS: {
-          /* If we are using NVLS_TREE algo, we must mark NVLS algo to set up
-           * NVLS intra-node buffer */
-          NCCLCHECK(ncclNvlsBufferSetup(comm));
+          NCCLCHECK(transportNvlsConnect(comm));
           break;
         }
         case NCCL_ALGO_NVLS_TREE: {
-          NCCLCHECK(ncclNvlsTreeConnect(comm));
+          NCCLCHECK(transportNvlsTreeConnect(comm));
           break;
         }
         case NCCL_ALGO_COLLNET_CHAIN: {

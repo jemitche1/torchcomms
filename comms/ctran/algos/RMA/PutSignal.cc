@@ -11,9 +11,10 @@
 #include "comms/ctran/colltrace/CollTraceWrapper.h"
 #include "comms/ctran/gpe/CtranGpe.h"
 #include "comms/ctran/mapper/CtranMapper.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
+#include "comms/ctran/utils/CtranLogger.h"
 #include "comms/ctran/utils/CudaWrap.h"
 #include "comms/ctran/window/CtranWin.h"
-#include "comms/utils/logger/LogUtils.h"
 
 using namespace ctran;
 using meta::comms::colltrace::CollTraceHandleTriggerState;
@@ -57,8 +58,8 @@ inline static commResult_t checkDisplacementBounds(
   size_t totalBytes = dispNbytes + (elemSize * elemCount);
 
   if (totalBytes > winSize) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInvalidArgument,
         "Invalid displacement from {} bytes to {} bytes exceeding the window size {}",
         dispNbytes,
         totalBytes,
@@ -72,8 +73,8 @@ inline static commResult_t checkSignalDisplacement(
     size_t disp,
     size_t signalSize) {
   if (disp > signalSize) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInvalidArgument,
         "Invalid displacement {} exceeding the signal buffer size {}",
         disp,
         signalSize);
@@ -98,7 +99,7 @@ static commResult_t putSignalImpl(
 
   // The IB backend must be available
   if (!comm->ctran_->mapper->hasBackend(peerRank, CtranMapperBackend::IB)) {
-    CLOGF(ERR, "Put signal doesn't have IB backend");
+    CTRAN_ERR(commInternalError, "Put signal doesn't have IB backend");
     return commInternalError;
   }
 
@@ -115,7 +116,7 @@ static commResult_t putSignalImpl(
   FB_COMMCHECK(comm->ctran_->mapper->searchRegHandle(
       op->putsignal.sendbuff, putSize, &localMemHdl, &localReg));
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "putSignalImpl: sbuf {}, rbuf {} (base {} + offset {}), size {}, signalAddr {} signalVal {}",
       op->putsignal.sendbuff,
@@ -173,11 +174,11 @@ static commResult_t signalImpl(
 
   // The IB backend must be available
   if (!comm->ctran_->mapper->hasBackend(peerRank, CtranMapperBackend::IB)) {
-    CLOGF(ERR, "Signal doesn't have IB backend");
+    CTRAN_ERR(commInternalError, "Signal doesn't have IB backend");
     return commInternalError;
   }
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "signalImpl: peer {} signalAddr {} signalVal {}",
       op->signal.peerRank,
@@ -205,7 +206,7 @@ static commResult_t waitSignalSpinningKernelImpl(
   const std::atomic<uint64_t>* addr =
       reinterpret_cast<const std::atomic<uint64_t>*>(op->waitsignal.signalAddr);
   CtranAlgoRMALogger logger("ctranWaitSignal", op->opCount, -1, win, comm);
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "waitSignalSpinningKernelImpl: signalAddr {}, cmpVal={}",
       (void*)const_cast<uint64_t*>(op->waitsignal.signalAddr),
@@ -231,6 +232,11 @@ commResult_t ctranPutSignal(
     cudaStream_t stream,
     bool signal) {
   CtranComm* comm = win->comm;
+  if (signal && !win->isSignalEnabled()) {
+    FB_ERRORRETURN(
+        commInvalidUsage,
+        "ctranPutSignal: signal requested but signals are disabled for this window (win_register_enable_signal=0)");
+  }
   const auto winOpCount = win->updateOpCount(peer);
   const auto putOpCount = win->updateOpCount(peer, window::OpCountType::kPut);
   auto statex = comm->statex_.get();
@@ -395,7 +401,7 @@ waitSignalDriverApi(int peer, CtranWin* win, cudaStream_t stream) {
     // Other errors (e.g., INVALID_VALUE) may indicate prior async failures
     // that could cause the spinning kernel to hang, so propagate them
     if (result == CUDA_ERROR_NOT_SUPPORTED) {
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "CTRAN RMA: Hardware wait not supported ({}), falling back to spinning kernel",
           errStr ? errStr : "unknown error");
@@ -404,8 +410,8 @@ waitSignalDriverApi(int peer, CtranWin* win, cudaStream_t stream) {
 
     // Propagate other errors - do not fallback as they may indicate
     // stream corruption from prior async operations
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInternalError,
         "CTRAN RMA: Hardware wait failed with error ({}), not falling back",
         errStr ? errStr : "unknown error");
     return commInternalError;
@@ -467,6 +473,11 @@ commResult_t waitSignalSpinningKernel(
 
 commResult_t ctranSignal(int peer, CtranWin* win, cudaStream_t stream) {
   CtranComm* comm = win->comm;
+  if (!win->isSignalEnabled()) {
+    FB_ERRORRETURN(
+        commInvalidUsage,
+        "ctranSignal: signals are disabled for this window (win_register_enable_signal=0)");
+  }
   const auto winOpCount = win->updateOpCount(peer);
   const auto sigOpCount =
       win->updateOpCount(peer, window::OpCountType::kSignal);
@@ -526,6 +537,11 @@ commResult_t ctranSignal(int peer, CtranWin* win, cudaStream_t stream) {
 // Tries hardware wait first (CUDA 11.7+), falls back to spinning kernel
 commResult_t ctranWaitSignal(int peer, CtranWin* win, cudaStream_t stream) {
   CtranComm* comm = win->comm;
+  if (!win->isSignalEnabled()) {
+    FB_ERRORRETURN(
+        commInvalidUsage,
+        "ctranWaitSignal: signals are disabled for this window (win_register_enable_signal=0)");
+  }
   auto statex = comm->statex_.get();
 
   // Track op counts for BOTH implementations
@@ -572,7 +588,7 @@ commResult_t ctranWaitSignal(int peer, CtranWin* win, cudaStream_t stream) {
     colltraceHandle->trigger(CollTraceHandleTriggerState::AfterEnqueueKernel);
 
     if (hwResult == commSuccess) {
-      CLOGF_TRACE(
+      CTRAN_LOG_TRACE(
           COLL, "CTRAN RMA: WaitSignal successful using hardware acceleration");
       return commSuccess;
     }
@@ -586,7 +602,7 @@ commResult_t ctranWaitSignal(int peer, CtranWin* win, cudaStream_t stream) {
   }
 
   // Fallback to spinning kernel implementation
-  CLOGF(
+  CTRAN_LOG(
       INFO,
       "CTRAN RMA: WaitSignal falling back to spinning kernel (peer={})",
       peer);

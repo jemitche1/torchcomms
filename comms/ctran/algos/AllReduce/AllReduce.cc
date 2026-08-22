@@ -6,8 +6,9 @@
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/algos/AllReduce/AllReduceImpl.h"
 #include "comms/ctran/mapper/CtranMapper.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
+#include "comms/ctran/utils/CtranLogger.h"
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 bool ctranAllReduceSupport(CtranComm* comm, enum NCCL_ALLREDUCE_ALGO algo) {
   if (!ctranInitialized(comm) || !comm->ctran_->mapper->hasBackend()) {
@@ -21,7 +22,7 @@ bool ctranAllReduceSupport(CtranComm* comm, enum NCCL_ALLREDUCE_ALGO algo) {
       if (comm->statex_->nLocalRanks() == 1) {
         return true;
       }
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "ctring algo currently only supported for nLocalRanks=1 for ctranAllReduce, falling back to baseline");
       return false;
@@ -53,14 +54,28 @@ commResult_t ctranAllReduce(
       if (comm->statex_->nRanks() == 1) {
         // TODO(T242570177): this is a temp workaround for nRanks == 1. Remove
         // the warning below if fixed.
-        CLOGF(
+        CTRAN_LOG(
             DBG,
             "AllReduce ctring currently requires nRanks > 1, fallback to ctdirect");
         return ctranAllReduceDirect(
             sendbuff, recvbuff, count, datatype, redOp, comm, stream, timeout);
       }
       if (count < comm->statex_->nRanks()) {
-        CLOGF(
+        // Opt-in: pad the message up to nRanks and run the ring anyway. This
+        // unblocks TCPDM, which is only exposed to the ring path.
+        // TODO: remove once small messages are fully supported through TCPDM.
+        if (MCCL_FORCE_SMALL_MSG_AR_RING) {
+          return ctranAllReduceRingSmallMsg(
+              sendbuff,
+              recvbuff,
+              count,
+              datatype,
+              redOp,
+              comm,
+              stream,
+              timeout);
+        }
+        CTRAN_LOG(
             DBG,
             "AllReduce ctring requires count {} > nRanks {}, fallback to ctdirect",
             count,

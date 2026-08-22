@@ -7,12 +7,12 @@
 #include <vector>
 #include "comms/ctran/backends/socket/CtranSocketBase.h"
 #include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/Debug.h"
 #include "comms/ctran/utils/ExtUtils.h"
 #include "comms/utils/StrUtils.h"
 #include "comms/utils/commSpecs.h"
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 CtranSocket::CtranSocket(CtranComm* comm)
     : comm(comm),
@@ -21,7 +21,7 @@ CtranSocket::CtranSocket(CtranComm* comm)
       commHash_(comm->statex_->commHash()),
       commDesc_(comm->statex_->commDesc()) {
   init(SocketServerAddr());
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-SOCKET: Initialized {} from comm {}",
@@ -41,7 +41,7 @@ CtranSocket::CtranSocket(
       commHash_(commHash),
       commDesc_(commDesc) {
   init(serverAddr);
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-SOCKET: Initialized {} from rank {} cudaDev {} commHash {:x} commDesc {}",
@@ -65,7 +65,7 @@ CtranSocket::~CtranSocket(void) {
     }
   }
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-SOCKET: destroyed SOCKET backend {} for commHash {:x} commDesc {}",
@@ -100,7 +100,7 @@ commResult_t CtranSocket::preConnect(const std::unordered_set<int>& peerRanks) {
   }
 
   if (newConnection) {
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "CTRAN-SOCKET: Rank-{} Pre-connected peers: [{}]",
@@ -132,11 +132,11 @@ void CtranSocket::init(const SocketServerAddr& serverAddr) {
           "CTRAN-SOCKET: No socket interfaces found (NCCL_SOCKET_IFNAME={}, NCCL_SOCKET_IPADDR_PREFIX={})",
           NCCL_SOCKET_IFNAME,
           NCCL_SOCKET_IPADDR_PREFIX);
-      CLOGF(ERR, msg);
+      CTRAN_ERR(commSystemError, "{}", msg);
       throw ctran::utils::Exception(
           msg, commSystemError, rank_, commHash_, commDesc_);
     } else {
-      CLOGF_SUBSYS(
+      CTRAN_LOG_SUBSYS(
           INFO,
           INIT,
           "CTRAN-SOCKET: socket address set to {} on interface {}",
@@ -148,7 +148,7 @@ void CtranSocket::init(const SocketServerAddr& serverAddr) {
     FB_SYSCHECKTHROW_EX(
         listenSocket_.bindAndListen(ifAddrSockAddr, resolvedIfName),
         ncclLogData_);
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "CTRAN-IB: Rank {} created listen socket based on a self-finding address {}",
@@ -175,7 +175,7 @@ void CtranSocket::init(const SocketServerAddr& serverAddr) {
     // use provided addr(i.e. ip, port, host) to initialize ctranSocket
     auto serverAddrSockAddr = toSocketAddress(serverAddr);
     listenSocket_.bindAndListen(serverAddrSockAddr, serverAddr.ifName);
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "CTRAN-SOCKET: Rank {} created listen socket based on provided address {} "
@@ -185,7 +185,7 @@ void CtranSocket::init(const SocketServerAddr& serverAddr) {
         serverAddr.ifName);
   }
   listenThread_ = std::thread{[this]() { bootstrapAccept(); }};
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-SOCKET: created SOCKET backend {} for commHash {} commDesc {}",
@@ -213,7 +213,7 @@ void CtranSocket::bootstrapAccept() {
         std::move(maybeSocket.value()));
     FB_SYSCHECKTHROW_EX(socket->recv(&peerRank, sizeof(int)), ncclLogData_);
 
-    CLOGF_SUBSYS(
+    CTRAN_LOG_SUBSYS(
         INFO,
         INIT,
         "CTRAN-SOCKET: Established connection: commHash {:x}, commDesc {}, "
@@ -230,7 +230,7 @@ void CtranSocket::bootstrapAccept() {
         updateSocket(std::move(socket), peerRank), comm->logMetaData_);
   }
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-SOCKET: Listen thread terminating for commHash {:x}, commDesc {}, rank {}",
@@ -277,7 +277,7 @@ commResult_t CtranSocket::bootstrapConnect(
     goto exit;
   }
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTRAN-SOCKET: Established connection: commHash {:x}, commDesc {}, pimpl {}, "
@@ -304,8 +304,8 @@ commResult_t CtranSocket::updateSocket(
     int peerRank) {
   auto locked = socketMaps_.wlock();
   if (locked->rankToSocket.find(peerRank) != locked->rankToSocket.end()) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInternalError,
         "CTRAN-SOCKET: socket already exists for peerRank {} in pimpl {} "
         "commHash {:x}, commDesc {}. It likely indicates a NCCL bug.",
         peerRank,
@@ -319,7 +319,8 @@ commResult_t CtranSocket::updateSocket(
 }
 
 bool CtranSocket::addToPendingOpsIfRequired(
-    const ControlMsg& msg,
+    void* payload,
+    std::size_t size,
     int peerRank,
     CtranSocketRequest& req,
     SockPendingOp::OpType opType,
@@ -332,13 +333,13 @@ bool CtranSocket::addToPendingOpsIfRequired(
     // pending queue, because we must issue all ops in order.
     // Otherwise, ctrlMsg may mismatch.
     if (!sock || it != locked->end()) {
-      auto pendingOp = std::make_unique<SockPendingOp>(
-          opType, const_cast<ControlMsg&>(msg), peerRank, req);
-      CLOGF_TRACE(
+      auto pendingOp =
+          std::make_unique<SockPendingOp>(opType, payload, size, peerRank, req);
+      CTRAN_LOG_TRACE(
           COLL,
-          "Enqueue pendingOp {} [{}], peer {}",
+          "CTRAN-SOCKET: enqueue pendingOp {} size {} peer {}",
           opType,
-          msg.toString(),
+          size,
           peerRank);
 
       if (it == locked->end()) {
@@ -393,10 +394,10 @@ commResult_t CtranSocket::progressPendingOps(void) {
     ctran::bootstrap::Socket* sock = getSocket(peerRank);
     for (auto& op : pendingOps) {
       if (op->type == SockPendingOp::OpType::ISEND_CTRL) {
-        CLOGF_TRACE(
+        CTRAN_LOG_TRACE(
             COLL, "CTRAN-SOCKET: socket {} send to {}", (void*)sock, peerRank);
         FB_SYSCHECKRETURN(
-            sock->send((void*)&op->msg, sizeof(ControlMsg)), commInternalError);
+            sock->send(&op->packet, op->packet.wireSize()), commInternalError);
         op->req.complete();
       } else {
         postRecvOp(peerRank, std::move(op));
@@ -429,11 +430,13 @@ commResult_t CtranSocket::progressInternal() {
     continueWhileLoop = false;
     int count = poll(fds.data(), fds.size(), NCCL_CTRAN_SOCKET_POLL_TIMEOUT);
     if (count < 0) {
-      CLOGF_SUBSYS(
-          ERR, COLL, "CTRAN-SOCKET: polling error, errno {}", strerror(errno));
+      CTRAN_ERR(
+          commInternalError,
+          "CTRAN-SOCKET: polling error, errno {}",
+          strerror(errno));
       return commInternalError;
     } else if (count > 0) {
-      CLOGF_TRACE(COLL, "CTRAN-SOCKET: polling returns {} events", count);
+      CTRAN_LOG_TRACE(COLL, "CTRAN-SOCKET: polling returns {} events", count);
       // there's a socket which receives data, let's continue
       continueWhileLoop = true;
     } else {
@@ -444,11 +447,11 @@ commResult_t CtranSocket::progressInternal() {
         // let's read it, and dequeue a posted recv from the queue
         ctran::bootstrap::Socket* socket = getSocket(peerRanks[fid]);
         auto& recvQueue = getRecvCtrlQueue(peerRanks[fid]);
-        std::unique_ptr<ControlMsg> msg = std::make_unique<ControlMsg>();
-        int bytes_read = doRecvMsg(socket, peerRanks[fid], msg.get());
-        if (bytes_read < 0) {
-          return commInternalError;
-        } else if (bytes_read == 0) {
+        std::optional<SocketCtrlPacket> packet;
+        bool connectionClosed = false;
+        FB_COMMCHECK(
+            doRecvMsg(socket, peerRanks[fid], packet, &connectionClosed));
+        if (connectionClosed) {
           // If any peer closes the connection and the socket is removed, we
           // will break the outer loop since the vector of pollfds has to be
           // re-constructed. However, we'll continue the inner loop to receive
@@ -456,30 +459,33 @@ commResult_t CtranSocket::progressInternal() {
           continueWhileLoop = false;
           continue;
         }
+        if (!packet) {
+          // Frame arrived in pieces; the remainder is picked up on a later
+          // poll.
+          continue;
+        }
         if (recvQueue.postedOps_.empty()) {
           // no posted op, let's read it and store as unexpected msg
-          CLOGF_TRACE(
+          CTRAN_LOG_TRACE(
               COLL,
-              "CTRAN-SOCKET: Received ctrl-msg {} from peer {}, size {}, add to unexpected msg queue",
-              msg->toString(),
+              "CTRAN-SOCKET: received control packet from peer {}, size {}, add to unexpected msg queue",
               peerRanks[fid],
-              bytes_read);
-          recvQueue.unexpMsgs_.push_back(std::move(msg));
+              packet->payloadSize);
+          recvQueue.unexpMsgs_.push_back(
+              std::make_unique<SocketCtrlPacket>(std::move(*packet)));
         } else {
           auto op = dequeFront(recvQueue.postedOps_);
-          op->msg = *msg;
+          FB_COMMCHECK(copyPacketToRecvOp(*packet, *op, peerRanks[fid]));
           op->req.complete();
-          CLOGF_TRACE(
+          CTRAN_LOG_TRACE(
               COLL,
-              "CTRAN-SOCKET: Received ctrl-msg {} from peer {}, size {}, complete a posted recv",
-              op->msg.toString(),
+              "CTRAN-SOCKET: received control packet from peer {}, size {}, complete a posted recv",
               peerRanks[fid],
-              bytes_read);
+              packet->payloadSize);
         }
       } else if (fds[fid].revents != 0) {
-        CLOGF_SUBSYS(
-            ERR,
-            COLL,
+        CTRAN_ERR(
+            commInternalError,
             "CTRAN-SOCKET: unexpected poll event {} rank {}",
             fds[fid].revents,
             peerRanks[fid]);
@@ -490,12 +496,31 @@ commResult_t CtranSocket::progressInternal() {
   return commSuccess;
 }
 
+commResult_t CtranSocket::checkCtrlPayload(
+    const void* payload,
+    std::size_t size,
+    const char* dir) {
+  if ((size > 0 && payload == nullptr) || size > CTRAN_CTRL_MAX_PAYLOAD_SIZE) {
+    CTRAN_ERR(
+        commInvalidArgument,
+        "CTRAN-SOCKET: invalid {} control payload {} size {} (max {})",
+        dir,
+        payload,
+        size,
+        CTRAN_CTRL_MAX_PAYLOAD_SIZE);
+    return commInvalidArgument;
+  }
+  return commSuccess;
+}
+
 commResult_t CtranSocket::isendCtrlMsgImpl(
-    const ControlMsg& msg,
+    const void* payload,
+    std::size_t size,
     int peerRank,
     const SocketServerAddr& peerServerAddr,
     CtranSocketRequest& req) {
   FB_COMMCHECK(checkValidPeer(peerRank));
+  FB_COMMCHECK(checkCtrlPayload(payload, size, "send"));
   ctran::bootstrap::Socket* sock = getSocket(peerRank);
 
   // nullptr socket indicates not yet established connection; try to connect.
@@ -508,18 +533,27 @@ commResult_t CtranSocket::isendCtrlMsgImpl(
     sock = getSocket(peerRank);
   }
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "CTRAN-SOCKET: isendCtrlMsgImpl to {} socket: {}",
       peerRank,
       (void*)sock);
 
   if (!addToPendingOpsIfRequired(
-          msg, peerRank, req, SockPendingOp::OpType::ISEND_CTRL, sock)) {
-    CLOGF_TRACE(
+          const_cast<void*>(payload),
+          size,
+          peerRank,
+          req,
+          SockPendingOp::OpType::ISEND_CTRL,
+          sock)) {
+    SocketCtrlPacket packet;
+    FB_CHECKABORT(
+        packet.copyFrom(payload, size),
+        "validated Socket control payload must fit in a packet");
+    CTRAN_LOG_TRACE(
         COLL, "CTRAN-SOCKET: socket {} send to {}", (void*)sock, peerRank);
     FB_SYSCHECKRETURN(
-        sock->send((void*)&msg, sizeof(ControlMsg)), commInternalError);
+        sock->send(&packet, packet.wireSize()), commInternalError);
     req.complete();
   }
 
@@ -527,11 +561,13 @@ commResult_t CtranSocket::isendCtrlMsgImpl(
 }
 
 commResult_t CtranSocket::irecvCtrlMsgImpl(
-    ControlMsg& msg,
+    void* payload,
+    std::size_t size,
     int peerRank,
     const SocketServerAddr& peerServerAddr,
     CtranSocketRequest& req) {
   FB_COMMCHECK(checkValidPeer(peerRank));
+  FB_COMMCHECK(checkCtrlPayload(payload, size, "receive"));
   ctran::bootstrap::Socket* sock = getSocket(peerRank);
 
   // nullptr socket indicates not yet established connection; try to connect.
@@ -544,43 +580,122 @@ commResult_t CtranSocket::irecvCtrlMsgImpl(
     sock = getSocket(peerRank);
   }
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "CTRAN-SOCKET: irecvCtrlMsgImpl from {} socket: {}",
       peerRank,
       (void*)sock);
 
   if (!addToPendingOpsIfRequired(
-          msg, peerRank, req, SockPendingOp::OpType::IRECV_CTRL, sock)) {
+          payload,
+          size,
+          peerRank,
+          req,
+          SockPendingOp::OpType::IRECV_CTRL,
+          sock)) {
     auto recvop = std::make_unique<SockPendingOp>(
-        SockPendingOp::OpType::IRECV_CTRL, msg, peerRank, req);
+        SockPendingOp::OpType::IRECV_CTRL, payload, size, peerRank, req);
     postRecvOp(peerRank, std::move(recvop));
   }
 
   return commSuccess;
 }
 
-int CtranSocket::doRecvMsg(
+commResult_t CtranSocket::doRecvMsg(
     ctran::bootstrap::Socket* socket,
     int peerRank,
-    ControlMsg* msg) {
-  int bytes_read = socket->recvAsync((void*)msg, sizeof(ControlMsg));
-  if (bytes_read < 0) {
-    CLOGF_SUBSYS(
-        ERR,
-        COLL,
+    std::optional<SocketCtrlPacket>& packet,
+    bool* closed) {
+  packet.reset();
+  *closed = false;
+  auto& state = rankToRecvFrameMap_[peerRank];
+
+  // recvAsync returns -1 both for a real failure and for a would-block, so the
+  // two are separated on errno here. A would-block just means the rest of the
+  // frame has not arrived; state carries the progress to the next poll.
+  auto recvStage = [&](void* dst, std::size_t remaining, std::size_t* done) {
+    int bytesRead = socket->recvAsync(dst, remaining);
+    if (bytesRead > 0) {
+      *done += static_cast<std::size_t>(bytesRead);
+      return commSuccess;
+    }
+    if (bytesRead == 0) {
+      *closed = true;
+      return commSuccess;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+      return commSuccess;
+    }
+    CTRAN_ERR(
+        commInternalError,
         "CTRAN-SOCKET: peer {} socket recvAsync failure, errno {}",
         peerRank,
         strerror(errno));
-  } else if (bytes_read == 0) {
-    CLOGF_SUBSYS(
-        WARN,
-        COLL,
-        "CTRAN-SOCKET: peer {} closed connection, remove socket",
-        peerRank);
-    removeSocket(peerRank);
+    return commInternalError;
+  };
+
+  auto finishPartialRead = [&]() {
+    if (*closed) {
+      CTRAN_LOG_SUBSYS(
+          WARN,
+          COLL,
+          "CTRAN-SOCKET: peer {} closed connection, remove socket",
+          peerRank);
+      rankToRecvFrameMap_.erase(peerRank);
+      removeSocket(peerRank);
+    }
+    return commSuccess;
+  };
+
+  if (state.headerBytes < sizeof(state.packet.payloadSize)) {
+    auto* header = reinterpret_cast<char*>(&state.packet.payloadSize);
+    FB_COMMCHECK(recvStage(
+        header + state.headerBytes,
+        sizeof(state.packet.payloadSize) - state.headerBytes,
+        &state.headerBytes));
+    if (*closed || state.headerBytes < sizeof(state.packet.payloadSize)) {
+      return finishPartialRead();
+    }
+    if (state.packet.payloadSize > CTRAN_CTRL_MAX_PAYLOAD_SIZE) {
+      CTRAN_ERR(
+          commInternalError,
+          "CTRAN-SOCKET: peer {} sent oversized control payload {} (max {})",
+          peerRank,
+          state.packet.payloadSize,
+          CTRAN_CTRL_MAX_PAYLOAD_SIZE);
+      return commInternalError;
+    }
   }
-  return bytes_read;
+
+  if (state.payloadBytes < state.packet.payloadSize) {
+    FB_COMMCHECK(recvStage(
+        state.packet.payload.data() + state.payloadBytes,
+        state.packet.payloadSize - state.payloadBytes,
+        &state.payloadBytes));
+    if (*closed || state.payloadBytes < state.packet.payloadSize) {
+      return finishPartialRead();
+    }
+  }
+
+  packet = state.packet;
+  rankToRecvFrameMap_.erase(peerRank);
+  return commSuccess;
+}
+
+commResult_t CtranSocket::copyPacketToRecvOp(
+    const SocketCtrlPacket& packet,
+    SockPendingOp& recvOp,
+    int peerRank) {
+  if (!packet.copyTo(recvOp.payload, recvOp.size)) {
+    CTRAN_ERR(
+        commInternalError,
+        "CTRAN-SOCKET: control payload size mismatch from peer {}: received {}, expected {}",
+        peerRank,
+        packet.payloadSize,
+        recvOp.size);
+    return commInternalError;
+  }
+  return commSuccess;
 }
 
 commResult_t CtranSocket::postRecvOp(
@@ -592,13 +707,13 @@ commResult_t CtranSocket::postRecvOp(
     recvQueue.postedOps_.push_back(std::move(recvop));
   } else {
     auto unexpMsg = dequeFront(recvQueue.unexpMsgs_);
-    recvop->msg = *unexpMsg;
+    FB_COMMCHECK(copyPacketToRecvOp(*unexpMsg, *recvop, peerRank));
     FB_COMMCHECK(recvop->req.complete());
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
-        "CTRAN-SOCKET: Received ctrl-msg {} from peer {}, complete a posted recv",
-        recvop->msg.toString(),
-        peerRank);
+        "CTRAN-SOCKET: received control packet from peer {}, size {}, complete a posted recv",
+        peerRank,
+        unexpMsg->payloadSize);
   }
   return commSuccess;
 }

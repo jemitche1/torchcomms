@@ -20,10 +20,12 @@
 
 #include <glog/logging.h>
 
+#include "comms/common/fault_tolerance/Abort.h"
 #include "comms/prims/bootstrap/NvlBootstrapAdapter.h"
 #include "comms/prims/memory/CuMemAllocation.h"
 #include "comms/prims/topology/TopologyDiscovery.h"
 #include "comms/prims/transport/MultiPeerDeviceHandle.cuh"
+#include "comms/utils/CudaRAII.h"
 
 namespace comms::prims {
 
@@ -51,6 +53,16 @@ namespace {
     }                                                                          \
   } while (0)
 
+comms::fault_tolerance::AbortDevice makeAbortDeviceHandle(
+    const std::shared_ptr<comms::fault_tolerance::Abort>& abort,
+    int deviceId) {
+  if (abort == nullptr || !abort->isEnabled()) {
+    return comms::fault_tolerance::AbortDevice{};
+  }
+  meta::comms::CudaDeviceGuard guard{deviceId};
+  return abort->getDeviceHandle();
+}
+
 } // namespace
 
 MultiPeerTransport::MultiPeerTransport(
@@ -59,12 +71,14 @@ MultiPeerTransport::MultiPeerTransport(
     int deviceId,
     std::shared_ptr<meta::comms::IBootstrap> bootstrap,
     const MultiPeerTransportConfig& config,
-    std::optional<TopologyResult> topo)
+    std::optional<TopologyResult> topo,
+    std::shared_ptr<comms::fault_tolerance::Abort> abort)
     : myRank_(myRank),
       nRanks_(nRanks),
       deviceId_(deviceId),
-      ibLazyConnect_(config.ibConfig.ibLazyConnect),
-      bootstrap_(std::move(bootstrap)) {
+      bootstrap_(std::move(bootstrap)),
+      abort_(std::move(abort)),
+      abortDevice_(makeAbortDeviceHandle(abort_, deviceId_)) {
   if (!topo.has_value()) {
     TopologyDiscovery topoDiscovery;
     topo = topoDiscovery.discover(
@@ -161,7 +175,11 @@ void MultiPeerTransport::initFromTopology(
         bootstrap_, std::move(localRankToCommRank));
 
     nvlTransport_ = std::make_unique<MultiPeerNvlTransport>(
-        nvlLocalRank_, nvlNRanks_, nvlBootstrapAdapter_, config.nvlConfig);
+        nvlLocalRank_,
+        nvlNRanks_,
+        deviceId_,
+        nvlBootstrapAdapter_,
+        config.nvlConfig);
     VLOG(1) << "MultiPeerTransport: rank " << myRank_
             << " created NVL sub-transport, nvlNRanks=" << nvlNRanks_
             << " nvlLocalRank=" << nvlLocalRank_;
@@ -191,6 +209,30 @@ void MultiPeerTransport::initFromTopology(
 
 MultiPeerTransport::~MultiPeerTransport() {
   free_device_handle();
+}
+
+std::optional<int> MultiPeerTransport::ibgda_max_groups() const {
+  if (!ibgdaTransport_) {
+    return std::nullopt;
+  }
+  return ibgdaTransport_->maxGroups();
+}
+
+std::optional<int> MultiPeerTransport::ibgda_pipeline_depth() const {
+  if (!ibgdaTransport_) {
+    return std::nullopt;
+  }
+  return ibgdaTransport_->pipelineDepth();
+}
+
+std::optional<int> MultiPeerTransport::ib_max_num_channels() const {
+  if (ibgdaTransport_) {
+    return ibgdaTransport_->maxNumChannels();
+  }
+  if (ibrcTransport_) {
+    return ibrcTransport_->maxNumChannels();
+  }
+  return std::nullopt;
 }
 
 void MultiPeerTransport::setExternalNvlDataBuffers(
@@ -267,29 +309,31 @@ Transport* /*nullable*/ MultiPeerTransport::get_nvl_transports_array() const {
   return nvlTransport_->getDeviceTransports().data();
 }
 
+bool MultiPeerTransport::has_multimem_nvl_transport() const {
+  // nvlTransport_ is legitimately null in normal builds without an NVL domain
+  // (e.g. nRanks == 1), same as get_nvl_transports_array() above; the null
+  // check is not masking an invariant.
+  return nvlTransport_ && nvlTransport_->hasMultimemNvlTransport();
+}
+
+bool MultiPeerTransport::initialize_multimem_nvl_transport() const {
+  return nvlTransport_ &&
+      nvlTransport_->initializeMultimemNvlTransportIfEligible();
+}
+
+MultimemNvlTransportDevice
+MultiPeerTransport::get_multimem_nvl_transport_device() const {
+  // The getter is local after collective initialization succeeds.
+  if (!has_multimem_nvl_transport()) {
+    throw std::runtime_error(
+        "MultiPeerTransport: multimem NVL transport is not initialized");
+  }
+  return nvlTransport_->getMultimemNvlTransportDevice();
+}
+
 P2pSelfTransportDevice MultiPeerTransport::get_p2p_self_transport_device()
     const {
   return P2pSelfTransportDevice{};
-}
-
-MultiPeerDeviceHandle MultiPeerTransport::get_device_handle() const {
-  if (!deviceHandleBuilt_) {
-    throw std::runtime_error(
-        "MultiPeerTransport::get_device_handle() called before exchange()");
-  }
-  if (ibLazyConnect_) {
-    throw std::runtime_error(
-        "get_device_handle() cannot be used with lazy mode (ibLazyConnect=true). "
-        "Use get_device_handle(peers) or getP2pTransportDevice(peerRank).");
-  }
-
-  return MultiPeerDeviceHandle{
-      myRank_,
-      nRanks_,
-      {transportsGpu_, static_cast<uint32_t>(nRanks_)},
-      static_cast<int>(nvlPeerRanks_.size()),
-      static_cast<int>(ibPeerRanks_.size()),
-  };
 }
 
 MultiPeerDeviceHandle MultiPeerTransport::get_device_handle(
@@ -298,18 +342,21 @@ MultiPeerDeviceHandle MultiPeerTransport::get_device_handle(
     throw std::runtime_error(
         "MultiPeerTransport::get_device_handle(peers) called before exchange()");
   }
-  materializePeers(peers);
+  if (!peers.empty()) {
+    materializePeers(peers);
+  }
   return MultiPeerDeviceHandle{
       myRank_,
       nRanks_,
       {transportsGpu_, static_cast<uint32_t>(nRanks_)},
+      abortDevice_,
       static_cast<int>(nvlPeerRanks_.size()),
       static_cast<int>(ibPeerRanks_.size()),
   };
 }
 
 bool MultiPeerTransport::is_lazy_mode() const {
-  return ibLazyConnect_;
+  return true;
 }
 
 void MultiPeerTransport::materializePeers(const std::vector<int>& peers) {
@@ -349,6 +396,56 @@ IbgdaLocalBuffer MultiPeerTransport::localRegisterIbgdaBuffer(
   }
   throw std::runtime_error(
       "localRegisterIbgdaBuffer: IB transport not available");
+}
+
+IbBufferRegistrationLease MultiPeerTransport::registerIbBulkBuffer(
+    void* ptr,
+    std::size_t size) {
+  if (ibgdaTransport_) {
+    return ibgdaTransport_->registerIbBulkBuffer(ptr, size);
+  }
+  if (ibrcTransport_) {
+    return ibrcTransport_->registerIbBulkBuffer(ptr, size);
+  }
+  throw std::runtime_error("registerIbBulkBuffer: IB transport not available");
+}
+
+std::optional<IbBufferRegistrationView> MultiPeerTransport::lookupIbBulkBuffer(
+    const IbBufferRegistrationLease& lease,
+    void* ptr,
+    std::size_t size) const {
+  if (ibgdaTransport_) {
+    return ibgdaTransport_->lookupIbBulkBuffer(lease, ptr, size);
+  }
+  if (ibrcTransport_) {
+    return ibrcTransport_->lookupIbBulkBuffer(lease, ptr, size);
+  }
+  return std::nullopt;
+}
+
+void MultiPeerTransport::deregisterIbBulkBuffer(
+    IbBufferRegistrationLease& lease) {
+  if (ibgdaTransport_) {
+    ibgdaTransport_->deregisterIbBulkBuffer(lease);
+    return;
+  }
+  if (ibrcTransport_) {
+    ibrcTransport_->deregisterIbBulkBuffer(lease);
+    return;
+  }
+  throw std::runtime_error(
+      "deregisterIbBulkBuffer: IB transport not available");
+}
+
+bool MultiPeerTransport::isIbBulkBufferViewActive(
+    const IbBufferRegistrationView& view) const {
+  if (ibgdaTransport_) {
+    return ibgdaTransport_->isIbBulkBufferViewActive(view);
+  }
+  if (ibrcTransport_) {
+    return ibrcTransport_->isIbBulkBufferViewActive(view);
+  }
+  return false;
 }
 
 void MultiPeerTransport::localDeregisterIbgdaBuffer(void* ptr) {
@@ -416,10 +513,10 @@ void MultiPeerTransport::freeIbCounterBuffer(
     ibgdaTransport_->deregisterBuffer(buffer.ptr);
   }
   if (hostPtr != nullptr) {
-    cudaFreeHost(hostPtr);
+    (void)cudaFreeHost(hostPtr);
     hostPtr = nullptr;
   } else {
-    cudaFree(buffer.ptr);
+    (void)cudaFree(buffer.ptr);
   }
   buffer = IbgdaLocalBuffer{};
 }
@@ -638,7 +735,7 @@ void MultiPeerTransport::build_device_handle() {
 
 void MultiPeerTransport::free_device_handle() {
   if (transportsGpu_) {
-    cudaFree(transportsGpu_);
+    (void)cudaFree(transportsGpu_);
     transportsGpu_ = nullptr;
   }
   deviceHandleBuilt_ = false;

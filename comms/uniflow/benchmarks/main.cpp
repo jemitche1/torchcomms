@@ -13,15 +13,22 @@
 #include "comms/uniflow/benchmarks/Rendezvous.h"
 #include "comms/uniflow/benchmarks/Reporter.h"
 #include "comms/uniflow/benchmarks/bench/RdmaBandwidthBenchmark.h"
+#include "comms/uniflow/benchmarks/bench/SendRecvBandwidthBenchmark.h"
 #include "comms/uniflow/logging/Logger.h"
-// ConnectionSetup/NVLink/NcclSendRecv/SendRecv benchmarks are NVIDIA-only
-// (NVLink/NCCL transports, or not yet wired for the AMD/hipify build) and are
-// compiled out on AMD.
+
+// ConnectionSetup/NVLink/NcclSendRecv benchmarks are NVIDIA-only (they depend
+// on the NVLink transport or NCCL) and are compiled out on AMD. The SendRecv
+// bandwidth benchmark is hipified and built on both platforms.
 #ifndef __HIP_PLATFORM_AMD__
 #include "comms/uniflow/benchmarks/bench/ConnectionSetupBenchmark.h"
 #include "comms/uniflow/benchmarks/bench/NVLinkBandwidthBenchmark.h"
 #include "comms/uniflow/benchmarks/bench/NcclSendRecvBenchmark.h"
-#include "comms/uniflow/benchmarks/bench/SendRecvBandwidthBenchmark.h"
+#else
+// AMD intra-node tier (HIP IPC over XGMI). Its target is only in
+// uniflow_bench's deps under ovr_config//gpu:amd, so the include must be
+// guarded to match -- unguarded it breaks the NVIDIA build with a missing
+// header.
+#include "comms/uniflow/benchmarks/bench/XgmiBandwidthBenchmark.h"
 #endif
 
 namespace {
@@ -405,10 +412,13 @@ int main(int argc, char** argv) {
       std::make_unique<uniflow::benchmark::NVLinkBandwidthBenchmark>());
   runner.registerBenchmark(
       std::make_unique<uniflow::benchmark::NcclSendRecvBenchmark>());
+#else
+  runner.registerBenchmark(
+      std::make_unique<uniflow::benchmark::XgmiBandwidthBenchmark>());
+#endif
   runner.registerBenchmark(
       std::make_unique<uniflow::benchmark::SendRecvBandwidthBenchmark>(
           opts.rdmaDevices));
-#endif
 
   if (opts.benchmark == "__list__") {
     std::cout << "Available benchmarks:\n";

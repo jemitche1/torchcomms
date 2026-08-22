@@ -1,6 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 
@@ -12,18 +14,20 @@
 #include "comms/ctran/colltrace/MapperTrace.h"
 #include "comms/ctran/gpe/CtranChecksum.h"
 #include "comms/ctran/gpe/CtranGpe.h"
+#include "comms/ctran/gpe/CtranGpeColltrace.h"
 #include "comms/ctran/gpe/CtranGpeDev.h"
 #include "comms/ctran/gpe/CtranGpeImpl.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/utils/Checks.h"
+#include "comms/ctran/utils/CtranLogUtils.h"
 #include "comms/ctran/utils/CudaWrap.h"
 #include "comms/ctran/utils/Debug.h"
 #include "comms/ctran/utils/Exception.h"
 #include "comms/ctran/utils/ExtUtils.h"
 
 #include "comms/utils/colltrace/CollRecord.h"
+#include "comms/utils/colltrace/ColltraceDeviceHandle.h"
 #include "comms/utils/cvars/nccl_cvars.h"
-#include "comms/utils/logger/LogUtils.h"
 
 using namespace ctran;
 using namespace ncclx::colltrace;
@@ -41,7 +45,29 @@ static std::unordered_map<KernelConfig::KernelType, const std::string>
         {KernelConfig::KernelType::ALLTOALLV, "AllToAllv"},
 };
 
-CtranGpe::Impl::Impl() {
+// Gated on mixing=0: at mixing=1 the guard's fence is a floating
+// EVENT_RECORD node awaited with cudaEventWaitExternal so it can order across
+// graphs, and GraphSideStream::fork_from deliberately restores the user
+// stream's dependencies after its fork (leaving no join edge) -- the opposite
+// of the kept join edge the spine needs. Silently ignoring the knob at
+// mixing=1 keeps that path byte-identical rather than producing a graph with
+// both a spine and a floating fence.
+static bool hostNodeSideStreamEnabled() {
+  if (!NCCL_CTRAN_GPE_HOST_NODE_SIDE_STREAM) {
+    return false;
+  }
+  if (NCCL_CTRAN_GRAPH_MIXING_SUPPORT != 0) {
+    CTRAN_LOG(
+        INFO,
+        "CTRAN-GPE: NCCL_CTRAN_GPE_HOST_NODE_SIDE_STREAM ignored because "
+        "NCCL_CTRAN_GRAPH_MIXING_SUPPORT={} (requires 0)",
+        NCCL_CTRAN_GRAPH_MIXING_SUPPORT);
+    return false;
+  }
+  return true;
+}
+
+CtranGpe::Impl::Impl() : hostNodeSpine_{hostNodeSideStreamEnabled()} {
   this->kernelFlagPool = std::unique_ptr<KernelFlagPool>(
       new KernelFlagPool(NCCL_CTRAN_NUM_KERNEL_FLAGS));
 
@@ -56,64 +82,6 @@ CtranGpe::Impl::Impl() {
 }
 
 CtranGpe::Impl::~Impl() = default;
-
-void OrderedWorkStreamGuard::init(const CommLogData& logMetaData) {
-  logMetaData_ = &logMetaData;
-  FB_CUDACHECKTHROW_EX(
-      cudaEventCreateWithFlags(&execModeSyncEvent_, cudaEventDisableTiming),
-      logMetaData);
-  sideStream_ = std::make_unique<meta::comms::GraphSideStream>();
-}
-
-OrderedWorkStreamGuard::~OrderedWorkStreamGuard() {
-  FB_CHECKABORT(
-      logMetaData_ != nullptr,
-      "OrderedWorkStreamGuard destroyed without init()");
-  FB_CUDACHECKTHROW_EX(cudaEventDestroy(execModeSyncEvent_), *logMetaData_);
-}
-
-OrderedWorkStreamGuard::Scope::Scope(
-    OrderedWorkStreamGuard& guard,
-    cudaStream_t userStream,
-    const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo)
-    : guard_(&guard), userStream_(userStream), captureInfo_(captureInfo) {
-  status_ = guard_->doAcquire(userStream_, captureInfo_);
-}
-
-OrderedWorkStreamGuard::Scope::~Scope() {
-  if (guard_) {
-    guard_->doRelease(userStream_, captureInfo_);
-  }
-}
-
-OrderedWorkStreamGuard::Scope::Scope(Scope&& other) noexcept
-    : guard_(other.guard_),
-      userStream_(other.userStream_),
-      captureInfo_(other.captureInfo_),
-      status_(other.status_) {
-  other.guard_ = nullptr;
-}
-
-OrderedWorkStreamGuard::Scope& OrderedWorkStreamGuard::Scope::operator=(
-    Scope&& other) noexcept {
-  if (this != &other) {
-    if (guard_) {
-      guard_->doRelease(userStream_, captureInfo_);
-    }
-    guard_ = other.guard_;
-    userStream_ = other.userStream_;
-    captureInfo_ = other.captureInfo_;
-    status_ = other.status_;
-    other.guard_ = nullptr;
-  }
-  return *this;
-}
-
-OrderedWorkStreamGuard::Scope OrderedWorkStreamGuard::acquire(
-    cudaStream_t userStream,
-    const ctran::utils::cudagraph::StreamCaptureInfo& captureInfo) {
-  return Scope(*this, userStream, captureInfo);
-}
 
 void CUDART_CB CtranGpe::Impl::cmdCb(void* data) {
   CtranGpeCmd* cmd = reinterpret_cast<CtranGpeCmd*>(data);
@@ -154,7 +122,7 @@ CtranGpeCmd::~CtranGpeCmd() {
 void CUDART_CB CtranGpe::Impl::cmdDestroy(void* data) {
   CtranGpeCmd* cmd = reinterpret_cast<CtranGpeCmd*>(data);
   if (!cmd->persistent) {
-    CLOGF(WARN, "CTranGPE: cmd desctructor called for non-persistent cmd");
+    CTRAN_LOG(WARN, "CTranGPE: cmd desctructor called for non-persistent cmd");
   }
   // Erase the registry entry BEFORE waiting on inFlight: erase() and the
   // worker's lookupAndFire() are mutually exclusive under the registry lock, so
@@ -178,105 +146,6 @@ void CUDART_CB CtranGpe::Impl::cmdDestroy(void* data) {
   delete cmd;
 }
 
-commResult_t OrderedWorkStreamGuard::doAcquire(
-    cudaStream_t userStream,
-    const utils::cudagraph::StreamCaptureInfo& captureInfo) {
-  const bool isCapturing = captureInfo.status == cudaStreamCaptureStatusActive;
-
-  bool isNewCapture = isCapturing && captureInfo.id != lastCaptureId_;
-  if (isNewCapture) {
-    lastCaptureId_ = captureInfo.id;
-    everCaptured_ = true;
-  }
-
-  auto doWait = [&]() -> commResult_t {
-    FB_CUDACHECK(cudaStreamWaitEvent(
-        userStream,
-        execModeSyncEvent_,
-        isCapturing ? cudaEventWaitExternal : cudaEventWaitDefault));
-    return commSuccess;
-  };
-
-  if (lastUserStream_ == nullptr) {
-    if (isCapturing) {
-      return doWait();
-    }
-    return commSuccess; // first submit ever
-  }
-
-  if (!isCapturing) {
-    if (everCaptured_) {
-      // Graph replays bypass submit(), so we cannot know for certain whether
-      // the previous operation was a graph replay or eager. CPU-side sync
-      // ensures any in-flight graph host node (which enqueues a GPE command)
-      // has fired before the caller can cmdEnqueue. Without this, the eager
-      // command lands in the GPE queue first and the single-threaded GPE
-      // deadlocks.
-      FB_CUDACHECK(cudaEventSynchronize(execModeSyncEvent_));
-    } else if (userStream != lastUserStream_) {
-      // Cross-stream eager, no graphs: GPU-side ordering only.
-      // We don't make any thread-safety guarantees for submit()
-      // so this is sufficient.
-      FB_COMMCHECK(doWait());
-    }
-    return commSuccess;
-  }
-
-  if (!isNewCapture) {
-    // Intra-capture cross-stream: add the RECORD node from the previous
-    // doRelease as a capture dependency of this stream. This creates an
-    // explicit graph edge, since cudaStreamWaitEvent cannot see RECORD
-    // nodes added via cudaGraphAddEventRecordNode.
-#if defined(__HIP_PLATFORM_AMD__)
-    FB_CUDACHECK(cudaStreamUpdateCaptureDependencies(
-        userStream, &lastRecordNode_, 1, hipStreamAddCaptureDependencies));
-#elif CUDART_VERSION >= 13000
-    FB_CUDACHECK(cudaStreamUpdateCaptureDependencies(
-        userStream,
-        &lastRecordNode_,
-        nullptr,
-        1,
-        cudaStreamAddCaptureDependencies));
-#else
-    FB_CUDACHECK(cudaStreamUpdateCaptureDependencies(
-        userStream, &lastRecordNode_, 1, cudaStreamAddCaptureDependencies));
-#endif
-  }
-
-  return doWait();
-}
-
-commResult_t OrderedWorkStreamGuard::doRelease(
-    cudaStream_t userStream,
-    const utils::cudagraph::StreamCaptureInfo& captureInfo) {
-  const bool isCapturing = captureInfo.status == cudaStreamCaptureStatusActive;
-
-  if (!isCapturing) {
-    FB_CUDACHECK(cudaEventRecord(execModeSyncEvent_, userStream));
-  } else {
-    // Route the external EVENT_RECORD node onto a side stream so its
-    // release fence doesn't stall unrelated work on userStream between
-    // ctran submissions. The next doAcquire on userStream still sees
-    // lastRecordNode_ via cudaStreamUpdateCaptureDependencies, which
-    // reinstates the explicit DAG edge ordering the next ctran op after
-    // this record. Non-ctran work on userStream is not serialized
-    // behind the record.
-    commResult_t innerRes = commSuccess;
-    FB_CUDACHECK(
-        sideStream_->fork_from(userStream, [&](cudaStream_t sideStream) {
-          innerRes = utils::cudagraph::addEventRecordNodeToCapture(
-              sideStream, captureInfo.g, execModeSyncEvent_, &lastRecordNode_);
-        }));
-    if (innerRes != commSuccess) {
-      return innerRes;
-    }
-  }
-
-  lastUserStream_ = userStream;
-
-  return commSuccess;
-}
-
 commResult_t CtranGpe::Impl::submit(
     CtranGpeCmd::TypeEnum type,
     std::vector<std::unique_ptr<struct OpElem>> opGroup,
@@ -288,8 +157,8 @@ commResult_t CtranGpe::Impl::submit(
 
   // Error checking before GPE cmd and kernel submission
   if (kernelConfig.args.devState_d == nullptr) {
-    CLOGF(
-        ERR,
+    CTRAN_ERR(
+        commInternalError,
         "COMM internally passed invalid devState_d (nullptr) to kernel {}",
         kernelTypeToName[kernelConfig.type]);
     return commInternalError;
@@ -303,6 +172,20 @@ commResult_t CtranGpe::Impl::submit(
           kernelConfig.stream, streamCaptureInfo));
   bool isCapturing = streamCaptureInfo.status == cudaStreamCaptureStatusActive;
 
+  // Only graph tracing on sm_90+ creates the ring consumed by the kernel.
+  const bool useInKernelColltrace = ctran::gpe::inKernelColltraceSupported() &&
+      isCapturing && NCCL_COLLTRACE_TRACE_CUDA_GRAPH;
+  // Single-kernel collectives emit both boundaries (the KernelConfig defaults);
+  // multi-kernel collectives (the AllGatherP pipeline) set these per kernel.
+  const bool colltraceEmitStart =
+      useInKernelColltrace && kernelConfig.colltraceEmitStart;
+  const bool colltraceEmitEnd =
+      useInKernelColltrace && kernelConfig.colltraceEmitEnd;
+  // Multi-kernel graph collectives create one record at their start boundary.
+  const bool colltraceCreatesRecord = !isCapturing || colltraceEmitStart;
+  // Boundary-only kernels still need a flag to carry colltraceHdr.
+  const bool colltraceNeedsFlag = colltraceEmitStart || colltraceEmitEnd;
+
   // For eager (non-capture) submits with empty opGroup but a
   // postKernelCleanup, we still need a cmd + kernelFlag so the GPE thread
   // can synchronize with the kernel before running cleanup. During graph
@@ -310,7 +193,13 @@ commResult_t CtranGpe::Impl::submit(
   // retainUserObject, avoiding host-node overhead.
   bool needsKernelFlag = !opGroup.empty() ||
       kernelConfig.unpackPool != nullptr ||
-      (kernelConfig.postKernelCleanup && !isCapturing);
+      (kernelConfig.postKernelCleanup && !isCapturing) || colltraceNeedsFlag;
+
+  // A boundary-only kernel never signals KERNEL_STARTED; retain its flag on
+  // the graph instead of routing it through the GPE worker.
+  const bool colltraceOnlyFlag = isCapturing && needsKernelFlag &&
+      opGroup.empty() && func == nullptr &&
+      kernelConfig.unpackPool == nullptr && !kernelConfig.postKernelCleanup;
 
   auto kernelFlag = needsKernelFlag ? this->kernelFlagPool->pop() : nullptr;
   ctran::gpe::KernelFlagDev* flagDev = nullptr;
@@ -353,11 +242,26 @@ commResult_t CtranGpe::Impl::submit(
   }
 
   // Record CollTrace event. Must be called before moving opGroup to cmd
-  auto colltraceHandle = meta::comms::colltrace::getCollTraceHandle(
-      comm, opGroup, kernelConfig, ifchecksum);
+  std::shared_ptr<meta::comms::colltrace::ICollTraceHandle> colltraceHandle =
+      colltraceCreatesRecord ? meta::comms::colltrace::getCollTraceHandle(
+                                   comm, opGroup, kernelConfig, ifchecksum)
+                             : nullptr;
+
+  // Arm the collective kernel to publish its own start/end timestamps into the
+  // colltrace ring, replacing the host-launched timestamp kernels for the
+  // grouped/self-timing pipeline collective. The header defaults to disabled
+  // (cleared on flag recycle), so kernels that emit nothing fall through.
+  if (useInKernelColltrace && kernelFlag != nullptr) {
+    ctran::gpe::armInKernelColltrace(
+        pendingColltraceGroup_,
+        kernelFlag->dev,
+        colltraceHandle.get(),
+        colltraceEmitStart,
+        colltraceEmitEnd);
+  }
 
   cudaStream_t launchStream = kernelConfig.stream;
-  std::optional<OrderedWorkStreamGuard::Scope> wsScope;
+  std::optional<ctran::algos::OrderedWorkStreamGuard::Scope> wsScope;
 
   // Acquire the work-stream baton before adding the host node so that
   // during graph replay the host node (which enqueues a GPE command) only
@@ -368,7 +272,7 @@ commResult_t CtranGpe::Impl::submit(
   // is stuck behind it in the queue).
   auto maybeAcquireWorkStreamScope = [&]() {
     if (!kernelConfig.canConcurrent) {
-      wsScope = ws_.acquire(kernelConfig.stream, streamCaptureInfo);
+      wsScope.emplace(ws_, kernelConfig.stream, streamCaptureInfo);
       FB_COMMCHECK(wsScope->status());
       launchStream = wsScope->stream();
     }
@@ -378,7 +282,7 @@ commResult_t CtranGpe::Impl::submit(
   size_t opGroupSize = 0;
   // Enqueue op to gpeThread if any op is appended, or if there is a
   // postKernelCleanup that needs to run after the kernel completes.
-  if (needsKernelFlag) {
+  if (needsKernelFlag && !colltraceOnlyFlag) {
     // record opGroup size before moving the object
     opGroupSize = opGroup.size();
     class CtranGpeCmd* cmd = new class CtranGpeCmd;
@@ -395,9 +299,13 @@ commResult_t CtranGpe::Impl::submit(
         cmd->coll.collHandle = colltraceHandle;
       }
       cmd->coll.comm = comm;
+      if (MCCL_COLLECTIVE_STATS_ENABLE) {
+        cmd->coll.statsKey =
+            ctranCollectiveStatsKey(cmd->coll.opGroup, kernelConfig);
+      }
     }
 
-    maybeAcquireWorkStreamScope();
+    FB_COMMCHECK(maybeAcquireWorkStreamScope());
 
     if (isCapturing) {
       cmd->persistent = true;
@@ -417,7 +325,7 @@ commResult_t CtranGpe::Impl::submit(
           auto result =
               comm->ctran_->mapper->teardownUnpackConsumer(unpackPool);
           if (result != commSuccess) {
-            CLOGF_SUBSYS(
+            CTRAN_LOG_SUBSYS(
                 WARN,
                 COLL,
                 "CTRAN-GPE: failed to teardown graph unpack pool {}: result {}",
@@ -442,7 +350,27 @@ commResult_t CtranGpe::Impl::submit(
       cmdEnqueue(cmd);
     }
   } else {
-    maybeAcquireWorkStreamScope();
+    FB_COMMCHECK(maybeAcquireWorkStreamScope());
+  }
+
+  // Colltrace-only graph flag: no GPE cmd is created (the kernel does no GPE
+  // work and never signals the flag), so retain the armed flag on the graph and
+  // reclaim it on destroy — clearPersistent()+reset() makes it reclaimable by
+  // the pool, mirroring what ~CtranGpeCmd does for the cmd path.
+  if (colltraceOnlyFlag) {
+    kernelFlag->setPersistent();
+    FB_COMMCHECKGOTO(
+        utils::cudagraph::retainUserObject(
+            /*obj=*/kernelFlag,
+            /*destroyCallback=*/
+            [](void* p) {
+              auto* f = static_cast<KernelFlagItem*>(p);
+              f->clearPersistent();
+              f->reset();
+            },
+            streamCaptureInfo),
+        res,
+        fail);
   }
 
   // For the no-cmd path during graph capture, retain cleanup on the graph.
@@ -528,7 +456,7 @@ commResult_t CtranGpe::Impl::submit(
     launchConfig.hStream = launchStream;
     CUfunction cuFn;
     FB_CUDACHECKGOTO(cudaGetFuncBySymbol(&cuFn, ncclKernel), res, fail);
-    CLOGF_TRACE(COLL, "CTranGPE: submit {}", kernelConfig.toString());
+    CTRAN_LOG_TRACE(COLL, "CTranGPE: submit {}", kernelConfig.toString());
 
     if (colltraceHandle != nullptr) {
       colltraceHandle->trigger(
@@ -545,18 +473,17 @@ commResult_t CtranGpe::Impl::submit(
     dim3 grid = {kernelConfig.numBlocks, 1, 1};
     dim3 blocks = {kernelConfig.numThreads, 1, 1};
 
-    CLOGF_TRACE(COLL, "CTranGPE: submit {}", kernelConfig.toString());
+    CTRAN_LOG_TRACE(COLL, "CTranGPE: submit {}", kernelConfig.toString());
 
     if (colltraceHandle != nullptr) {
       colltraceHandle->trigger(
           CollTraceHandleTriggerState::BeforeEnqueueKernel);
     }
 
-    // Set the maximum dynamic shared memory size since CtranAlgoDeviceState
-    // (~67KB) exceeds the default limit (48KB)
-    size_t sharedMemBytes = kernelConfig.dynamicSharedMemBytes > 0
-        ? kernelConfig.dynamicSharedMemBytes
-        : sizeof(CtranAlgoDeviceState);
+    // Raise the opt-in dynamic shared memory limit: the 48KB default covers
+    // sizeof(CtranAlgoDeviceState), but a dynamicSharedMemBytes override
+    // need not.
+    const size_t sharedMemBytes = kernelConfig.launchSharedMemBytes();
     FB_CUDACHECKGOTO(
         cudaFuncSetAttribute(
             ncclKernel,
@@ -597,7 +524,7 @@ commResult_t CtranGpe::Impl::submit(
           launchStream);
       if (res != cudaSuccess && checksumItem != nullptr) {
         // Do not return error if the internal checksum fails
-        CLOGF(WARN, "CTranGPE: Failed to launch checksum kernel");
+        CTRAN_LOG(WARN, "CTranGPE: Failed to launch checksum kernel");
         checksumItem->reset();
       } else if (colltraceHandle != nullptr) {
         folly::dynamic dynamicObj = folly::dynamic::object();
@@ -615,7 +542,7 @@ commResult_t CtranGpe::Impl::submit(
     colltraceHandle->trigger(CollTraceHandleTriggerState::AfterEnqueueKernel);
   }
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       COLL,
       "CTRAN-GPE: Launched kernelType {} (opGroup size {}) with kernelFlag={}",
@@ -631,6 +558,10 @@ fail:
   if (kernelFlag != nullptr) {
     kernelFlag->reset();
   }
+  // A failure after arming a Begin would leave an open colltrace group whose
+  // End never submits; clear it so a later collective's End can't consume this
+  // collective's stale collId.
+  pendingColltraceGroup_ = {};
   return res;
 }
 
@@ -671,13 +602,13 @@ commResult_t CtranGpe::Impl::publishCapturedCmd(
     kernelFlag->dev.gpeHdr.cmdId = id;
     kernelFlag->dev.gpeHdr.enabled = 1;
   } else {
-    FB_COMMCHECK(
-        utils::cudagraph::addHostNode(
-            /*data=*/cmd,
-            /*execCallback=*/cmdCb,
-            /*destroyCallback=*/cmdDestroy,
-            stream,
-            streamCaptureInfo));
+    // HostNodeSpine picks the inline or side-stream shape internally.
+    FB_COMMCHECK(hostNodeSpine_.submit(
+        /*data=*/cmd,
+        /*execCallback=*/cmdCb,
+        /*destroyCallback=*/cmdDestroy,
+        stream,
+        streamCaptureInfo));
   }
   return commSuccess;
 }
@@ -703,6 +634,10 @@ commResult_t CtranGpe::Impl::submitHost(
       cmd->coll.opGroup = std::move(opGroup);
       cmd->coll.func = func;
       cmd->coll.comm = comm;
+      if (MCCL_COLLECTIVE_STATS_ENABLE) {
+        cmd->coll.statsKey =
+            ctranCollectiveStatsKey(cmd->coll.opGroup, kernelConfig);
+      }
       auto colltraceHandle = meta::comms::colltrace::getCollTraceHandle(
           comm, cmd->coll.opGroup, kernelConfig, false /* ifChecksum */);
       if (colltraceHandle != nullptr) {
@@ -726,11 +661,14 @@ commResult_t CtranGpe::Impl::submitHost(
 }
 
 void CtranGpe::Impl::start() {
-  ws_.init(comm->logMetaData_);
+  ws_.init(comm->logMetaData_, true /* synchronizeEagerAfterCapturedWork */);
   thread_ = std::thread([this] { gpeThreadFn(); });
 }
 
 void CtranGpe::Impl::terminate() {
+  // Let the worker's kernel-start waits (gpeThreadFn) bail out so a cmd whose
+  // kernel never launches cannot block join() forever.
+  terminating_.store(true, std::memory_order_relaxed);
   class CtranGpeCmd* cmd = new class CtranGpeCmd;
   cmd->type = CtranGpeCmd::TypeEnum::TERMINATE;
 
@@ -763,8 +701,8 @@ void CtranGpe::Impl::terminate() {
     if (now >= nextLog) {
       const auto elapsedSec =
           std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
-      CLOGF_SUBSYS(
-          WARNING,
+      CTRAN_LOG_SUBSYS(
+          WARN,
           INIT,
           "terminate() spin-wait: pools still draining after {}s on rank {} commHash {:x}"
           " -- kernelFlag {}/{} kernelElem {}/{} gpeKernelSync {}/{}."
@@ -784,7 +722,7 @@ void CtranGpe::Impl::terminate() {
     std::this_thread::yield();
   }
 
-  CLOGF_SUBSYS(
+  CTRAN_LOG_SUBSYS(
       INFO,
       INIT,
       "CTranGPE thread joined on rank {} commHash {:x} commDesc {}",
@@ -829,7 +767,7 @@ void CtranGpe::Impl::gpeThreadFn() {
 
       if (cmd->timeout.has_value()) {
         comm->setTimeout(cmd->timeout.value());
-      } else if (auto d = comm->getAbort()->GetDefaultTimeoutDuration();
+      } else if (auto d = comm->getAbort()->getDefaultTimeout();
                  d.has_value()) {
         // Fall back to comm-level default (CUDA-graph replay path).
         comm->setTimeout(*d);
@@ -840,7 +778,7 @@ void CtranGpe::Impl::gpeThreadFn() {
           // must never flip back to not-aborted.
           comm->setAbort();
           const std::string_view reason =
-              comm->getAbort()->TimedOut() ? "timeout" : "explicit";
+              comm->getAbort()->isTimedOut() ? "timeout" : "explicit";
 
           // TERMINATE was marked before SCOPE_EXIT — skip the marker here.
           if (!isTerminateCmd) {
@@ -848,7 +786,7 @@ void CtranGpe::Impl::gpeThreadFn() {
           }
 
           const std::string_view phase = isTerminateCmd ? " now TERMINATE" : "";
-          CLOGF(
+          CTRAN_LOG(
               ERR,
               "Communicator aborted ({}){} on rank {} commHash {:x} {}",
               reason,
@@ -872,7 +810,7 @@ void CtranGpe::Impl::gpeThreadFn() {
             pending->inFlight.fetch_sub(1, std::memory_order_release);
           }
         }
-        CLOGF_SUBSYS(
+        CTRAN_LOG_SUBSYS(
             INFO,
             INIT,
             "[COMM THREAD] CTranGPE thread terminated on rank {} commHash {:x} commDesc {}",
@@ -890,13 +828,24 @@ void CtranGpe::Impl::gpeThreadFn() {
         volatile int* flag_d = kernelFlag->dev.flag_;
         // Here we check just flag_d[0]. This is ok because Kernel Start signal
         // is only used for tracing purposes. Before the flags are freed below
-        // with reset, all block flags are checked.
+        // with reset, all block flags are checked. Bail out on terminate() so a
+        // cmd whose kernel never launches cannot wedge teardown.
         while (flag_d[0] != KERNEL_STARTED &&
-               flag_d[0] != KERNEL_STARTED_AND_EXIT) {
+               flag_d[0] != KERNEL_STARTED_AND_EXIT &&
+               !terminating_.load(std::memory_order_relaxed)) {
           std::this_thread::yield();
         }
       }
       gpeProfiler_->mark(ctran::GpeTracePoint::WAIT_KERNEL);
+
+      // Keyed off statsKey, not the cvar: re-reading the cvar at the record
+      // site would let a false->true flip mid-collective time from a
+      // default-constructed start point.
+      const bool collectiveStatsEnabled = !cmd->coll.statsKey.key.empty();
+      std::chrono::steady_clock::time_point collectiveStatsStart;
+      if (collectiveStatsEnabled) {
+        collectiveStatsStart = std::chrono::steady_clock::now();
+      }
 
       if (cmd->coll.collHandle != nullptr) {
         cmd->coll.collHandle->trigger(
@@ -937,7 +886,7 @@ void CtranGpe::Impl::gpeThreadFn() {
           // Comm already aborted — skip collective to prevent
           // progressInternal() from accessing stale VC queue entries
           // left by a previously aborted collective (double-complete bug).
-          CLOGF(
+          CTRAN_LOG(
               WARN,
               "Communicator aborted, skipping collective (opType={}, opCount={}) on rank {} commHash {:x}",
               cmd->coll.opGroup.empty()
@@ -980,6 +929,22 @@ void CtranGpe::Impl::gpeThreadFn() {
           }
         }
 
+        // Aborted collectives are recorded too: duration-until-abort is
+        // still useful.
+        if (collectiveStatsEnabled && comm != nullptr) {
+          const auto durationUs =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - collectiveStatsStart)
+                  .count();
+          collectiveStats_.record(
+              cmd->coll.statsKey.collective,
+              cmd->coll.statsKey.key,
+              static_cast<uint64_t>(durationUs),
+              cmd->coll.statsKey.numBlocks,
+              cmd->coll.statsKey.blockSize,
+              cmd->coll.statsKey.blocksPerSM);
+        }
+
         if (cmd->persistent) {
           for (const auto& x : cmd->coll.opGroup) {
             x->setStatus(KernelElem::ElemStatus::INUSE);
@@ -1003,9 +968,8 @@ void CtranGpe::Impl::gpeThreadFn() {
             kernelFlag->reset();
           }
         } else {
-          // In case of aborted comm, wait for kernel to start
-          while (comm->testAbort() &&
-                 !kernelFlag->testFlagAllGroups(KERNEL_STARTED)) {
+          // A late block must not overwrite the terminal state with STARTED.
+          while (!kernelFlag->testFlagAllGroups(KERNEL_STARTED)) {
             std::this_thread::yield();
           }
           // Stop kernel and kernel will free up the flag after confirmed the
@@ -1065,7 +1029,7 @@ void KernelElem::unuse() {
   for (int i = 0; i < this->ngroups; i++) {
     this->status[i] = KernelElem::ElemStatus::RESET;
   }
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "CTRAN-GPE: elem {} set to unuse with ngroups {}",
       (void*)this,
@@ -1077,7 +1041,7 @@ void KernelElem::setStatus(KernelElem::ElemStatus s) {
   for (int i = 0; i < this->ngroups; i++) {
     this->status[i] = s;
   }
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "CTRAN-GPE: elem {} set to {} with ngroups {}",
       (void*)this,
@@ -1115,7 +1079,7 @@ void KernelElem::free() {
   for (int i = 0; i < this->ngroups; i++) {
     this->status[i] = KernelElem::ElemStatus::RESET;
   }
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "CTRAN-GPE: elem {} freed with ngroups {}",
       (void*)this,
@@ -1132,7 +1096,7 @@ bool KernelElem::isFree() {
     allFree &= (this->status[i] == KernelElem::ElemStatus::RESET);
   }
   if (allFree) {
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "CTRAN-GPE: elem {} isFree = true with ngroups {}",
         (void*)this,
@@ -1153,7 +1117,7 @@ void KernelElem::post(int groupId) {
     for (int i = 0; i < this->ngroups; i++) {
       this->status[i] = KernelElem::ElemStatus::POSTED;
     }
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "CTRAN-GPE: elem {} posted with ngroups {}",
         (void*)this,
@@ -1163,7 +1127,7 @@ void KernelElem::post(int groupId) {
 
     // Ring doorbell to each thread block on kernel side
     this->status[groupId] = KernelElem::ElemStatus::POSTED;
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "CTRAN-GPE: elem {} posted with groupId {}",
         (void*)this,
@@ -1180,7 +1144,7 @@ void KernelElem::revoke() {
   for (int i = 0; i < this->ngroups; i++) {
     this->status[i] = KernelElem::ElemStatus::REVOKED;
   }
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "CTRAN-GPE: elem {} revoked with ngroups {}",
       (void*)this,
@@ -1201,7 +1165,7 @@ bool KernelElem::isComplete(int groupId) {
     complete = (this->status[groupId] == KernelElem::ElemStatus::DONE);
   }
   if (complete) {
-    CLOGF_TRACE(
+    CTRAN_LOG_TRACE(
         COLL,
         "CTRAN-GPE: elem {} completed at step {}",
         (void*)this,
@@ -1218,9 +1182,11 @@ void KernelElem::wait(int groupId) {
   }
 }
 
-void KernelElem::wait(std::shared_ptr<ctran::utils::Abort> abort, int groupId) {
+void KernelElem::wait(
+    std::shared_ptr<comms::fault_tolerance::Abort> abort,
+    int groupId) {
   // wait for all thread blocks to complete
-  while (!this->isComplete(groupId) && !abort->Test()) {
+  while (!this->isComplete(groupId) && !abort->isAborted()) {
     // friendly spin so we don't hog CPU
     std::this_thread::yield();
   }
@@ -1243,7 +1209,7 @@ KernelElemPool::KernelElemPool(size_t capacity) : capacity_(capacity) {
 KernelElemPool::~KernelElemPool() {
   this->reclaim();
   if (this->inuseWorkElems_.size()) {
-    CLOGF(
+    CTRAN_LOG(
         WARN,
         "CTRAN-GPE: Internal KernelElem pool has {} inuse elements",
         this->inuseWorkElems_.size());
@@ -1274,7 +1240,7 @@ size_t KernelElemPool::capacity() {
 
 KernelElem* KernelElemPool::pop(int ngroups) {
   if (ngroups > CTRAN_ALGO_MAX_THREAD_BLOCKS) {
-    CLOGF(
+    CTRAN_LOG(
         WARN,
         "CTRAN-GPE: ngroups {} exceeds max thread blocks {}",
         ngroups,
@@ -1289,7 +1255,7 @@ KernelElem* KernelElemPool::pop(int ngroups) {
     workElem->status[i] = KernelElem::ElemStatus::INUSE;
   }
 
-  CLOGF_TRACE(
+  CTRAN_LOG_TRACE(
       COLL,
       "CTRAN-GPE: elem {} popped with ngroups {}",
       (void*)workElem,
@@ -1348,7 +1314,7 @@ std::optional<ChecksumArgs> ctranFillChecksumArgs(
       return ChecksumHandler<KT::RECV>::ctranFillChecksumArgs(
           kernelConfig, checksumItem, comm);
     default:
-      CLOGF(
+      CTRAN_LOG(
           WARN,
           "CTRAN-GPE: Unsupported kernel type {} for checksum",
           kernelConfig.type);
