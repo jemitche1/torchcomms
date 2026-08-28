@@ -4,10 +4,10 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 
 #include "comms/common/fault_tolerance/AbortMacros.cuh"
 #include "comms/prims/core/ThreadGroup.cuh"
-#include "comms/prims/core/Timeout.cuh"
 #include "comms/prims/transport/nvl/MultimemNvlTransportDevice.cuh"
 
 namespace comms::prims {
@@ -24,23 +24,132 @@ enum class NvlSignalPhase { Ready, Ack, Consumed };
 /** Selects how a per-peer waiter combines peer completion state. */
 enum class NvlPerPeerWaitPolicy { WaitAll, SerialMin, TreeMin, ButterflyMin };
 
+inline constexpr uint32_t kMaxNvlSignalRanks = 72;
+inline constexpr uint32_t kNvlSignalRanksPerMaskWord =
+    std::numeric_limits<uint64_t>::digits;
+inline constexpr uint32_t kNvlSignalSmallPerPeerThreads =
+    kNvlSignalRanksPerMaskWord;
+inline constexpr uint32_t kNvlSignalLargePerPeerThreads =
+    2 * kNvlSignalSmallPerPeerThreads;
+
+__host__ __device__ constexpr bool nvl_signal_rank_count_supported(
+    uint32_t ranks) {
+  return ranks > 0 && ranks <= kMaxNvlSignalRanks;
+}
+
+/**
+ * Returns a launchable one-dimensional per-peer CUDA block size.
+ *
+ * Rank validity is checked separately so an invalid count still reaches
+ * device-side protocol validation instead of producing a zero-thread launch.
+ */
+__host__ __device__ constexpr uint32_t nvl_signal_per_peer_group_size(
+    uint32_t ranks) {
+  return ranks <= kNvlSignalSmallPerPeerThreads ? kNvlSignalSmallPerPeerThreads
+                                                : kNvlSignalLargePerPeerThreads;
+}
+
+inline constexpr uint32_t kMaxNvlSignalPerPeerThreads =
+    nvl_signal_per_peer_group_size(kMaxNvlSignalRanks);
+inline constexpr uint32_t kMaxNvlSignalPerPeerWarps =
+    kMaxNvlSignalPerPeerThreads / kWarpSize;
+
+static_assert(kMaxNvlSignalPerPeerThreads % kWarpSize == 0);
+
 /** Identifies one channel and one monotonic per-peer round value. */
 struct StageRound {
   uint32_t channel;
   uint64_t value;
 };
 
+/** Selects up to 72 NVL-local ranks; ranks 64-71 use the high word. */
+struct NvlSignalRankMask {
+  uint64_t low{0};
+  uint64_t high{0};
+
+  __host__ __device__ constexpr NvlSignalRankMask() = default;
+  __host__ __device__ constexpr NvlSignalRankMask(uint64_t lowBits)
+      : low(lowBits) {}
+  __host__ __device__ constexpr NvlSignalRankMask(
+      uint64_t lowBits,
+      uint64_t highBits)
+      : low(lowBits), high(highBits) {}
+
+  __host__ __device__ static constexpr NvlSignalRankMask first(uint32_t ranks) {
+    if (!nvl_signal_rank_count_supported(ranks)) {
+      return {};
+    }
+    if (ranks < kNvlSignalRanksPerMaskWord) {
+      return {(uint64_t{1} << ranks) - 1};
+    }
+    if (ranks == kNvlSignalRanksPerMaskWord) {
+      return {~uint64_t{0}};
+    }
+    return {
+        ~uint64_t{0},
+        (uint64_t{1} << (ranks - kNvlSignalRanksPerMaskWord)) - 1};
+  }
+
+  __host__ __device__ static constexpr NvlSignalRankMask single(uint32_t rank) {
+    if (rank < kNvlSignalRanksPerMaskWord) {
+      return {uint64_t{1} << rank};
+    }
+    if (rank < kMaxNvlSignalRanks) {
+      return {0, uint64_t{1} << (rank - kNvlSignalRanksPerMaskWord)};
+    }
+    return {};
+  }
+
+  __host__ __device__ constexpr NvlSignalRankMask without(uint32_t rank) const {
+    auto result = *this;
+    if (rank < kNvlSignalRanksPerMaskWord) {
+      result.low &= ~(uint64_t{1} << rank);
+    } else if (rank < kMaxNvlSignalRanks) {
+      result.high &= ~(uint64_t{1} << (rank - kNvlSignalRanksPerMaskWord));
+    }
+    return result;
+  }
+};
+
 /** Describes the ranks participating in one signal operation. */
 struct NvlSignalParticipants {
-  uint64_t publisherMask{0};
-  uint64_t waiterMask{0};
+  NvlSignalRankMask publisherMask{};
+  NvlSignalRankMask waiterMask{};
   uint32_t expectedArrivals{0};
 };
 
 namespace nvl_signal_detail {
 
-__device__ __forceinline__ bool rank_selected(uint64_t mask, int rank) {
-  return rank >= 0 && rank < 64 && ((mask >> rank) & uint64_t{1}) != 0;
+__device__ __forceinline__ bool rank_selected(
+    const NvlSignalRankMask& mask,
+    int rank) {
+  if (rank < 0 || rank >= static_cast<int>(kMaxNvlSignalRanks)) {
+    return false;
+  }
+  const uint64_t word = rank < static_cast<int>(kNvlSignalRanksPerMaskWord)
+      ? mask.low
+      : mask.high;
+  return ((word >> (rank % kNvlSignalRanksPerMaskWord)) & uint64_t{1}) != 0;
+}
+
+__device__ __forceinline__ bool mask_is_empty(const NvlSignalRankMask& mask) {
+  return mask.low == 0 && mask.high == 0;
+}
+
+__device__ __forceinline__ bool mask_fits(
+    const NvlSignalRankMask& mask,
+    const NvlSignalRankMask& valid) {
+  return (mask.low & ~valid.low) == 0 && (mask.high & ~valid.high) == 0;
+}
+
+__device__ __forceinline__ uint32_t
+mask_rank_count(const NvlSignalRankMask& mask) {
+#if defined(__CUDA_ARCH__)
+  return static_cast<uint32_t>(__popcll(mask.low) + __popcll(mask.high));
+#else
+  (void)mask;
+  return 0;
+#endif
 }
 
 __device__ __forceinline__ bool sequence_reached(
@@ -82,10 +191,10 @@ __device__ __forceinline__ void validate_protocol() {
 __device__ __forceinline__ void wait_until_reached(
     const SignalState& signal,
     uint64_t expected,
-    const Timeout& timeout) {
+    const AbortDevice& abortDevice) {
   while (!sequence_reached(signal.load(), expected)) {
     if (FT_ABORT_CHECK(
-            timeout,
+            abortDevice,
             "NVL signal wait for sequence=%llu",
             static_cast<unsigned long long>(expected))) {
       FT_DEVICE_TRAP();
@@ -134,32 +243,39 @@ __device__ __forceinline__ void validate_common(
     const StageRound& round,
     const NvlSignalParticipants& participants) {
 #if defined(__CUDA_ARCH__)
-  const bool validRankCount =
-      transport.nvlRanks > 0 && transport.nvlRanks <= 64;
-  uint64_t validRankMask = ~uint64_t{0};
-  if (validRankCount && transport.nvlRanks < 64) {
-    validRankMask = (uint64_t{1} << transport.nvlRanks) - 1;
-  }
+  const bool validRankCount = transport.nvlRanks > 0 &&
+      nvl_signal_rank_count_supported(
+                                  static_cast<uint32_t>(transport.nvlRanks));
+  const auto validRankMask = NvlSignalRankMask::first(
+      validRankCount ? static_cast<uint32_t>(transport.nvlRanks) : 0);
+  const uint64_t expectedSignalsPerChannel = validRankCount
+      ? multimem_staging_signals_per_channel(
+            static_cast<uint64_t>(transport.nvlRanks), transport.pipelineDepth)
+      : 0;
   if (!validRankCount || transport.nvlRank < 0 ||
       transport.nvlRank >= transport.nvlRanks ||
-      participants.publisherMask == 0 || participants.waiterMask == 0 ||
-      (participants.publisherMask & ~validRankMask) != 0 ||
-      (participants.waiterMask & ~validRankMask) != 0 ||
+      mask_is_empty(participants.publisherMask) ||
+      mask_is_empty(participants.waiterMask) ||
+      !mask_fits(participants.publisherMask, validRankMask) ||
+      !mask_fits(participants.waiterMask, validRankMask) ||
       participants.expectedArrivals == 0 ||
       participants.expectedArrivals !=
-          static_cast<uint32_t>(__popcll(participants.publisherMask)) ||
+          mask_rank_count(participants.publisherMask) ||
       round.channel >= transport.maxChannels || round.value == 0 ||
-      transport.signalsPerChannel == 0) {
+      transport.signalsPerChannel != expectedSignalsPerChannel) {
     printf(
         "NVL signal invalid geometry: rank=%d ranks=%d channel=%u "
-        "round=%llu maxChannels=%u publishers=%llu waiters=%llu arrivals=%u\n",
+        "round=%llu maxChannels=%u publishers=(%llu,%llu) "
+        "waiters=(%llu,%llu) arrivals=%u\n",
         transport.nvlRank,
         transport.nvlRanks,
         static_cast<unsigned>(round.channel),
         static_cast<unsigned long long>(round.value),
         static_cast<unsigned>(transport.maxChannels),
-        static_cast<unsigned long long>(participants.publisherMask),
-        static_cast<unsigned long long>(participants.waiterMask),
+        static_cast<unsigned long long>(participants.publisherMask.low),
+        static_cast<unsigned long long>(participants.publisherMask.high),
+        static_cast<unsigned long long>(participants.waiterMask.low),
+        static_cast<unsigned long long>(participants.waiterMask.high),
         static_cast<unsigned>(participants.expectedArrivals));
     __trap();
   }
@@ -173,21 +289,38 @@ __device__ __forceinline__ void validate_common(
 template <NvlSignalAccess access>
 __device__ __forceinline__ void validate_per_peer(
     const MultimemNvlTransportDevice& transport,
+    const StageRound& round,
     const ThreadGroup& group) {
 #if defined(__CUDA_ARCH__)
   const uint64_t requiredSignals =
       static_cast<uint64_t>(transport.maxChannels) *
       transport.signalsPerChannel;
-  if (group.scope != SyncScope::BLOCK || group.group_size != 64 ||
-      transport.nvlRanks > 64 ||
+  const uint32_t requiredGroupSize =
+      nvl_signal_per_peer_group_size(static_cast<uint32_t>(transport.nvlRanks));
+  if (blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1 ||
+      blockDim.x != requiredGroupSize || group.scope != SyncScope::BLOCK ||
+      group.group_size != requiredGroupSize ||
+      group.group_id != round.channel ||
+      transport.nvlRanks > static_cast<int>(kMaxNvlSignalRanks) ||
       requiredSignals > transport.internalLocalSignals.size() ||
       requiredSignals > transport.internalMultimemSignals.size() ||
       (access == NvlSignalAccess::Unicast &&
        transport.internalUnicastSignalsByRank.size() !=
            static_cast<uint32_t>(transport.nvlRanks))) {
     printf(
-        "NVL per-peer signal invalid execution geometry: groupSize=%u "
-        "ranks=%d localSignals=%u multimemSignals=%u peers=%u\n",
+        "NVL per-peer signal invalid execution geometry: block=(%u,%u,%u) "
+        "grid=(%u,%u,%u) groupId=%u blockId=%u channel=%u groupSize=%u "
+        "ranks=%d "
+        "localSignals=%u multimemSignals=%u peers=%u\n",
+        static_cast<unsigned>(blockDim.x),
+        static_cast<unsigned>(blockDim.y),
+        static_cast<unsigned>(blockDim.z),
+        static_cast<unsigned>(gridDim.x),
+        static_cast<unsigned>(gridDim.y),
+        static_cast<unsigned>(gridDim.z),
+        static_cast<unsigned>(group.group_id),
+        static_cast<unsigned>(group.block_id),
+        static_cast<unsigned>(round.channel),
         static_cast<unsigned>(group.group_size),
         transport.nvlRanks,
         static_cast<unsigned>(transport.internalLocalSignals.size()),
@@ -197,6 +330,7 @@ __device__ __forceinline__ void validate_per_peer(
   }
 #else
   (void)transport;
+  (void)round;
   (void)group;
 #endif
 }
@@ -207,7 +341,7 @@ __device__ __forceinline__ void wait_per_peer_all(
     const StageRound& round,
     const NvlSignalParticipants& participants,
     ThreadGroup& group,
-    const Timeout& timeout) {
+    const AbortDevice& abortDevice) {
   const int source = static_cast<int>(group.thread_id_in_group);
   if (source < transport.nvlRanks &&
       rank_selected(participants.publisherMask, source)) {
@@ -215,7 +349,7 @@ __device__ __forceinline__ void wait_per_peer_all(
         transport.internalLocalSignals[peer_signal_id<phase>(
             transport, round, source)],
         round.value,
-        timeout);
+        abortDevice);
   }
   group.sync();
 }
@@ -226,7 +360,7 @@ __device__ __forceinline__ void wait_per_peer_serial(
     const StageRound& round,
     const NvlSignalParticipants& participants,
     ThreadGroup& group,
-    const Timeout& timeout) {
+    const AbortDevice& abortDevice) {
   if (group.is_leader()) {
     bool complete = false;
     while (!complete) {
@@ -244,7 +378,7 @@ __device__ __forceinline__ void wait_per_peer_serial(
       }
       if (!complete) {
         if (FT_ABORT_CHECK(
-                timeout,
+                abortDevice,
                 "NVL serial per-peer wait for round=%llu",
                 static_cast<unsigned long long>(round.value))) {
           FT_DEVICE_TRAP();
@@ -261,13 +395,13 @@ __device__ __forceinline__ void wait_per_peer_tree(
     const StageRound& round,
     const NvlSignalParticipants& participants,
     ThreadGroup& group,
-    const Timeout& timeout) {
-  __shared__ uint32_t completeByPeer[64];
+    const AbortDevice& abortDevice) {
+  __shared__ uint32_t completeByThread[kMaxNvlSignalPerPeerThreads];
   const uint32_t thread = group.thread_id_in_group;
   bool complete = false;
   while (!complete) {
     const int source = static_cast<int>(thread);
-    completeByPeer[thread] = source >= transport.nvlRanks ||
+    completeByThread[thread] = source >= transport.nvlRanks ||
             !rank_selected(participants.publisherMask, source) ||
             sequence_reached(transport
                                  .internalLocalSignals[peer_signal_id<phase>(
@@ -277,16 +411,16 @@ __device__ __forceinline__ void wait_per_peer_tree(
         ? 1
         : 0;
     group.sync();
-    for (uint32_t stride = 32; stride != 0; stride /= 2) {
+    for (uint32_t stride = group.group_size / 2; stride != 0; stride /= 2) {
       if (thread < stride) {
-        completeByPeer[thread] &= completeByPeer[thread + stride];
+        completeByThread[thread] &= completeByThread[thread + stride];
       }
       group.sync();
     }
-    complete = completeByPeer[0] != 0;
+    complete = completeByThread[0] != 0;
     if (!complete && group.is_leader()) {
       if (FT_ABORT_CHECK(
-              timeout,
+              abortDevice,
               "NVL tree per-peer wait for round=%llu",
               static_cast<unsigned long long>(round.value))) {
         FT_DEVICE_TRAP();
@@ -302,8 +436,8 @@ __device__ __forceinline__ void wait_per_peer_butterfly(
     const StageRound& round,
     const NvlSignalParticipants& participants,
     ThreadGroup& group,
-    const Timeout& timeout) {
-  __shared__ uint32_t completeByWarp[2];
+    const AbortDevice& abortDevice) {
+  __shared__ uint32_t completeByWarp[kMaxNvlSignalPerPeerWarps];
   const uint32_t thread = group.thread_id_in_group;
   const uint32_t lane = thread % kWarpSize;
   const uint32_t warp = thread / kWarpSize;
@@ -328,10 +462,13 @@ __device__ __forceinline__ void wait_per_peer_butterfly(
       completeByWarp[warp] = laneComplete;
     }
     group.sync();
-    complete = completeByWarp[0] != 0 && completeByWarp[1] != 0;
+    complete = true;
+    for (uint32_t index = 0; index < group.group_size / kWarpSize; ++index) {
+      complete &= completeByWarp[index] != 0;
+    }
     if (!complete && group.is_leader()) {
       if (FT_ABORT_CHECK(
-              timeout,
+              abortDevice,
               "NVL butterfly per-peer wait for round=%llu",
               static_cast<unsigned long long>(round.value))) {
         FT_DEVICE_TRAP();
@@ -344,21 +481,40 @@ __device__ __forceinline__ void wait_per_peer_butterfly(
 template <NvlSignalAccess access>
 __device__ __forceinline__ void validate_aggregate(
     const MultimemNvlTransportDevice& transport,
+    const StageRound& round,
     const ThreadGroup& group) {
 #if defined(__CUDA_ARCH__)
   const uint64_t requiredSignals =
       static_cast<uint64_t>(transport.maxChannels) *
       transport.signalsPerChannel;
-  if (group.scope != SyncScope::WARP || group.group_size != kWarpSize ||
-      transport.pipelineDepth == 0 || transport.pipelineDepth > kWarpSize ||
+  const uint32_t threadInBlock = threadIdx.x + threadIdx.y * blockDim.x +
+      threadIdx.z * blockDim.x * blockDim.y;
+  const uint32_t warpInBlock = threadInBlock / kWarpSize;
+  if (blockDim.x < kWarpSize || blockDim.x % kWarpSize != 0 ||
+      blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1 ||
+      group.scope != SyncScope::WARP || group.group_size != kWarpSize ||
+      group.group_id != round.channel || transport.pipelineDepth == 0 ||
+      transport.pipelineDepth > kWarpSize ||
       requiredSignals > transport.internalLocalSignals.size() ||
       requiredSignals > transport.internalMultimemSignals.size() ||
       (access == NvlSignalAccess::Unicast &&
        transport.internalUnicastSignalsByRank.size() !=
            static_cast<uint32_t>(transport.nvlRanks))) {
     printf(
-        "NVL aggregate signal invalid execution geometry: groupSize=%u "
+        "NVL aggregate signal invalid execution geometry: block=(%u,%u,%u) "
+        "grid=(%u,%u,%u) groupId=%u blockId=%u channel=%u warp=%u "
+        "groupSize=%u "
         "pipelineDepth=%u localSignals=%u multimemSignals=%u peers=%u\n",
+        static_cast<unsigned>(blockDim.x),
+        static_cast<unsigned>(blockDim.y),
+        static_cast<unsigned>(blockDim.z),
+        static_cast<unsigned>(gridDim.x),
+        static_cast<unsigned>(gridDim.y),
+        static_cast<unsigned>(gridDim.z),
+        static_cast<unsigned>(group.group_id),
+        static_cast<unsigned>(group.block_id),
+        static_cast<unsigned>(round.channel),
+        static_cast<unsigned>(warpInBlock),
         static_cast<unsigned>(group.group_size),
         static_cast<unsigned>(transport.pipelineDepth),
         static_cast<unsigned>(transport.internalLocalSignals.size()),
@@ -368,6 +524,7 @@ __device__ __forceinline__ void validate_aggregate(
   }
 #else
   (void)transport;
+  (void)round;
   (void)group;
 #endif
 }
@@ -379,7 +536,8 @@ __device__ __forceinline__ void validate_aggregate(
  *
  * Aggregate topology requires one warp and maps active threads to pipeline
  * lanes.
- * Per-peer topology requires one 64-thread block and maps threads to peers.
+ * Per-peer topology requires one block sized by
+ * `nvl_signal_per_peer_group_size()` and maps threads to peers.
  *
  * @param transport Exchanged multimem transport device view.
  * @param round Logical channel and per-peer round value.
@@ -401,9 +559,9 @@ __device__ __forceinline__ void signal_publish_impl(
   nvl_signal_detail::validate_protocol<access, topology, phase, waitPolicy>();
   nvl_signal_detail::validate_common(transport, round, participants);
   if constexpr (topology == NvlSignalTopology::Aggregate) {
-    nvl_signal_detail::validate_aggregate<access>(transport, group);
+    nvl_signal_detail::validate_aggregate<access>(transport, round, group);
   } else {
-    nvl_signal_detail::validate_per_peer<access>(transport, group);
+    nvl_signal_detail::validate_per_peer<access>(transport, round, group);
   }
 
   comms::device::fence_acq_rel_sys();
@@ -417,8 +575,9 @@ __device__ __forceinline__ void signal_publish_impl(
             nvl_signal_detail::aggregate_counter_id<phase>(
                 transport, round, lane);
         if constexpr (access == NvlSignalAccess::Multimem) {
-          transport.template signal_internal_scalar<SignalOp::SIGNAL_ADD>(
-              signalId, 1);
+          transport
+              .template signal_internal_scalar_prefenced<SignalOp::SIGNAL_ADD>(
+                  signalId, 1);
         } else {
           for (int destination = 0; destination < transport.nvlRanks;
                ++destination) {
@@ -435,8 +594,9 @@ __device__ __forceinline__ void signal_publish_impl(
           transport, round, transport.nvlRank);
       if constexpr (access == NvlSignalAccess::Multimem) {
         if (group.is_leader()) {
-          transport.template signal_internal_scalar<SignalOp::SIGNAL_SET>(
-              signalId, round.value);
+          transport
+              .template signal_internal_scalar_prefenced<SignalOp::SIGNAL_SET>(
+                  signalId, round.value);
         }
       } else {
         const int destination = static_cast<int>(group.thread_id_in_group);
@@ -476,14 +636,14 @@ __device__ __forceinline__ void signal_publish(
 /**
  * Waits for the selected publishers on every selected waiter rank.
  *
- * A caller that enables timeout checking must call `Timeout::start()` before
- * this function.
+ * A caller that enables abortDevice checking must call `Timeout::start()`
+ * before this function.
  *
  * @param transport Exchanged multimem transport device view.
  * @param round Logical channel and per-peer round value.
  * @param participants Rank masks and expected arrival count.
  * @param group Topology-specific cooperative thread group.
- * @param timeout Started timeout or the disabled default timeout.
+ * @param abortDevice Started abortDevice or the disabled default abortDevice.
  */
 namespace nvl_signal_detail {
 
@@ -497,13 +657,13 @@ __device__ __forceinline__ void signal_wait_impl(
     const StageRound& round,
     const NvlSignalParticipants& participants,
     ThreadGroup& group,
-    const Timeout& timeout) {
+    const AbortDevice& abortDevice) {
   nvl_signal_detail::validate_protocol<access, topology, phase, waitPolicy>();
   nvl_signal_detail::validate_common(transport, round, participants);
   if constexpr (topology == NvlSignalTopology::Aggregate) {
-    nvl_signal_detail::validate_aggregate<access>(transport, group);
+    nvl_signal_detail::validate_aggregate<access>(transport, round, group);
   } else {
-    nvl_signal_detail::validate_per_peer<access>(transport, group);
+    nvl_signal_detail::validate_per_peer<access>(transport, round, group);
   }
 
   const bool isWaiter = nvl_signal_detail::rank_selected(
@@ -518,7 +678,7 @@ __device__ __forceinline__ void signal_wait_impl(
       const uint64_t expected =
           epoch->load() + static_cast<uint64_t>(participants.expectedArrivals);
       if (isWaiter) {
-        nvl_signal_detail::wait_until_reached(*counter, expected, timeout);
+        nvl_signal_detail::wait_until_reached(*counter, expected, abortDevice);
       }
       if constexpr (access == NvlSignalAccess::Multimem) {
         epoch->store(expected);
@@ -531,16 +691,16 @@ __device__ __forceinline__ void signal_wait_impl(
     return;
   } else if constexpr (waitPolicy == NvlPerPeerWaitPolicy::WaitAll) {
     nvl_signal_detail::wait_per_peer_all<phase>(
-        transport, round, participants, group, timeout);
+        transport, round, participants, group, abortDevice);
   } else if constexpr (waitPolicy == NvlPerPeerWaitPolicy::SerialMin) {
     nvl_signal_detail::wait_per_peer_serial<phase>(
-        transport, round, participants, group, timeout);
+        transport, round, participants, group, abortDevice);
   } else if constexpr (waitPolicy == NvlPerPeerWaitPolicy::TreeMin) {
     nvl_signal_detail::wait_per_peer_tree<phase>(
-        transport, round, participants, group, timeout);
+        transport, round, participants, group, abortDevice);
   } else {
     nvl_signal_detail::wait_per_peer_butterfly<phase>(
-        transport, round, participants, group, timeout);
+        transport, round, participants, group, abortDevice);
   }
   (void)access;
 }
@@ -558,13 +718,13 @@ __device__ __forceinline__ void signal_wait(
     const StageRound& round,
     const NvlSignalParticipants& participants,
     ThreadGroup& group,
-    const Timeout& timeout) {
+    const AbortDevice& abortDevice) {
   static_assert(
       access != NvlSignalAccess::Multimem ||
           topology != NvlSignalTopology::Aggregate,
       "aggregate multimem requires signal_publish_and_wait on every rank");
   nvl_signal_detail::signal_wait_impl<access, topology, phase, waitPolicy>(
-      transport, round, participants, group, timeout);
+      transport, round, participants, group, abortDevice);
 }
 
 /**
@@ -574,7 +734,7 @@ __device__ __forceinline__ void signal_wait(
  * @param round Logical channel and per-peer round value.
  * @param participants Rank masks and expected arrival count.
  * @param group Topology-specific cooperative thread group.
- * @param timeout Started timeout or the disabled default timeout.
+ * @param abortDevice Started abortDevice or the disabled default abortDevice.
  */
 template <
     NvlSignalAccess access,
@@ -586,11 +746,11 @@ __device__ __forceinline__ void signal_publish_and_wait(
     const StageRound& round,
     const NvlSignalParticipants& participants,
     ThreadGroup& group,
-    const Timeout& timeout) {
+    const AbortDevice& abortDevice) {
   nvl_signal_detail::signal_publish_impl<access, topology, phase, waitPolicy>(
       transport, round, participants, group);
   nvl_signal_detail::signal_wait_impl<access, topology, phase, waitPolicy>(
-      transport, round, participants, group, timeout);
+      transport, round, participants, group, abortDevice);
 }
 
 } // namespace comms::prims

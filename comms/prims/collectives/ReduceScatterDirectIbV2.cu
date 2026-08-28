@@ -175,9 +175,9 @@ template <int kRecvThreads, int kBlockSize, int kUnroll>
 __global__
 __launch_bounds__(kBlockSize, 1) void direct_reduce_scatter_ib_v2_kernel(
     const __grid_constant__ DirectReduceScatterIbV2Args args,
-    Timeout timeout) {
+    AbortDevice abortDevice) {
 #ifdef __CUDA_ARCH__
-  timeout.start();
+  abortDevice.start();
 
   // The send only needs its leader to post a WQE; one warp keeps its sync at
   // __syncwarp() and hands every other thread to the reduce.
@@ -300,7 +300,8 @@ __launch_bounds__(kBlockSize, 1) void direct_reduce_scatter_ib_v2_kernel(
             // slow peer never stops us polling the others.
             int ready = 0;
             bool finished = false;
-            while (ready < count && !finished) {
+            bool aborted = false;
+            while (ready < count && !finished && !aborted) {
               ready = 0;
               for (int i = 0; i < count; ++i) {
                 if (rviews[s][i].staging != nullptr) {
@@ -310,7 +311,18 @@ __launch_bounds__(kBlockSize, 1) void direct_reduce_scatter_ib_v2_kernel(
                 detail::RecvChunkAcquisition view{};
                 auto transport = args.peers[rpeer_of[i]];
                 const auto st = transport.progress_recv_acquire_once(
-                    solo, wire_bytes, max_sig, timeout, view);
+                    solo, wire_bytes, max_sig, abortDevice, view);
+                // `Aborted` is terminal and must be handled explicitly. It used
+                // to fall through this chain: the acquire had already driven
+                // the slot to `Done` via abandon_progress_state(), so the NEXT
+                // acquire returned `Done`, the loop set `finished` and the
+                // collective reported ordinary completion over a partially
+                // reduced accumulator. Stopping here keeps "aborted" and
+                // "stream complete" distinguishable.
+                if (st == IbgdaSendRecvProgressStatus::Aborted) {
+                  aborted = true;
+                  break;
+                }
                 if (st == IbgdaSendRecvProgressStatus::Done) {
                   finished = true;
                   break;
@@ -321,7 +333,7 @@ __launch_bounds__(kBlockSize, 1) void direct_reduce_scatter_ib_v2_kernel(
                 }
               }
             }
-            if (finished) {
+            if (finished || aborted) {
               s_nchunks = c;
               __threadfence_block();
               s_published = c;
@@ -339,7 +351,8 @@ __launch_bounds__(kBlockSize, 1) void direct_reduce_scatter_ib_v2_kernel(
               const int ps = (c - 1) % kSlots;
               for (int i = 0; i < count; ++i) {
                 auto transport = args.peers[rpeer_of[i]];
-                transport.progress_recv_release_once(solo, rviews[ps][i]);
+                transport.progress_recv_release_once(
+                    solo, abortDevice, rviews[ps][i]);
                 rviews[ps][i] = detail::RecvChunkAcquisition{};
               }
               released = c - 1;
@@ -354,7 +367,8 @@ __launch_bounds__(kBlockSize, 1) void direct_reduce_scatter_ib_v2_kernel(
             const int ds = d % kSlots;
             for (int i = 0; i < count; ++i) {
               auto transport = args.peers[rpeer_of[i]];
-              transport.progress_recv_release_once(solo, rviews[ds][i]);
+              transport.progress_recv_release_once(
+                  solo, abortDevice, rviews[ds][i]);
               rviews[ds][i] = detail::RecvChunkAcquisition{};
             }
             released = d;
@@ -436,7 +450,7 @@ __launch_bounds__(kBlockSize, 1) void direct_reduce_scatter_ib_v2_kernel(
                   send_offset_bytes(args, peer_of[i], tile_offset_elements)),
               wire_bytes,
               max_sig,
-              timeout);
+              abortDevice);
           if (st == IbgdaRegisteredSendProgressStatus::Posted) {
             posted[i] = true;
             --remaining;
@@ -449,8 +463,9 @@ __launch_bounds__(kBlockSize, 1) void direct_reduce_scatter_ib_v2_kernel(
       // caller may reuse that buffer while it is still being read.
       for (int i = 0; i < count; ++i) {
         auto transport = args.peers[peer_of[i]];
-        while (transport.progress_registered_send_drain_once(solo, timeout) !=
-               IbgdaRegisteredSendProgressStatus::Drained) {
+        while (
+            transport.progress_registered_send_drain_once(solo, abortDevice) !=
+            IbgdaRegisteredSendProgressStatus::Drained) {
         }
       }
     }
@@ -460,39 +475,39 @@ __launch_bounds__(kBlockSize, 1) void direct_reduce_scatter_ib_v2_kernel(
 
 template __global__ void direct_reduce_scatter_ib_v2_kernel<224, 256, 1>(
     const __grid_constant__ DirectReduceScatterIbV2Args,
-    Timeout);
+    AbortDevice);
 template __global__ void direct_reduce_scatter_ib_v2_kernel<480, 512, 1>(
     const __grid_constant__ DirectReduceScatterIbV2Args,
-    Timeout);
+    AbortDevice);
 template __global__ void direct_reduce_scatter_ib_v2_kernel<736, 768, 1>(
     const __grid_constant__ DirectReduceScatterIbV2Args,
-    Timeout);
+    AbortDevice);
 template __global__ void direct_reduce_scatter_ib_v2_kernel<992, 1024, 1>(
     const __grid_constant__ DirectReduceScatterIbV2Args,
-    Timeout);
+    AbortDevice);
 
 void launch_direct_reduce_scatter_ib_v2(
     const DirectReduceScatterIbV2Args& args,
     int num_blocks,
     int block_threads,
     cudaStream_t stream,
-    Timeout timeout) {
+    AbortDevice abortDevice) {
   switch (block_threads) {
     case 256:
       direct_reduce_scatter_ib_v2_kernel<224, 256, 1>
-          <<<num_blocks, 256, 0, stream>>>(args, timeout);
+          <<<num_blocks, 256, 0, stream>>>(args, abortDevice);
       break;
     case 512:
       direct_reduce_scatter_ib_v2_kernel<480, 512, 1>
-          <<<num_blocks, 512, 0, stream>>>(args, timeout);
+          <<<num_blocks, 512, 0, stream>>>(args, abortDevice);
       break;
     case 768:
       direct_reduce_scatter_ib_v2_kernel<736, 768, 1>
-          <<<num_blocks, 768, 0, stream>>>(args, timeout);
+          <<<num_blocks, 768, 0, stream>>>(args, abortDevice);
       break;
     default:
       direct_reduce_scatter_ib_v2_kernel<992, 1024, 1>
-          <<<num_blocks, 1024, 0, stream>>>(args, timeout);
+          <<<num_blocks, 1024, 0, stream>>>(args, abortDevice);
       break;
   }
   PIPES_CUDA_CHECK(cudaGetLastError());

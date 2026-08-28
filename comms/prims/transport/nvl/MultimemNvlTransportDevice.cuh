@@ -78,6 +78,7 @@ struct MultimemNvlTransportDevice {
   int nvlRanks{1};
   uint32_t pipelineDepth{0};
   uint32_t maxChannels{0};
+  uint32_t maxBlocks{0};
   uint32_t signalsPerChannel{0};
   // Indexed by NVL-local destination rank. Each entry addresses the base of
   // that destination's internal signal slots through its unicast mapping.
@@ -108,8 +109,9 @@ struct MultimemNvlTransportDevice {
       uint64_t signal_id,
       CmpOp op,
       uint64_t expected,
-      const AbortDevice& timeout = AbortDevice()) const {
-    user_local_signal_ptr(signal_id)->wait_until(group, op, expected, timeout);
+      const AbortDevice& abortDevice = AbortDevice()) const {
+    user_local_signal_ptr(signal_id)->wait_until(
+        group, op, expected, abortDevice);
   }
 
   __device__ __forceinline__ void signal_internal(
@@ -124,8 +126,18 @@ struct MultimemNvlTransportDevice {
   __device__ __forceinline__ void signal_internal_scalar(
       uint64_t signal_id,
       uint64_t value) const {
-    auto* signal = internal_multimem_signal_ptr(signal_id);
     comms::device::fence_acq_rel_sys();
+    signal_internal_scalar_prefenced<op>(signal_id, value);
+  }
+
+  template <SignalOp op>
+  __device__ __forceinline__ void signal_internal_scalar_prefenced(
+      uint64_t signal_id,
+      uint64_t value) const {
+    // Every cooperative-group thread that may have produced published data
+    // must complete the required system-scope fence. All participating threads
+    // must then synchronize before the signaling thread invokes this helper.
+    auto* signal = internal_multimem_signal_ptr(signal_id);
     if constexpr (op == SignalOp::SIGNAL_SET) {
       detail::multimem_store_release_sys_u64(&signal->signal_, value);
     } else {
@@ -143,9 +155,9 @@ struct MultimemNvlTransportDevice {
       uint64_t signal_id,
       CmpOp op,
       uint64_t expected,
-      const AbortDevice& timeout = AbortDevice()) const {
+      const AbortDevice& abortDevice = AbortDevice()) const {
     internal_local_signal_ptr(signal_id)->wait_until(
-        group, op, expected, timeout);
+        group, op, expected, abortDevice);
   }
 
  private:

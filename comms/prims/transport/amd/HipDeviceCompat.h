@@ -6,7 +6,7 @@
 //
 // Provides AMD-side equivalents of the CUDA device intrinsics that pipes
 // device code uses (originally written for CUDA PTX). Lives in `amd/`
-// and is consumed by `pipes_gda_*` device APIs and the IBGDA WQE
+// and is consumed by `prims_amd_gda_*` device APIs and the IBGDA WQE
 // construction path.
 //
 // CUDA → AMD mapping:
@@ -52,7 +52,7 @@
 //
 // Self-skip on non-HIP/non-AMD builds so this header can be included
 // unconditionally from cross-platform headers (e.g. `IbgdaBuffer.h`,
-// `Timeout.cuh`). All HIP-specific intrinsic shims and host-pass stubs
+// `AbortCheck.cuh`). All HIP-specific intrinsic shims and host-pass stubs
 // below are gated by this block.
 
 #ifdef __HIP_PLATFORM_AMD__

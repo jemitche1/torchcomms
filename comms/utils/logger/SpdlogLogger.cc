@@ -4,8 +4,11 @@
 
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -18,6 +21,7 @@
 
 #include <spdlog/async.h>
 #include <spdlog/details/periodic_worker.h>
+#include <spdlog/details/thread_pool.h>
 #include <spdlog/pattern_formatter.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/sink.h>
@@ -26,6 +30,16 @@
 #include "comms/utils/logger/CommsLogFormatter.h"
 
 namespace meta::comms::logger {
+
+void reportCommsLoggingFailureToStderr(const char* level) noexcept {
+  std::fprintf(stderr, "%s: communications logging failed\n", level);
+  std::fflush(stderr);
+}
+
+[[noreturn]] void abortAfterCommsLoggingFailure() noexcept {
+  reportCommsLoggingFailureToStderr("FATAL");
+  std::abort();
+}
 
 spdlog::level::level_enum loggerLevelToSpdlogLevel(LogLevel level) {
   switch (level) {
@@ -46,7 +60,6 @@ spdlog::level::level_enum loggerLevelToSpdlogLevel(LogLevel level) {
 }
 namespace {
 
-constexpr std::string_view kLoggerName = "comms";
 constexpr size_t kAsyncQueueSize = 8192;
 constexpr size_t kAsyncThreadCount = 1;
 /*
@@ -55,18 +68,122 @@ constexpr size_t kAsyncThreadCount = 1;
  * recent lines only in the stdio buffer.
  */
 constexpr auto kPeriodicFlushInterval = std::chrono::seconds{1};
-thread_local std::string threadName = "main";
 // Guard the full callback chain so it cannot recurse through another context
 // logger and eventually re-enter the originating callback.
 thread_local bool errorCallbackInProgress = false;
 
+class CommsThreadPoolState final {
+ public:
+  class Lease final {
+   public:
+    Lease() = default;
+    Lease(
+        std::shared_lock<std::shared_mutex> lock,
+        std::shared_ptr<spdlog::details::thread_pool> threadPool)
+        : lock_(std::move(lock)), threadPool_(std::move(threadPool)) {}
+
+    explicit operator bool() const {
+      return threadPool_ != nullptr;
+    }
+
+    const std::shared_ptr<spdlog::details::thread_pool>& threadPool() const {
+      return threadPool_;
+    }
+
+   private:
+    // Destroy the strong reference before releasing the shared shutdown lock.
+    std::shared_lock<std::shared_mutex> lock_;
+    std::shared_ptr<spdlog::details::thread_pool> threadPool_;
+  };
+
+  CommsThreadPoolState()
+      : threadPool_{std::make_shared<spdlog::details::thread_pool>(
+            kAsyncQueueSize,
+            kAsyncThreadCount)} {}
+
+  Lease acquire() const {
+    if (stopping_.load(std::memory_order_acquire)) {
+      return {};
+    }
+    std::shared_lock lock{leaseMutex_};
+    if (stopping_.load(std::memory_order_acquire)) {
+      return {};
+    }
+    return {std::move(lock), threadPool_};
+  }
+
+  void stop() {
+    {
+      std::lock_guard lock{lifecycleMutex_};
+      stopping_.store(true, std::memory_order_release);
+    }
+    lifecycleCv_.notify_all();
+
+    // The exclusive lock rejects new leases and waits for existing calls to
+    // release theirs before destroying, draining, and joining the pool.
+    std::unique_lock lock{leaseMutex_};
+    auto threadPool = std::move(threadPool_);
+    threadPool.reset();
+  }
+
+  void waitForShutdownToStart() const {
+    std::unique_lock lock{lifecycleMutex_};
+    lifecycleCv_.wait(
+        lock, [this]() { return stopping_.load(std::memory_order_acquire); });
+  }
+
+ private:
+  std::atomic<bool> stopping_{false};
+  mutable std::mutex lifecycleMutex_;
+  mutable std::condition_variable lifecycleCv_;
+  mutable std::shared_mutex leaseMutex_;
+  std::shared_ptr<spdlog::details::thread_pool> threadPool_;
+};
+
+class CommsThreadPoolStopper final {
+ public:
+  explicit CommsThreadPoolStopper(CommsThreadPoolState& state)
+      : state_(state) {}
+  ~CommsThreadPoolStopper() {
+    state_.stop();
+  }
+
+  CommsThreadPoolStopper(const CommsThreadPoolStopper&) = delete;
+  CommsThreadPoolStopper& operator=(const CommsThreadPoolStopper&) = delete;
+  CommsThreadPoolStopper(CommsThreadPoolStopper&&) = delete;
+  CommsThreadPoolStopper& operator=(CommsThreadPoolStopper&&) = delete;
+
+ private:
+  CommsThreadPoolState& state_;
+};
+
+CommsThreadPoolState& getCommsThreadPoolState() {
+  static auto* state = new CommsThreadPoolState{};
+  static const CommsThreadPoolStopper stopper{*state};
+  return *state;
+}
+
+/*
+ * Deliberately leaked along with the logger-owned static state below. A process
+ * that exits without aborting its NCCL communicator leaves the proxy,
+ * CollTrace, and watchdog threads logging while __cxa_atexit runs, so a logger
+ * with a destructor would be freed out from under them. Leaking behind a
+ * pointer registers no destructor, so the object outlives every thread that can
+ * reach it.
+ */
 class PeriodicSinkFlusher final {
  public:
   PeriodicSinkFlusher()
-      : worker_{
+      : worker_{std::make_unique<spdlog::details::periodic_worker>(
             [this]() noexcept { flushRegisteredSinks(); },
-            kPeriodicFlushInterval} {}
-  ~PeriodicSinkFlusher() = default;
+            kPeriodicFlushInterval)} {}
+
+  // Joins the flush thread so it cannot touch sinks or stdio during exit. The
+  // flusher itself survives, so registerSink() from a running thread stays
+  // safe.
+  void stopFlushing() {
+    worker_.reset();
+  }
 
   void registerSink(const std::shared_ptr<spdlog::sinks::sink>& sink) {
     std::lock_guard lock{mutex_};
@@ -82,11 +199,6 @@ class PeriodicSinkFlusher final {
     }
     sinks_.push_back(sink);
   }
-
-  PeriodicSinkFlusher(const PeriodicSinkFlusher&) = delete;
-  PeriodicSinkFlusher& operator=(const PeriodicSinkFlusher&) = delete;
-  PeriodicSinkFlusher(PeriodicSinkFlusher&&) = delete;
-  PeriodicSinkFlusher& operator=(PeriodicSinkFlusher&&) = delete;
 
  private:
   void flushRegisteredSinks() noexcept {
@@ -114,12 +226,34 @@ class PeriodicSinkFlusher final {
 
   std::mutex mutex_;
   std::vector<std::weak_ptr<spdlog::sinks::sink>> sinks_;
-  spdlog::details::periodic_worker worker_;
+  // Declared last so it is joined before the state its callback reads.
+  std::unique_ptr<spdlog::details::periodic_worker> worker_;
+};
+
+// Stops the flush thread at exit without destroying the flusher it points at.
+class PeriodicFlushStopper final {
+ public:
+  explicit PeriodicFlushStopper(PeriodicSinkFlusher& flusher)
+      : flusher_(flusher) {}
+  ~PeriodicFlushStopper() {
+    flusher_.stopFlushing();
+  }
+
+  PeriodicFlushStopper(const PeriodicFlushStopper&) = delete;
+  PeriodicFlushStopper& operator=(const PeriodicFlushStopper&) = delete;
+  PeriodicFlushStopper(PeriodicFlushStopper&&) = delete;
+  PeriodicFlushStopper& operator=(PeriodicFlushStopper&&) = delete;
+
+ private:
+  PeriodicSinkFlusher& flusher_;
 };
 
 PeriodicSinkFlusher& getPeriodicSinkFlusher() {
-  static PeriodicSinkFlusher flusher;
-  return flusher;
+  static auto* flusher = new PeriodicSinkFlusher{};
+  // Constructed after the logger and spdlog registry, so atexit's LIFO order
+  // joins the flush thread before spdlog's exit-time teardown begins.
+  static const PeriodicFlushStopper stopper{*flusher};
+  return *flusher;
 }
 
 class ErrorCallbackGuard {
@@ -217,18 +351,56 @@ uint64_t getCurrentThreadId() {
   return threadId;
 }
 
-std::shared_ptr<spdlog::logger> createLogger(std::string name) {
-  if (!spdlog::thread_pool()) {
-    spdlog::init_thread_pool(kAsyncQueueSize, kAsyncThreadCount);
-  }
+struct NamedLoggerRegistry {
+  std::shared_mutex mutex;
+  std::map<std::string, std::unique_ptr<CommsSpdlogLogger>, std::less<>>
+      loggers;
+};
 
-  auto logger = spdlog::create_async_nb<spdlog::sinks::stderr_color_sink_mt>(
-      std::move(name));
+std::shared_ptr<spdlog::logger> createLogger(std::string name) {
+  auto threadPoolLease = getCommsThreadPoolState().acquire();
+  auto sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+  std::shared_ptr<spdlog::logger> logger;
+  if (threadPoolLease) {
+    logger = std::make_shared<spdlog::async_logger>(
+        std::move(name),
+        std::move(sink),
+        threadPoolLease.threadPool(),
+        spdlog::async_overflow_policy::overrun_oldest);
+  } else {
+    // A logger first referenced during exit cannot use the stopped async pool.
+    logger = std::make_shared<spdlog::logger>(std::move(name), std::move(sink));
+  }
   logger->set_formatter(makeFormatter());
   return logger;
 }
 
 } // namespace
+
+void shutdownSpdlogForFatal() {
+  getCommsThreadPoolState().stop();
+}
+
+namespace testing {
+
+bool holdAsyncThreadPoolLeaseForTesting(const std::function<void()>& callback) {
+  auto lease = getCommsThreadPoolState().acquire();
+  if (!lease) {
+    return false;
+  }
+  callback();
+  return true;
+}
+
+void waitForAsyncThreadPoolShutdownForTesting() {
+  getCommsThreadPoolState().waitForShutdownToStart();
+}
+
+bool asyncThreadPoolLeaseAvailableForTesting() {
+  return static_cast<bool>(getCommsThreadPoolState().acquire());
+}
+
+} // namespace testing
 
 bool shouldWriteCommsLogToStderr(std::string_view formattedMessage) {
   /*
@@ -243,17 +415,64 @@ bool shouldWriteCommsLogToStderr(std::string_view formattedMessage) {
 }
 
 CommsSpdlogLogger::CommsSpdlogLogger()
-    : CommsSpdlogLogger(std::string{kLoggerName}) {}
+    : CommsSpdlogLogger(std::string{kCommsLoggerName}) {}
 
 CommsSpdlogLogger::CommsSpdlogLogger(std::string name)
-    : logger_(createLogger(std::move(name))),
-      outputSink_(
-          std::make_shared<spdlog::sinks::dist_sink_mt>(logger_->sinks())) {
+    : logger_(createLogger(std::move(name))) {
+  outputSink_ = std::make_shared<spdlog::sinks::dist_sink_mt>(logger_->sinks());
   logger_->sinks() = {outputSink_};
   synchronousLogger_ =
       std::make_shared<spdlog::logger>(logger_->name(), outputSink_);
   synchronousLogger_->set_level(spdlog::level::trace);
   storeConfiguration(std::make_shared<const Configuration>());
+}
+
+CommsLogStreamBase::CommsLogStreamBase(
+    CommsSpdlogLogger& logger,
+    spdlog::source_loc location,
+    spdlog::level::level_enum level)
+    : logger_(logger), location_(location), level_(level) {}
+
+std::ostream& CommsLogStreamBase::stream() {
+  return stream_;
+}
+
+void CommsLogStreamBase::log() {
+  logger_.log(location_, level_, stream_.str());
+}
+
+[[noreturn]] void CommsLogStreamBase::logFatalAndAbort() noexcept {
+  try {
+    logger_.flush();
+    shutdownSpdlogForFatal();
+    logger_.logFatal(location_, stream_.str());
+  } catch (...) {
+    abortAfterCommsLoggingFailure();
+  }
+  std::abort();
+}
+
+CommsLogStream::CommsLogStream(
+    CommsSpdlogLogger& logger,
+    spdlog::source_loc location,
+    spdlog::level::level_enum level)
+    : CommsLogStreamBase(logger, location, level) {}
+
+CommsLogStream::~CommsLogStream() noexcept {
+  try {
+    log();
+  } catch (...) {
+    reportCommsLoggingFailureToStderr("ERROR");
+  }
+}
+
+CommsFatalLogStream::CommsFatalLogStream(
+    CommsSpdlogLogger& logger,
+    spdlog::source_loc location)
+    : CommsLogStreamBase(logger, location, spdlog::level::critical) {}
+
+[[noreturn]] CommsFatalLogStream::~CommsFatalLogStream() noexcept {
+  logFatalAndAbort();
 }
 
 std::string_view CommsSpdlogLogger::getLevelName(
@@ -283,8 +502,13 @@ bool CommsSpdlogLogger::usesAsyncLogging() const {
 }
 
 void CommsSpdlogLogger::flush() {
-  logger_->flush();
-  if (!usesAsyncLogging()) {
+  // Once the async pool is gone, spdlog reports the failed post through its
+  // error handler and drops the flush, so use the synchronous path instead.
+  const auto threadPoolLease = getCommsThreadPoolState().acquire();
+  if (threadPoolLease) {
+    logger_->flush();
+  }
+  if (!usesAsyncLogging() || !threadPoolLease) {
     synchronousLogger_->flush();
   }
 }
@@ -391,7 +615,9 @@ void CommsSpdlogLogger::logFormatted(
     std::string_view levelName,
     std::string_view message,
     bool bypassLevelGate) {
-  static const auto hostname = getHostName();
+  // Leaked for the reason PeriodicSinkFlusher documents: threads that outlive
+  // exit-time destruction still format messages through here.
+  static const auto* hostname = new std::string{getHostName()};
   static const auto processId = getpid();
   const auto configuration = loadConfiguration();
   if (level >= spdlog::level::err && configuration->errorCallback &&
@@ -409,12 +635,13 @@ void CommsSpdlogLogger::logFormatted(
        getCurrentThreadId(),
        getBaseName(location.filename),
        static_cast<unsigned int>(location.line),
-       hostname,
+       *hostname,
        processId,
        configuration->threadContextFn(),
-       threadName,
+       getLogThreadName(),
        configuration->prefix});
-  if (bypassLevelGate || !configuration->asyncLogging) {
+  const auto threadPoolLease = getCommsThreadPoolState().acquire();
+  if (bypassLevelGate || !configuration->asyncLogging || !threadPoolLease) {
     synchronousLogger_->log(location, level, formatted);
     synchronousLogger_->flush();
   } else {
@@ -423,31 +650,44 @@ void CommsSpdlogLogger::logFormatted(
 }
 
 CommsSpdlogLogger& getSpdlogLogger() {
-  static CommsSpdlogLogger logger;
-  return logger;
+  // Leaked; see PeriodicSinkFlusher for why nothing here may have a destructor.
+  static auto* logger = new CommsSpdlogLogger{};
+  return *logger;
 }
 
 CommsSpdlogLogger& getSpdlogLogger(std::string_view loggerName) {
-  if (loggerName == kLoggerName) {
+  if (loggerName == kCommsLoggerName) {
     return getSpdlogLogger();
   }
-  static std::shared_mutex mutex;
-  static std::map<std::string, std::unique_ptr<CommsSpdlogLogger>, std::less<>>
-      loggers;
+  // Leaked as a unit: destroying the map would destroy every named logger, and
+  // destroying the mutex would strand any thread still looking one up.
+  static auto* registry = new NamedLoggerRegistry{};
   {
-    std::shared_lock lock{mutex};
-    if (const auto it = loggers.find(loggerName); it != loggers.end()) {
+    std::shared_lock lock{registry->mutex};
+    if (const auto it = registry->loggers.find(loggerName);
+        it != registry->loggers.end()) {
       return *it->second;
     }
   }
-  std::unique_lock lock{mutex};
-  if (const auto it = loggers.find(loggerName); it != loggers.end()) {
+  std::unique_lock lock{registry->mutex};
+  if (const auto it = registry->loggers.find(loggerName);
+      it != registry->loggers.end()) {
     return *it->second;
   }
   auto name = std::string{loggerName};
   auto logger = std::make_unique<CommsSpdlogLogger>(name);
-  const auto it = loggers.emplace(std::move(name), std::move(logger)).first;
+  const auto it =
+      registry->loggers.emplace(std::move(name), std::move(logger)).first;
   return *it->second;
+}
+
+CommsSpdlogLogger& getSpdlogLoggerForFatal(
+    std::string_view loggerName) noexcept {
+  try {
+    return getSpdlogLogger(loggerName);
+  } catch (...) {
+    abortAfterCommsLoggingFailure();
+  }
 }
 
 void configureSpdlogLogger(
@@ -472,8 +712,40 @@ void configureSpdlogLogger(
   logger.configureOutput(logFilePath);
 }
 
+void configureCommsAndNamedSpdlogLoggers(
+    std::string_view loggerName,
+    std::string logPrefix,
+    std::string_view logFilePath,
+    std::function<int(void)> threadContextFn,
+    std::function<void(std::string_view)> errorCallback,
+    bool asyncLogging,
+    spdlog::level::level_enum logLevel,
+    bool configureCommsLogger) {
+  if (configureCommsLogger || loggerName == kCommsLoggerName) {
+    configureSpdlogLogger(
+        kCommsLoggerName,
+        "COMM",
+        logFilePath,
+        threadContextFn,
+        errorCallback,
+        asyncLogging);
+    getSpdlogLogger().set_level(logLevel);
+  }
+
+  if (loggerName != kCommsLoggerName) {
+    configureSpdlogLogger(
+        loggerName,
+        std::move(logPrefix),
+        logFilePath,
+        std::move(threadContextFn),
+        std::move(errorCallback),
+        asyncLogging);
+    getSpdlogLogger(loggerName).set_level(logLevel);
+  }
+}
+
 void setSpdlogThreadName(std::string_view name) {
-  threadName = name;
+  setLogThreadName(name);
 }
 
 } // namespace meta::comms::logger

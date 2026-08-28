@@ -40,9 +40,18 @@ std::string getHostName(const char delim) {
 struct ProcMetaData {
   std::string hostname;
   int pid{};
-} procMetaData;
-folly::once_flag procMetaDataInitFlag;
-static thread_local std::string myThreadName = "main";
+  folly::once_flag initFlag;
+};
+
+ProcMetaData& getProcMetaData() {
+  /*
+   * Retain process metadata for the process lifetime because formatting may run
+   * during static destruction. Keeping the initialization guard here also
+   * prevents its destruction from racing with initialization.
+   */
+  static auto* metaData = new ProcMetaData{};
+  return *metaData;
+}
 
 struct LastErrorInfo {
   std::string lastErrorMessage;
@@ -57,7 +66,12 @@ struct LastErrorInfo {
   std::vector<std::string> lastErrorNativeStack;
 };
 
-static folly::Synchronized<LastErrorInfo> lastCommsError{};
+folly::Synchronized<LastErrorInfo>& getLastCommsErrorStorage() {
+  // Error callbacks remain reachable from logger threads during static
+  // destruction, so this storage must not register an exit-time destructor.
+  static auto* storage = new folly::Synchronized<LastErrorInfo>{};
+  return *storage;
+}
 } // Anonymous namespace
 
 namespace meta::comms::logger {
@@ -189,11 +203,11 @@ std::string parseDebugFile(const char* ncclDebugFileEnv) {
             dfn,
             PATH_MAX + 1 - (dfn - debugFn),
             "%s",
-            procMetaData.hostname.c_str());
+            getProcMetaData().hostname.c_str());
         break;
       case 'p': // %p = pid
         dfn += snprintf(
-            dfn, PATH_MAX + 1 - (dfn - debugFn), "%d", procMetaData.pid);
+            dfn, PATH_MAX + 1 - (dfn - debugFn), "%d", getProcMetaData().pid);
         break;
       default: // Echo everything we don't understand
         *dfn++ = '%';
@@ -238,18 +252,16 @@ LogLevel getLoggerDebugLevel(std::string_view level) {
 }
 
 void initProcMetaData() {
-  folly::call_once(procMetaDataInitFlag, []() {
-    procMetaData.hostname = getHostName('.');
-    procMetaData.pid = getpid();
+  auto& metaData = getProcMetaData();
+  folly::call_once(metaData.initFlag, [&metaData]() {
+    metaData.hostname = getHostName('.');
+    metaData.pid = getpid();
   });
 }
 
 void initThreadMetaData(std::string_view threadName) {
   static thread_local folly::once_flag threadNameFlag;
-  folly::call_once(threadNameFlag, [&]() {
-    myThreadName = threadName;
-    setSpdlogThreadName(threadName);
-  });
+  folly::call_once(threadNameFlag, [&]() { setSpdlogThreadName(threadName); });
 }
 
 std::string NcclLogFormatter::formatMessage(
@@ -266,7 +278,7 @@ std::string NcclLogFormatter::formatMessage(
     // the call site's logErrorToScuba(), which runs after this formatter,
     // re-sets it when present, and a bare XLOG(ERR) correctly falls back to the
     // legacy per-frame chain.
-    auto lockedError = lastCommsError.wlock();
+    auto lockedError = getLastCommsErrorStorage().wlock();
     lockedError->lastErrorMessage = message.getMessage();
     lockedError->lastErrorNativeStack.clear();
   }
@@ -284,10 +296,10 @@ std::string NcclLogFormatter::formatMessage(
        .threadId = message.getThreadID(),
        .filename = std::string_view{basename.data(), basename.size()},
        .lineNumber = message.getLineNumber(),
-       .hostname = procMetaData.hostname,
-       .processId = procMetaData.pid,
+       .hostname = getProcMetaData().hostname,
+       .processId = getProcMetaData().pid,
        .threadContext = cudaDev,
-       .threadName = myThreadName,
+       .threadName = getLogThreadName(),
        .prefix = prefix_});
 }
 
@@ -307,7 +319,7 @@ void logErrorToScuba(
 }
 
 void setLastError(const std::string& message, std::vector<std::string> stack) {
-  auto w = lastCommsError.wlock();
+  auto w = getLastCommsErrorStorage().wlock();
   w->lastErrorMessage = message;
   w->lastErrorNativeStack = std::move(stack);
 }
@@ -330,7 +342,7 @@ void logCommErrorToScuba(commResult_t code, const std::string& message) {
 std::string getLastCommsError() {
   std::ostringstream ss;
   {
-    auto lastCommsErrorRLocked = lastCommsError.rlock();
+    auto lastCommsErrorRLocked = getLastCommsErrorStorage().rlock();
     ss << lastCommsErrorRLocked->lastErrorMessage << "\nNCCL Stack trace:";
     // Prefer the native captured stack; fall back to the legacy per-frame
     // chain (still populated by v2_27/v2_29) when no native stack is present.
@@ -351,7 +363,8 @@ std::string getLastCommsError() {
 // LoggingFormat.h) -- v2_30/ctran use captureNativeErrorStack() +
 // setLastError().
 void appendErrorToStack(std::string error) {
-  lastCommsError.wlock()->lastErrorStack.push_back(std::move(error));
+  getLastCommsErrorStorage().wlock()->lastErrorStack.push_back(
+      std::move(error));
 }
 
 NcclLogFormatter::NcclLogFormatter(

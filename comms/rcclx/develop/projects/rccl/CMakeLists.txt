@@ -919,7 +919,7 @@ list(FILTER PIPES_SOURCES EXCLUDE REGEX "MultimemHandler\\.")
 # Exclude MultiPeerNvlTransport — it depends on GpuMemHandler.h which is excluded.
 list(FILTER PIPES_SOURCES EXCLUDE REGEX "MultiPeerNvlTransport\\.")
 # Exclude comms/prims/transport/amd/ — the AMD GDA (GPUDirect Async) verbs backend
-# (pipes_gda, mlx5/bnxt nic backends) is only consumed by the excluded
+# (prims_amd_gda, mlx5/bnxt nic backends) is only consumed by the excluded
 # MultipeerIbgdaTransport, and depends on mlx5dv/bnxt direct-verbs headers
 # (infiniband/mlx5dv.h, BnxtReDv.h) not available in this build.
 list(FILTER PIPES_SOURCES EXCLUDE REGEX "comms/prims/transport/amd/.*")
@@ -1090,6 +1090,8 @@ set(COMMON_FILES
   comms/utils/logger/BackendTopologyUtil.h
   comms/utils/logger/CommsLogFormatter.cc
   comms/utils/logger/CommsLogFormatter.h
+  comms/utils/logger/CudaLog.cc
+  comms/utils/logger/CudaLog.h
   comms/utils/logger/DataSink.h
   comms/utils/logger/DataTable.cc
   comms/utils/logger/DataTable.h
@@ -1105,6 +1107,8 @@ set(COMMON_FILES
   comms/utils/logger/EventsScubaUtil.h
   comms/utils/logger/Logger.cc
   comms/utils/logger/Logger.h
+  comms/utils/logger/LoggerRuntime.cc
+  comms/utils/logger/LoggerRuntime.h
   comms/utils/logger/LoggingFormat.cc
   comms/utils/logger/LoggingFormat.h
   comms/utils/logger/LogTypes.cc

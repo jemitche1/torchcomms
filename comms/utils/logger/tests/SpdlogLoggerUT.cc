@@ -5,7 +5,10 @@
 
 #include "comms/utils/logger/SpdlogLogger.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -17,7 +20,16 @@
 
 #include <gtest/gtest.h>
 
+#include "comms/utils/logger/CommsLogFormatter.h"
+#include "comms/utils/logger/CudaLog.h"
+
 using meta::comms::logger::getSpdlogLogger;
+
+namespace meta::comms::logger::testing {
+bool holdAsyncThreadPoolLeaseForTesting(const std::function<void()>& callback);
+void waitForAsyncThreadPoolShutdownForTesting();
+bool asyncThreadPoolLeaseAvailableForTesting();
+} // namespace meta::comms::logger::testing
 
 class ScopedTestFile {
  public:
@@ -67,7 +79,13 @@ bool waitForFileToContain(
 class LogLevelRestoringTest : public testing::Test {
  protected:
   void TearDown() override {
-    getSpdlogLogger().set_level(spdlog::level::info);
+    const auto resetLogger = [](auto& logger, std::string prefix) {
+      logger.configure(std::move(prefix), []() { return 0; }, {}, false);
+      logger.set_level(spdlog::level::info);
+    };
+    resetLogger(getSpdlogLogger(), "COMMS");
+    resetLogger(getSpdlogLogger("comms.paired_test"), "PAIRED");
+    resetLogger(getSpdlogLogger("comms.named_only_test"), "NAMED_ONLY");
   }
 };
 
@@ -81,6 +99,60 @@ TEST(SpdlogLoggerTest, ReturnsStableLoggerPerContext) {
   EXPECT_EQ(&ctranLogger, &getSpdlogLogger("comms.ctran"));
   EXPECT_NE(&ctranLogger, &getSpdlogLogger("comms.ncclx"));
   EXPECT_EQ(ctranLogger.name(), "comms.ctran");
+}
+
+TEST(SpdlogLoggerTest, SupportsLoggerExpressionDbg5Stream) {
+  auto& logger = getSpdlogLogger("comms.dbg5_stream_test");
+  logger.set_level(spdlog::level::off);
+
+  COMMS_LOGGER_STREAM(logger, DBG5) << "suppressed trace message";
+}
+
+TEST_F(LogLevelRestoringTest, ConfiguresSharedAndNamedLoggersTogether) {
+  constexpr std::string_view kNamedLoggerName{"comms.paired_test"};
+  std::vector<std::string> errors;
+
+  meta::comms::logger::configureCommsAndNamedSpdlogLoggers(
+      kNamedLoggerName,
+      "NAMED",
+      "",
+      []() { return 0; },
+      [&](std::string_view message) { errors.emplace_back(message); },
+      false,
+      spdlog::level::err);
+
+  COMMS_LOG(ERR, "shared error");
+  COMMS_LOG_NAMED(kNamedLoggerName, ERR, "named error");
+
+  EXPECT_EQ(errors, (std::vector<std::string>{"shared error", "named error"}));
+}
+
+TEST_F(LogLevelRestoringTest, ConfiguresOnlyNamedLoggerWhenRequested) {
+  constexpr std::string_view kNamedLoggerName{"comms.named_only_test"};
+  std::vector<std::string> sharedErrors;
+  std::vector<std::string> namedErrors;
+  getSpdlogLogger().configure(
+      "SHARED",
+      []() { return 0; },
+      [&](std::string_view message) { sharedErrors.emplace_back(message); },
+      false);
+  getSpdlogLogger().set_level(spdlog::level::err);
+
+  meta::comms::logger::configureCommsAndNamedSpdlogLoggers(
+      kNamedLoggerName,
+      "NAMED_ONLY",
+      "",
+      []() { return 0; },
+      [&](std::string_view message) { namedErrors.emplace_back(message); },
+      false,
+      spdlog::level::err,
+      false);
+
+  COMMS_LOG(ERR, "shared error");
+  COMMS_LOG_NAMED(kNamedLoggerName, ERR, "named error");
+
+  EXPECT_EQ(sharedErrors, (std::vector<std::string>{"shared error"}));
+  EXPECT_EQ(namedErrors, (std::vector<std::string>{"named error"}));
 }
 
 TEST(SpdlogLoggerTest, MatchesLegacyStderrRouting) {
@@ -220,6 +292,31 @@ TEST_F(LogLevelRestoringTest, RuntimeGateSkipsArguments) {
   EXPECT_EQ(evaluationCount, 1);
 }
 
+TEST_F(LogLevelRestoringTest, CudaFacadeFormatsAndGatesMessages) {
+  const ScopedTestFile scopedLogFile{"comms_cuda_log.log"};
+  auto& logger = getSpdlogLogger();
+  logger.configureOutput(scopedLogFile.path().string());
+  logger.configure("TEST", []() { return 0; }, {}, false);
+  logger.set_level(spdlog::level::warn);
+
+  int evaluationCount = 0;
+  COMMS_CUDA_LOG(INFO, "filtered value %d", ++evaluationCount);
+  COMMS_CUDA_LOG(WARN, "cuda facade value %d", 7);
+  const std::string largeMessage(600, 'x');
+  COMMS_CUDA_LOG(WARN, "large cuda facade value %s", largeMessage.c_str());
+  logger.flush();
+
+  const auto output = readFile(scopedLogFile.path());
+  EXPECT_EQ(evaluationCount, 0);
+  EXPECT_NE(output.find("cuda facade value 7"), std::string::npos);
+  EXPECT_NE(
+      output.find("large cuda facade value " + largeMessage),
+      std::string::npos);
+
+  logger.configureOutput({});
+  logger.configure("COMMS", []() { return 0; });
+}
+
 TEST_F(LogLevelRestoringTest, EmptyThreadContextUsesDefault) {
   getSpdlogLogger().set_level(spdlog::level::info);
   meta::comms::logger::configureSpdlogLogger("TEST", {});
@@ -301,6 +398,190 @@ TEST(SpdlogLoggerTest, ErrorCallbackExceptionDoesNotEscapeLogCall) {
   EXPECT_NO_THROW(COMMS_LOG_NAMED(kContext, ERR, "second error"));
   EXPECT_EQ(callbackCount, 2);
   logger.configure("TEST", []() { return 0; }, {});
+}
+
+/*
+ * Reproduces an exit without destroy_process_group: the communicator's threads
+ * are never joined, so they keep logging while static destructors run. The
+ * atexit handler is registered before the first getSpdlogLogger() call, so LIFO
+ * ordering runs it after everything the logging singletons would have
+ * destroyed.
+ */
+TEST(SpdlogLoggerTest, UnjoinedThreadCanLogDuringStaticDestruction) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        static std::atomic<bool> destructionStarted{false};
+        static std::atomic<bool> backgroundThreadDone{false};
+        constexpr std::string_view kNamedContext{"comms.teardown_test"};
+        constexpr std::string_view kLateNamedContext{
+            "comms.teardown_late_test"};
+
+        std::thread{[=]() {
+          while (!destructionStarted.load()) {
+            /* sleep override */
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+          }
+          COMMS_LOG(WARN, "shared logger survived teardown");
+          COMMS_LOG_NAMED(
+              kNamedContext, WARN, "named logger survived teardown");
+          COMMS_LOG_NAMED(
+              kLateNamedContext,
+              WARN,
+              "late-created named logger survived teardown");
+          backgroundThreadDone.store(true);
+        }}.detach();
+
+        std::atexit([]() {
+          destructionStarted.store(true);
+          const auto deadline =
+              std::chrono::steady_clock::now() + std::chrono::seconds{5};
+          while (!backgroundThreadDone.load() &&
+                 std::chrono::steady_clock::now() < deadline) {
+            /* sleep override */
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+          }
+        });
+
+        const auto configureForStderr = [](auto& logger) {
+          // Async configuration also exercises exit-time shutdown of the
+          // periodic sink flusher before the logging thread runs.
+          logger.configure("TEST", []() { return 0; }, {}, true);
+          logger.set_level(spdlog::level::info);
+        };
+        configureForStderr(getSpdlogLogger());
+        configureForStderr(getSpdlogLogger(kNamedContext));
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "shared logger survived teardown(.|\\n)*named logger survived "
+      "teardown(.|\\n)*late-created named logger survived teardown");
+}
+
+/*
+ * Exercises logging from an atexit handler after non-trivial TLS teardown. A
+ * maximum-length name prevents small-string optimization from hiding a
+ * lifetime error and verifies that the name remains intact.
+ */
+TEST(SpdlogLoggerTest, ExitingThreadCanLogFromAtexitAfterTlsTeardown) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        const std::string longThreadName(
+            meta::comms::logger::kMaxLogThreadNameLength, 'n');
+        meta::comms::logger::setSpdlogThreadName(longThreadName);
+
+        auto& logger = getSpdlogLogger();
+        logger.configure("TEST", []() { return 0; }, {}, true);
+        logger.set_level(spdlog::level::info);
+
+        std::atexit([]() {
+          COMMS_LOG(WARN, "logged from atexit on the exiting thread");
+        });
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "\\[n{63}\\].*logged from atexit on the exiting thread");
+}
+
+TEST(SpdlogLoggerTest, ThreadNameIsTruncatedToStorageCapacity) {
+  const std::string overlongName(
+      meta::comms::logger::kMaxLogThreadNameLength + 17, 'z');
+  meta::comms::logger::setSpdlogThreadName(overlongName);
+  EXPECT_EQ(
+      meta::comms::logger::getLogThreadName(),
+      std::string(meta::comms::logger::kMaxLogThreadNameLength, 'z'));
+
+  meta::comms::logger::setSpdlogThreadName("main");
+  EXPECT_EQ(meta::comms::logger::getLogThreadName(), "main");
+}
+
+TEST(SpdlogLoggerTest, AsyncLoggingFallsBackWhenThreadPoolIsGone) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        auto& logger = getSpdlogLogger();
+        logger.configure("TEST", []() { return 0; }, {}, true);
+        logger.set_level(spdlog::level::info);
+        // Run shutdown in the logger library's translation unit. Sanitizer
+        // builds may link a separate spdlog registry into this test binary.
+        meta::comms::logger::shutdownSpdlogForFatal();
+
+        COMMS_LOG(WARN, "delivered after thread pool teardown");
+        // flush() must also fall back rather than posting to the dead pool.
+        logger.flush();
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "delivered after thread pool teardown");
+}
+
+TEST(SpdlogLoggerTest, ShutdownWaitsForActiveLeaseAndRejectsNewLeases) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        auto& logger = getSpdlogLogger();
+        logger.configure("TEST", []() { return 0; }, {}, true);
+        logger.set_level(spdlog::level::info);
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool leaseHeld = false;
+        bool releaseLease = false;
+        std::atomic<bool> shutdownDone{false};
+
+        std::thread leaseHolder{[&]() {
+          const auto acquired =
+              meta::comms::logger::testing::holdAsyncThreadPoolLeaseForTesting(
+                  [&]() {
+                    std::unique_lock lock{mutex};
+                    leaseHeld = true;
+                    cv.notify_all();
+                    cv.wait(lock, [&]() { return releaseLease; });
+                  });
+          if (!acquired) {
+            std::_Exit(2);
+          }
+        }};
+
+        {
+          std::unique_lock lock{mutex};
+          if (!cv.wait_for(
+                  lock, std::chrono::seconds{5}, [&]() { return leaseHeld; })) {
+            std::_Exit(3);
+          }
+        }
+
+        std::thread shutdown{[&]() {
+          meta::comms::logger::shutdownSpdlogForFatal();
+          shutdownDone.store(true);
+        }};
+        meta::comms::logger::testing::
+            waitForAsyncThreadPoolShutdownForTesting();
+
+        if (shutdownDone.load()) {
+          std::_Exit(4);
+        }
+        if (meta::comms::logger::testing::
+                asyncThreadPoolLeaseAvailableForTesting()) {
+          std::_Exit(5);
+        }
+        COMMS_LOG(WARN, "synchronous log while shutdown waits for lease");
+
+        {
+          std::lock_guard lock{mutex};
+          releaseLease = true;
+        }
+        cv.notify_all();
+        leaseHolder.join();
+        shutdown.join();
+        if (!shutdownDone.load()) {
+          std::_Exit(6);
+        }
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "synchronous log while shutdown waits for lease");
 }
 
 TEST(SpdlogLoggerTest, FileOpenFailureIncludesPath) {
