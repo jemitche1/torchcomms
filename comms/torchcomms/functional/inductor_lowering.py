@@ -35,6 +35,164 @@ try:  # noqa: C901
     from torch._inductor import ir
     from torch._inductor.lowering import register_lowering
 
+    def _register_sideeffect_lowering(base_op_name: str, schema) -> None:
+        """Register a _CollectiveKernel-based lowering for no-mutable-arg ops.
+
+        Ops like barrier() and send() have no mutable tensor arg, so
+        register_torchcomms_lowerings previously skipped custom lowering
+        for them entirely, leaving them to the generic torch._inductor
+        with_effects fallback (a plain ir.FallbackKernel).
+
+        That matters because torch._inductor.comms.decide_global_ordering_of_comms
+        - the pass whose entire job is to "enforce the ordering that's in
+        the input graph" for communication ops - only considers a node for
+        ordering if torch._inductor.utils.is_collective() recognizes it,
+        which requires isinstance(node, ir._CollectiveKernel). A plain
+        ir.FallbackKernel is invisible to that pass. So a mutating op like
+        recv() (which does get a _CollectiveKernel via
+        _register_functional_lowering/_register_inplace_lowering) is
+        correctly kept in program order, while barrier()/send() are not -
+        letting the scheduler reorder recv() ahead of them even though the
+        traced program order was barrier() -> send() -> recv(). Point-to-
+        point patterns (e.g. an even/odd send-then-recv vs. recv-then-send
+        ring used specifically to avoid deadlock) depend on that order
+        being preserved exactly, so this reordering causes a real
+        deadlock, not just a performance regression.
+
+        These ops' schemas say ``Tensor?`` (Optional) because whether they
+        return a real tensor depends on the *value* of async_op at trace
+        time, not on which op it is: barrier(async_op=True)/
+        send(async_op=True) return a real (small, often opaque "work
+        handle") tensor that a later .wait() call needs a genuine
+        reference to, while the async_op=False case returns nothing.
+        So the actual fake-traced example_output is inspected and handled
+        either way: a real tensor gets a FixedLayout _CollectiveKernel (so
+        is_collective() still recognizes it and a real handle is available
+        for .wait()), and a genuine None gets a NoneLayout _CollectiveKernel
+        (the same pattern _register_inplace_lowering uses for mutating
+        ops, minus the mutation_outputs since there is nothing to mutate).
+
+        process_kernel (which fake-traces the underlying op to determine
+        its output) is called exactly once here, not once per branch. An
+        earlier version of this function called it a second time in the
+        None branch after already using it to decide which branch to take.
+        That is wrong for any op whose real kernel does request/sequence-
+        number bookkeeping even under fake tracing (as collective ops
+        often do to pair up requests across ranks) - the extra trace call
+        looks like a second real invocation and desyncs that bookkeeping
+        from what actually runs, which showed up as a torchcomm_barrier()
+        call in the same compiled function as torchcomm_reduce_scatter_v()
+        corrupting the latter's result (wrong values, and on one rank a
+        segfault) even though reduce_scatter_v's own lowering was
+        untouched by this change.
+
+        A version of this function that routed the real-tensor
+        (async_op=True) case through a plain ir.FallbackKernel instead of
+        _CollectiveKernel (leaving is_collective() unable to recognize
+        barrier(async_op=True)/send(async_op=True)) was tried as a more
+        conservative fix, since a prior _CollectiveKernel-based version of
+        this branch had caused a hang in a test combining
+        barrier(async_op=True) with reduce_scatter_v. That conservative
+        version passed test_fullgraph_compile_send_recv in isolation
+        (every count/dtype/async_op combination) but still hung on its
+        async_op=True case specifically inside the full ~200-compile
+        FullgraphCompileTest discover suite - i.e. the same
+        works-in-isolation-fails-in-a-larger-run non-determinism seen with
+        reduce_scatter_v, just for a different pair of ops. Given the sync
+        case's deadlock was fixed by making it a _CollectiveKernel, the
+        async case likely needs the same treatment for the same reason
+        (is_collective() recognition -> decide_global_ordering_of_comms
+        participation), so both branches build a _CollectiveKernel again
+        here.
+        """
+        from torch._inductor.virtualized import V
+
+        functional_op = getattr(torch.ops.torchcomms, base_op_name, None)
+        if functional_op is None:
+            return
+
+        def _sideeffect_lowering(*args):
+            logger.debug(f"Lowering side-effect-capable {base_op_name}")
+
+            with V.graph.fake_mode:
+                (
+                    example_output,
+                    tensor_args,
+                    non_tensor_args,
+                    unflatten_args,
+                    unbacked_bindings,
+                ) = _unpack_process_kernel(
+                    ir._CollectiveKernel.process_kernel(functional_op.default, *args)
+                )
+            assert not unbacked_bindings, f"{functional_op} {unbacked_bindings}"
+
+            if isinstance(example_output, torch.Tensor):
+                for tensor_arg in tensor_args:
+                    if not isinstance(tensor_arg, ir.TorchBindObject):
+                        tensor_arg.realize()
+                packed = ir._CollectiveKernel(
+                    ir._CollectiveKernel.tensor_to_layout(example_output),
+                    functional_op.default,
+                    tensor_args,
+                    non_tensor_args,
+                    unflatten_args,
+                )
+                packed.outputs = [packed]
+                return ir.TensorBox.create(packed)
+
+            device = None
+            for a in args:
+                if isinstance(a, ir.TensorBox):
+                    a.realize()
+                    if device is None:
+                        device = a.get_device()
+            if device is None:
+                # Ops like barrier() take no tensor arg at all, so there is
+                # nothing above to derive a device from. If this happens to
+                # be the first op lowered in the graph, V.graph.current_device
+                # may also still be unset (nothing has claimed a device
+                # context yet), so get_current_device_or_throw() would raise.
+                # Fall back to any real tensor among the compiled function's
+                # own inputs - the collective still runs on that device.
+                device = V.graph.current_device
+            if device is None:
+                for graph_input in V.graph.graph_inputs.values():
+                    if isinstance(graph_input, ir.IRNode):
+                        try:
+                            device = graph_input.get_device()
+                        except Exception:
+                            device = None
+                        if device is not None:
+                            break
+            if device is None:
+                # Last resort: this process is already bound to a specific
+                # accelerator device (e.g. torch.xpu.set_device() in the
+                # wrapper code that runs before any compiled kernel), so
+                # ask for that directly instead of trying to infer it from
+                # graph state.
+                try:
+                    device = torch.device(
+                        torch.accelerator.current_accelerator().type,
+                        torch.accelerator.current_device_index(),
+                    )
+                except Exception:
+                    device = None
+            if device is None:
+                device = V.graph.get_current_device_or_throw()
+
+            ir._CollectiveKernel(
+                ir.NoneLayout(device=device),
+                functional_op.default,
+                tensor_args,
+                non_tensor_args,
+                unflatten_args,
+            )
+
+            return None
+
+        register_lowering(functional_op.default)(_sideeffect_lowering)
+        logger.info(f"Registered side-effect-capable lowering: {base_op_name}")
+
     def register_torchcomms_lowerings():
         from torchcomms.functional import collectives
 
@@ -53,6 +211,14 @@ try:  # noqa: C901
                     _register_with_reinplace_pass(base_op_name, schema)
                     _register_inplace_lowering(base_op_name, schema)
                     _register_functional_lowering(base_op_name, schema)
+                else:
+                    # No mutable tensor arg (e.g. barrier(), send(), or
+                    # torchcommwindow_map_remote_tensor): still needs a
+                    # _CollectiveKernel-based lowering so Inductor's
+                    # scheduler recognizes it as a collective, regardless
+                    # of whether this particular call ends up producing a
+                    # real tensor output. See _register_sideeffect_lowering.
+                    _register_sideeffect_lowering(base_op_name, schema)
 
             # Register lowering for functional wait_tensors
             _register_wait_tensors_lowering()
