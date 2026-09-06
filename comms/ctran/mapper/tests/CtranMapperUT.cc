@@ -2,9 +2,15 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "comms/ctran/utils/CtranLogger.h"
 
 #include <cstdlib>
 #include <memory>
+#include <string>
+#include <vector>
+
+#include <fmt/core.h>
+#include <folly/String.h>
 
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/mapper/CtranMapperImpl.h"
@@ -12,7 +18,6 @@
 #include "comms/ctran/regcache/RegCache.h"
 #include "comms/ctran/tests/CtranTestUtils.h"
 #include "comms/testinfra/TestXPlatUtils.h"
-#include "comms/utils/logger/LogUtils.h"
 
 class CtranMapperTest : public ::testing::Test {
  public:
@@ -1269,14 +1274,18 @@ TEST_F(CtranMapperTest, exportMemFailsWithExtraSegments) {
 
 TEST_F(CtranMapperTest, RemoteAccessKeyToString) {
   CtranMapperRemoteAccessKey rkey1 = {.backend = CtranMapperBackend::IB};
+  std::vector<std::string> expectedKeys;
   for (auto i = 0; i < CTRAN_MAX_IB_DEVICES_PER_RANK; i++) {
     rkey1.ibKey.rkeys[i] = 291 + i;
+    expectedKeys.push_back(std::to_string(rkey1.ibKey.rkeys[i]));
   }
   rkey1.ibKey.nKeys = CTRAN_MAX_IB_DEVICES_PER_RANK;
   std::strncpy(
       rkey1.nvlKey.peerId, "host1:1234", ctran::regcache::kMaxPeerIdLen);
   rkey1.nvlKey.basePtr = (void*)0x4567890;
-  EXPECT_EQ(rkey1.toString(), "backend=IB, ibKey=[291, 292]");
+  EXPECT_EQ(
+      rkey1.toString(),
+      fmt::format("backend=IB, ibKey=[{}]", folly::join(", ", expectedKeys)));
 
   CtranMapperRemoteAccessKey rkey2 = rkey1;
   rkey2.backend = CtranMapperBackend::NVL;
@@ -1451,7 +1460,7 @@ class CtranMapperTestDisjoint : public ::testing::Test {
     }
     usedDisjointAllocation = true;
 
-    CLOGF(
+    CTRAN_LOG(
         INFO,
         "Disjoint allocation created {} segments: seg0[{}, {}], seg1[{}, {}]",
         segments.size(),
@@ -1462,7 +1471,7 @@ class CtranMapperTestDisjoint : public ::testing::Test {
 
     buf = (char*)bufBase + offset;
 
-    CLOGF(INFO, "bufBase: {}, buf: {}", bufBase, buf);
+    CTRAN_LOG(INFO, "bufBase: {}, buf: {}", bufBase, buf);
 
     // Turn on profiler after initialization to track only test registrations
     NCCL_CTRAN_REGISTER_REPORT_SNAPSHOT_COUNT = 0;

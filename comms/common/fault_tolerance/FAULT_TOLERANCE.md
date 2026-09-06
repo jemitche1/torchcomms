@@ -183,9 +183,31 @@ nextPollCycles_ = now + pollIntervalCycles_;
 ```
 
 `pollIntervalCycles_` is `cyclesPerMs_ / kAbortPollsPerMs` with
-`kAbortPollsPerMs = 100`, i.e. **100 shared reads per millisecond per handle**,
+`kAbortPollsPerMs = 1`, i.e. **one shared read per millisecond per handle**,
 independent of how fast the loop spins. Once a terminal reason has been seen,
 `sawTerminalReason_` answers from a register forever.
+
+That constant used to be 100, and gating the read was only half the job: the
+gate makes the cost independent of loop speed, but the *rate* still sets a
+fixed fraction of kernel runtime, namely `kAbortPollsPerMs x 1.1us / 1000us`.
+At 100 that is 11% of every collective, and it measured as exactly that: 4-rank
+IB_ONLY on GB300, `MCCL_ABORT_MODE=skip` against a same-session `none`, went
+from **+11.4us to +3.1us on tree and +10.8us to +5.6us on ring** when this
+constant moved to 1. Amortizing a 1.1us read to "only" once per 10us is not
+amortizing it.
+
+What that costs: abort-*observation* latency goes from ~10us to ~1ms. Deadline
+expiry is unaffected — `checkExpired()` tests `deadlineDue` ahead of the
+throttle, so a timeout still fires on time. This governs only how quickly one
+rank notices *another* rank's abort, and the only thing delayed is how fast an
+already-failed collective unwinds.
+
+`startTimeout()` seeds `nextPollCycles_` rather than leaving it at zero, so the
+first `checkExpired()` on an armed handle is throttled like every other. The
+cost is that an abort raised before the kernel started is observed up to one
+poll interval later, which is inside the bound this constant already advertises
+and is unreachable in practice because the host checks `Abort::isAborted()`
+before it launches.
 
 ### What it is worth
 
@@ -224,9 +246,10 @@ Two consequences worth internalizing:
 - Prefer one poller per group over one per thread when the loop is per-thread.
   The gate is per-handle-copy, so N thread-local copies mean N times the shared
   reads.
-- If you change `kAbortPollsPerMs`, re-run `abort_bench` and update both this
-  section and `Perf.md`. It trades abort-detection latency against shared-read
-  volume, and both numbers above move with it.
+- If you change `kAbortPollsPerMs`, re-run `abort_bench`, re-run the GB300
+  sweep, and update this section, `Perf.md`, and the constant's own comment.
+  It trades abort-detection latency against a fixed percentage of every
+  collective's runtime, and the cost is linear in the value.
 
 ## MPT And Prims Integration
 
@@ -346,31 +369,21 @@ For Prims-backed collectives:
 3. Kernel entry creates a local per-block copy and calls `startTimeout()`.
 4. Transport and synchronization waits poll that local abort handle.
 
-## Prims `Timeout` Compatibility
+## What Replaced the Prims `Timeout`
 
-Prims `Timeout` is a source-compatible alias to `AbortDevice` during the
-migration:
-
-```cpp
-using Timeout = comms::fault_tolerance::AbortDevice;
-```
-
-This preserves existing kernel signatures while removing the old standalone
-`Timeout` implementation. There is no per-launch GPU-cycle timeout object and
+`AbortDevice` is the only spelling. The standalone Prims `Timeout` and its
+transitional alias are gone: there is no per-launch GPU-cycle timeout object and
 no `makeTimeout()` helper. Timeout duration comes from the communicator-owned
 host `Abort` default timeout and is read by `AbortDevice::startTimeout()`.
 
-The behavior change is intentional:
+The behavior differences from the old `Timeout` are intentional:
 
-- Default-constructed `Timeout`/`AbortDevice` is disabled and behaves like the
-  previous no-timeout default.
+- A default-constructed `AbortDevice` is disabled and behaves like the previous
+  no-timeout default.
 - Handles borrowed from MPT observe explicit host aborts and timeout-triggered
   aborts through shared state.
 - Timeout expiry records `AbortReason::TIMED_OUT` once in shared abort state,
   making the result visible to host code and other device consumers.
-
-New code should name the concrete type `AbortDevice`. `Timeout` spelling is
-only for migration compatibility and should not be used in new Prims APIs.
 
 ### Per-operation timeouts
 
@@ -435,9 +448,9 @@ unlikely case of a `commSuccess`, the comm result data should still be ignored."
    handles outlive individual operations and are shared across blocks. Copy the
    handle per block and call `startTimeout()` on the copy.
 6. **Returning a status is welcome, not required.** Several waits return `bool`
-   and the IB progress path returns `Aborted`; that lets callers stop sooner and
-   more precisely. Callers are not *obliged* to consume it, so never rely on
-   propagation for liveness.
+   and the IB and NVL progress paths return `Aborted`; that lets callers stop
+   sooner and more precisely. Callers are not *obliged* to consume it, so never
+   rely on propagation for liveness.
 7. **Leave the channel state releasable.** A wait that unwinds must not strand
    the resource it was waiting on. In the IB progress path this is
    `abandon_progress_state()` (`P2pIbTransportProgressImpl.cuh`): every abort
@@ -451,6 +464,18 @@ unlikely case of a `commSuccess`, the comm result data should still be ignored."
    channel is fit to reuse. If a new wait acquires state of its own, releasing
    it on abort is part of adding the wait — pushing that onto the collective
    violates the containment principle.
+
+   The NVL progress path holds the same guarantee by the same shape:
+   `abandon_progress_state()` in `P2pNvlTransportDevice.cuh` drives the slot to
+   `Idle` — NVL's terminal stage — so the aborting call returns `Aborted` and a
+   later progress call short-circuits to `Done`, and the next
+   `init_*_progress()` passes `assert_progress_slot_idle()`. The channel cursor
+   stays advanced there too, because the peer may still write into the reserved
+   range over NVLink. `NvlSendRecvProgressStatus::Aborted` mirrors the IB enum,
+   so a transport-agnostic driver loop keeps one abort branch across both
+   transports: treat `Done` and `Aborted` alike as "stop polling this
+   operation", and take `Aborted` as the signal to consult the host `Abort` for
+   the reason rather than to record a completed transfer.
 
 ### Collective Enablement — onboarding a collective
 
@@ -538,7 +563,8 @@ Two things this audit turned up that are worth keeping written down:
   already armed one must use the four-argument overload — using the short one
   is the easiest way to end up with two budgets in a kernel, and it is how Tree
   did before this was fixed.
-- `prims::collectives::all_gather` takes its `Timeout` **by value and arms it**.
+- `prims::collectives::all_gather` takes its `AbortDevice` **by value and arms
+  it**.
   That is correct for its current callers, which are all kernel entries handing
   in an unarmed handle, but it means a collective that ever passes its own armed
   handle would silently get it re-armed. Prefer taking it by reference if that
@@ -547,7 +573,7 @@ Two things this audit turned up that are worth keeping written down:
 ### What the caller sees
 
 - The collective completes; **output buffers are undefined** after an abort.
-- Check `IComm::isAborted()`, `getAbortReason()` and `getAbortReasonStr()`.
+- Check `IComm::isAborted()` and `getAbortInfo()`.
 - Where the host can determine it cheaply, the work handle also reports a
   non-success result — but a `commSuccess` after an abort is contract-legal and
   its data must still be ignored.

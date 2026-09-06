@@ -2,7 +2,7 @@
 
 #include "CtranDistTestUtils.h"
 
-#include <folly/logging/xlog.h>
+#include "comms/ctran/utils/CtranLogger.h"
 
 #include "comms/ctran/tests/bootstrap/CtranTestBootstrap.h"
 #include "comms/ctran/utils/CudaUtils.h"
@@ -38,10 +38,6 @@ void CtranDistEnvironment::SetUp() {
 #if defined(TEST_ENABLE_LOCAL_REGISTER)
   setenv("NCCL_LOCAL_REGISTER", "1", 1);
 #endif
-
-#if defined(TEST_CUDA_GRAPH_MODE)
-  setenv("NCCL_CTRAN_ALLOW_CUDA_GRAPH", "1", 1);
-#endif
 }
 
 // ============================================================================
@@ -71,8 +67,8 @@ void CtranDistTestFixture::SetUp(const CtranEnvs& envs) {
   setenv("RANK", std::to_string(globalRank).c_str(), 1);
 
   if (globalRank == 0) {
-    XLOG(DBG) << "Testing with NCCL_COMM_STATE_DEBUG_TOPO="
-              << (isNolocalTopo() ? "nolocal" : "default");
+    CTRAN_LOG_STREAM(DBG) << "Testing with NCCL_COMM_STATE_DEBUG_TOPO="
+                          << (isNolocalTopo() ? "nolocal" : "default");
   }
 
   stream.emplace(cudaStreamNonBlocking);

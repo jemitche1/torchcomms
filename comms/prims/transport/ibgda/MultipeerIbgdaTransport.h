@@ -215,6 +215,10 @@ class MultipeerIbgdaTransport
    */
   int getGidIndex() const;
 
+  bool collapsedCqActive() const {
+    return collapsedCq_;
+  }
+
  private:
   // Helper methods
   void initDocaGpu();
@@ -249,11 +253,20 @@ class MultipeerIbgdaTransport
   // backend's doMaterializePeer()/cleanupPeerOnFailure() hooks.
   friend class MultiPeerIbTransport<MultipeerIbgdaTransport>;
 
-  // myRank_/nRanks_/bootstrap_/config_/registeredBuffers_/nics_/lazy-state are
+  // myRank_/nRanks_/bootstrap_/config_/registrationState_/nics_/lazy-state are
   // inherited (protected) from MultiPeerIbTransport.
 
   // DOCA GPU context (shared across NICs).
   doca_gpu* docaGpu_{nullptr};
+
+  // Resolved RDMA-Read/Atomic depth: config value (or MCCL_IBGDA_MAX_RD_ATOMIC)
+  // taken in the ctor, then clamped to NIC capability in openIbDevice(). The
+  // default of 1 reproduces the pre-existing wire behaviour exactly.
+  uint8_t maxRdAtomic_{1};
+
+  // One local format for every device-visible main and companion CQ. Resolved
+  // before any QP is created; the host-only loopback CQs remain ordinary rings.
+  bool collapsedCq_{false};
 
   // numNics_ is inherited (protected) from MultiPeerIbTransport;
   // nicDoca_.size() == numNics_ after openIbDevice().
@@ -275,6 +288,20 @@ class MultipeerIbgdaTransport
   };
   std::vector<NicDocaResources> nicDoca_;
 
+  // What was asked for: config value, or MCCL_IBGDA_QP_ORDERING_SEMANTIC when
+  // that cvar is set to something other than its registered default. Taken in
+  // the ctor, before openIbDevice() consults the NICs.
+  IbQpOrderingPolicy qpOrderingPolicy_{IbQpOrderingPolicy::Auto};
+
+  // What we actually got: the policy above resolved against every NIC's
+  // capability in openIbDevice(), narrowed to the least capable one. This is
+  // the value written to the QPC and exchanged with peers.
+  //
+  // Stays Ibta on AMD, where the whole dp_ordering path is compiled out and
+  // openIbDevice() never resolves anything -- so AMD keeps sending the same
+  // zero it always did.
+  IbQpOrderingSemantic qpOrderingSemantic_{IbQpOrderingSemantic::Ibta};
+
   // Sink buffer for RDMA atomic return values (discarded).
   // DOCA's OPCODE_ATOMIC_FA requires a local address for the fetch-add
   // return value. We don't need it, so we use a small "sink" buffer.
@@ -285,7 +312,7 @@ class MultipeerIbgdaTransport
   std::size_t sinkBufferAllocSize_{0};
   std::uint64_t sinkBufferHandle_{0};
 
-  // The refcounted MR cache (CachedMr + registeredBuffers_) lives in
+  // The refcounted MR cache (CachedMr + registrationState_) lives in
   // MultiPeerIbTransport.
 
   // GPU PCIe bus ID.

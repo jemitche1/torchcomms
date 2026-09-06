@@ -22,11 +22,33 @@ namespace comms::fault_tolerance {
 /**
  * Shared-abort-state polls per millisecond of device time.
  *
- * 100 polls/ms bounds abort-observation latency at ~10us - orders of magnitude
- * finer than any timeout that matters - while removing the mapped-host read
- * from the steady-state spin path.
+ * Each poll is a read of mapped pinned host memory, which is an uncached PCIe
+ * round trip measured at ~1.1us on H100 (`CudaAtomicDeviceLoadLoop` in
+ * `benchmarks/Perf.md`). So this constant is not a free knob: it sets a
+ * *fraction of kernel runtime* spent polling, and that fraction is
+ * `kAbortPollsPerMs * 1.1us / 1000us`.
+ *
+ * At the previous value of 100 that is **11% of every collective**, and it was
+ * measured as exactly that. A 4-rank IB_ONLY AllReduce on GB300 runs ~170us, so
+ * it paid ~17 polls; neutralizing the poll while leaving every barrier and
+ * branch in place took the fault-tolerance overhead from +11.4us to +1.1us
+ * (tree) and +10.8us to +3.0us (ring). Polling was the overhead.
+ *
+ * 1 poll/ms bounds abort-observation latency at ~1ms instead of ~10us, for
+ * ~0.1% of runtime. That is still four orders of magnitude finer than the
+ * deadlines this exists to serve -- `MCCL_ABORT_TIMEOUT_MS` defaults to 30
+ * seconds -- and the thing being delayed is only how fast an *already failed*
+ * collective unwinds. Nobody can measure a millisecond added to that.
+ *
+ * Deadline expiry is deliberately not affected: `checkExpired()` tests
+ * `deadlineDue` ahead of the throttle, so a timeout still fires on time no
+ * matter what this is set to. This governs only how quickly one rank notices
+ * *another* rank's abort.
+ *
+ * If you raise this, re-run `abort_bench` and the GB300 sweep and update both
+ * this comment and `FAULT_TOLERANCE.md`. The cost is linear in the value.
  */
-inline constexpr uint64_t kAbortPollsPerMs = 100;
+inline constexpr uint64_t kAbortPollsPerMs = 1;
 
 namespace detail {
 
@@ -121,6 +143,11 @@ deviceCompareExchangeSystem(int* value, int* expected, int desired) {
 #endif
 }
 
+__device__ __forceinline__ void publishContextReady(AbortState* state) {
+  int expected = 0;
+  (void)deviceCompareExchangeSystem(&state->contextReady, &expected, 1);
+}
+
 } // namespace detail
 
 /**
@@ -212,12 +239,16 @@ struct AbortDevice final {
       deadlineCycles_ = 0;
       return;
     }
+    const auto now = detail::deviceClock();
+    // Seeded here rather than left at zero: `nextPollCycles_{0}` makes the
+    // first `checkExpired()` on every armed handle unthrottled, which is one
+    // uncached mapped-pinned read on the one call guaranteed to happen.
+    nextPollCycles_ = now + pollIntervalCycles_;
     const auto timeoutMs = resolveTimeoutMs();
     if (timeoutMs <= 0 || cyclesPerMs_ == 0) {
       deadlineCycles_ = 0;
       return;
     }
-    const auto now = detail::deviceClock();
     const auto timeoutMsU = static_cast<uint64_t>(timeoutMs);
     if (timeoutMsU > (UINT64_MAX - now) / cyclesPerMs_) {
       deadlineCycles_ = now;
@@ -227,11 +258,10 @@ struct AbortDevice final {
   }
 
   /**
-   * Transition alias for Prims `Timeout::start()`.
+   * Legacy spelling of `startTimeout()`, kept for the Prims waits that were
+   * written against the retired standalone timeout type.
    *
-   * New device code should prefer `startTimeout()`. This exists so timeout
-   * shaped Prims waits can migrate to `AbortDevice` without introducing a
-   * separate adapter type.
+   * New device code should prefer `startTimeout()`.
    */
   __device__ void start() {
     startTimeout();
@@ -268,8 +298,8 @@ struct AbortDevice final {
    * performed by Prims helpers so common fault-tolerance code stays transport
    * agnostic.
    */
-  __device__ AbortCheckResult check() const {
-    if (!checkExpired()) {
+  __device__ AbortCheckResult check(bool* flippedHere = nullptr) const {
+    if (!checkExpired(flippedHere)) {
       return AbortCheckResult::CONTINUE;
     }
     return behavior_ == AbortBehavior::TRAP ? AbortCheckResult::TRAP
@@ -277,13 +307,16 @@ struct AbortDevice final {
   }
 
   /**
-   * Transition alias for Prims `Timeout::checkExpired()`.
+   * Legacy spelling of the raw expiry predicate, kept for migrated Prims waits.
    *
    * Returns true for either an explicit abort or an expired local device
    * timeout. If this handle's local deadline has expired, this records
    * `AbortReason::TIMED_OUT` in the shared state.
    */
-  __device__ bool checkExpired() const {
+  __device__ bool checkExpired(bool* flippedHere = nullptr) const {
+    if (flippedHere != nullptr) {
+      *flippedHere = false;
+    }
     if (!isEnabled()) {
       return false;
     }
@@ -294,8 +327,8 @@ struct AbortDevice final {
     }
 
     // `state_` lives in mapped pinned host memory, so every read here is an
-    // uncached PCIe round trip. The pre-migration Prims `Timeout` compared an
-    // on-chip clock and touched no memory at all, so a naive port turns each
+    // uncached PCIe round trip. The retired standalone Prims timeout compared
+    // an on-chip clock and touched no memory at all, so a naive port turns each
     // spin-loop iteration into a host access - worst case 32 lanes x 2 loads
     // per warp per iteration in the LL small-message path. Gate the shared
     // read on the free device clock: steady-state polling costs a register
@@ -311,7 +344,7 @@ struct AbortDevice final {
       sawTerminalReason_ = true;
       return true;
     }
-    if (deadlineDue && markTimedOutIfExpired()) {
+    if (deadlineDue && markTimedOutIfExpired(flippedHere)) {
       sawTerminalReason_ = true;
       return true;
     }
@@ -319,7 +352,7 @@ struct AbortDevice final {
   }
 
   /**
-   * Group-scoped transition alias for Prims `Timeout::checkExpired(group)`.
+   * Group-scoped form of the legacy raw expiry predicate.
    *
    * Only the group leader polls shared abort state, matching the current
    * timeout check shape used by Prims wait loops.
@@ -373,7 +406,6 @@ struct AbortDevice final {
     if (!isEnabled()) {
       return false;
     }
-    (void)context;
     const bool validReason = detail::deviceIsValidTerminalReason(newReason);
     assert(validReason);
     if (!validReason) {
@@ -381,8 +413,18 @@ struct AbortDevice final {
     }
 
     int expected = static_cast<int>(AbortReason::NONE);
-    return detail::deviceCompareExchangeSystem(
+    const bool won = detail::deviceCompareExchangeSystem(
         &state_->abort, &expected, static_cast<int>(newReason));
+    if (won) {
+      // Device context is intentionally not persisted in mapped host state.
+      detail::publishContextReady(state_);
+      // NOLINTNEXTLINE(facebook-security-vulnerable-printf)
+      printf(
+          FT_ABORT_FIRST_WRITER_DEVICE_ "reason=%d context=%s\n",
+          static_cast<int>(newReason),
+          context == nullptr ? "" : context);
+    }
+    return won;
   }
 
  private:
@@ -400,6 +442,13 @@ struct AbortDevice final {
    * Deliberately NOT cached in the handle. Transports keep one handle for the
    * communicator's lifetime, so caching here would silently ignore every later
    * `Abort::setDefaultTimeout()`.
+   *
+   * That also makes it load-bearing for **CUDA graphs**: a captured graph
+   * replays with no host code in between, so anything the host stamped into the
+   * handle at capture time would be frozen for every replay and the deadline
+   * would never lapse. `AbortState` lives in mapped memory precisely so
+   * graph-mode device code reads the live value;
+   * `DroppedRankTimeoutLapsesDuringGraphReplay` is the test that says so.
    */
   __device__ int64_t resolveTimeoutMs() const {
     if (opTimeoutMs_ >= 0) {
@@ -441,7 +490,7 @@ struct AbortDevice final {
     return deadlineCycles_ != 0 && detail::deviceClock() >= deadlineCycles_;
   }
 
-  __device__ bool markTimedOutIfExpired() const {
+  __device__ bool markTimedOutIfExpired(bool* flippedHere = nullptr) const {
     if (!isEnabled() || !deadlineExpired()) {
       return false;
     }
@@ -451,6 +500,10 @@ struct AbortDevice final {
             &state_->abort,
             &expected,
             static_cast<int>(AbortReason::TIMED_OUT))) {
+      detail::publishContextReady(state_);
+      if (flippedHere != nullptr) {
+        *flippedHere = true;
+      }
       return true;
     }
     return expected == static_cast<int>(AbortReason::TIMED_OUT);
@@ -551,6 +604,8 @@ struct AbortFlag final {
    * Writing shared state is safe to do from a shared handle -- it is a
    * system-scope CAS, which is exactly what the shared state is for. Only
    * *polling* needs per-thread throttle state, and this type has none.
+   * Device context is not persisted, so a winning writer publishes
+   * `contextReady` immediately after the reason.
    */
   __device__ bool setAbort(
       AbortReason newReason = AbortReason::ABORTED,
@@ -565,8 +620,12 @@ struct AbortFlag final {
       return false;
     }
     int expected = static_cast<int>(AbortReason::NONE);
-    return detail::deviceCompareExchangeSystem(
+    const bool won = detail::deviceCompareExchangeSystem(
         &state_->abort, &expected, static_cast<int>(newReason));
+    if (won) {
+      detail::publishContextReady(state_);
+    }
+    return won;
   }
 
   /**

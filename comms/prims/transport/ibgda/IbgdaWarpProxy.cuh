@@ -22,9 +22,9 @@ inline constexpr bool isIbgdaWarpProxyPipelineDepthSupported(int depth) {
 
 #include <cstddef>
 
+#include "comms/prims/core/AbortCheck.cuh"
 #include "comms/prims/core/MemcpyCopyOp.cuh"
 #include "comms/prims/core/ThreadGroup.cuh"
-#include "comms/prims/core/Timeout.cuh"
 #include "comms/prims/transport/P2pIbTransportProgressImpl.cuh"
 #include "comms/prims/transport/ibgda/P2pIbgdaTransportDevice.cuh"
 
@@ -135,6 +135,10 @@ class IbgdaWarpProxy {
   class Ops {
    public:
     static constexpr uint32_t kWorkerThreads = WorkerThreads;
+    // Every ops policy names its wire format so callers can size transfers by
+    // it (see BlockingIbOps). The proxy stages through its own queues and has
+    // no LL counterpart, so this one is fixed.
+    using WireProto = protocol::Simple;
 
     __device__ __forceinline__ ThreadGroup& group() {
       return workers_;

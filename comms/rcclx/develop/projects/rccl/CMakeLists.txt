@@ -959,6 +959,8 @@ set(RCCLX_LIB_FILES
   comms/rcclx/develop/meta/lpcoll/p2p_allgather.cc
   comms/rcclx/develop/meta/lpcoll/p2p_allgather.h
   # find comms/rcclx/develop/meta -type f ! -path "*/tests/*" -path "*/relay/*" \( -name "*.cc" -o -name "*.h" -o -name "*.cu" \) | sort
+  comms/rcclx/develop/meta/relay/relay_control.cc
+  comms/rcclx/develop/meta/relay/relay_control.h
   comms/rcclx/develop/meta/relay/sharded_relay_all_gather.cc
   comms/rcclx/develop/meta/relay/sharded_relay_all_gather.h
   comms/rcclx/develop/meta/relay/sharded_relay_all_to_all.cc
@@ -967,6 +969,16 @@ set(RCCLX_LIB_FILES
   comms/rcclx/develop/meta/relay/sharded_relay_allreduce.h
   comms/rcclx/develop/meta/relay/sharded_relay_allreduce_kernels.cu
   comms/rcclx/develop/meta/relay/sharded_relay_allreduce_kernels.h
+  comms/rcclx/develop/meta/relay/sharded_relay_graph_scratch.cc
+  comms/rcclx/develop/meta/relay/sharded_relay_graph_scratch.h
+  comms/rcclx/develop/meta/relay/sharded_relay_lp.cc
+  comms/rcclx/develop/meta/relay/sharded_relay_lp.h
+  comms/rcclx/develop/meta/relay/sharded_relay_lp_arena.cc
+  comms/rcclx/develop/meta/relay/sharded_relay_lp_arena.h
+  comms/rcclx/develop/meta/relay/sharded_relay_lp_kernels.cu
+  comms/rcclx/develop/meta/relay/sharded_relay_lp_kernels.h
+  comms/rcclx/develop/meta/relay/sharded_relay_oneshot.cc
+  comms/rcclx/develop/meta/relay/sharded_relay_oneshot.h
   comms/rcclx/develop/meta/relay/sharded_relay_reduce_scatter.cc
   comms/rcclx/develop/meta/relay/sharded_relay_reduce_scatter.h
   comms/rcclx/develop/meta/relay/sharded_relay_route.h
@@ -1109,6 +1121,8 @@ set(COMMON_FILES
   comms/utils/logger/Logger.h
   comms/utils/logger/LoggerRuntime.cc
   comms/utils/logger/LoggerRuntime.h
+  comms/utils/logger/CommsLogging.cc
+  comms/utils/logger/CommsLogging.h
   comms/utils/logger/LoggingFormat.cc
   comms/utils/logger/LoggingFormat.h
   comms/utils/logger/LogTypes.cc

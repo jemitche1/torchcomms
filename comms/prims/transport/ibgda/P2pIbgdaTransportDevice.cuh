@@ -24,11 +24,11 @@
 
 #include "comms/prims/platform/DocaVerbsUtils.cuh"
 #endif
+#include "comms/prims/core/AbortCheck.cuh"
 #include "comms/prims/core/CopyOp.cuh"
 #include "comms/prims/core/CopyUtils.cuh"
 #include "comms/prims/core/DeviceMacros.cuh"
 #include "comms/prims/core/ThreadGroup.cuh"
-#include "comms/prims/core/Timeout.cuh"
 #include "comms/prims/memory/DeviceSpan.cuh"
 #include "comms/prims/transport/P2pIbTransportDeviceDecl.cuh"
 #include "comms/prims/transport/P2pIbTransportDeviceImpl.cuh"
@@ -39,6 +39,88 @@ namespace comms::prims {
 struct Memcpy;
 
 inline constexpr uint64_t kDefaultDeviceTimeoutCycles = 10'000'000'000ULL;
+
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(PRIMS_IBGDA_DISABLE_COLLAPSED_CQ)
+// Buck targets that also link ncclx can see its older DOCA headers at this same
+// include path. Keep collapsed-CQ polling in Prims and depend only on the
+// common v2.30 CQ/CQE prefix instead of extending the vendored DOCA API.
+static_assert(offsetof(doca_gpu_dev_verbs_cq, cqe_daddr) == 0);
+static_assert(offsetof(doca_gpu_dev_verbs_cq, cqe_num) == 12);
+static_assert(offsetof(doca_gpu_dev_verbs_cq, cqe_ci) == 24);
+static_assert(sizeof(doca_gpunetio_ib_mlx5_cqe64) == 64);
+static_assert(offsetof(doca_gpunetio_ib_mlx5_cqe64, wqe_counter) == 60);
+static_assert(offsetof(doca_gpunetio_ib_mlx5_cqe64, op_own) == 63);
+
+template <
+    doca_gpu_dev_verbs_resource_sharing_mode SharingMode,
+    doca_gpu_dev_verbs_sync_scope AcquireScope>
+__device__ __forceinline__ int prims_ibgda_poll_collapsed_cq_once(
+    doca_gpu_dev_verbs_cq* cq,
+    uint64_t ticket) {
+  const uint64_t consumerIndex =
+      doca_gpu_dev_verbs_load_relaxed<SharingMode>(&cq->cqe_ci);
+  if (ticket < consumerIndex) {
+    return 0;
+  }
+
+  auto* cqe = reinterpret_cast<doca_gpunetio_ib_mlx5_cqe64*>(
+      __ldg(reinterpret_cast<uintptr_t*>(&cq->cqe_daddr)));
+  auto* cqeTail = reinterpret_cast<uint32_t*>(
+      reinterpret_cast<uint8_t*>(cqe) + sizeof(*cqe) - sizeof(uint32_t));
+  const uint32_t cqeChunk = doca_gpu_dev_verbs_bswap32(
+      doca_gpu_dev_verbs_load_relaxed_sys_global(cqeTail));
+  uint16_t wqeCounter = cqeChunk >> 16;
+  const uint8_t opcode =
+      (cqeChunk & 0xff) >> DOCA_GPUNETIO_VERBS_MLX5_CQE_OPCODE_SHIFT;
+
+#if DOCA_GPUNETIO_VERBS_ENABLE_DEBUG == 1
+  if (opcode == DOCA_GPUNETIO_IB_MLX5_CQE_REQ_ERR) {
+    doca_gpu_dev_verbs_cq_print_cqe_err(cqe);
+  }
+#endif
+  // An RC QP cannot recover after a request error. Check the sticky slot before
+  // the bounded ticket window so later SQ-reclamation waits also escape.
+  if (opcode == DOCA_GPUNETIO_IB_MLX5_CQE_REQ_ERR) {
+    return -EIO;
+  }
+
+  const uint32_t cqeCount = __ldg(&cq->cqe_num);
+  // Relaxed receive placement does not relax completion delivery order. The
+  // collapsed CQE therefore remains a completion frontier; see
+  // third-party/rdma-core/stablev57/providers/mlx5/man/mlx5dv_create_qp.3.md.
+  // Prims tickets name the completed WQE itself, so a counter one behind is
+  // still busy. Upstream v4's `- 2` is off by one for that convention.
+  if (ticket >= consumerIndex + cqeCount ||
+      opcode == DOCA_GPUNETIO_IB_MLX5_CQE_INVALID ||
+      static_cast<uint16_t>(
+          static_cast<uint16_t>(ticket) - wqeCounter - uint16_t{1}) <
+          cqeCount) {
+    return EBUSY;
+  }
+
+  ++wqeCounter;
+  const uint64_t newConsumerIndex = ((ticket & ~0xffffULL) | wqeCounter) +
+      ((static_cast<uint16_t>(ticket) > wqeCounter) ? 0x10000ULL : 0);
+  doca_gpu_dev_verbs_fence_acquire<AcquireScope>();
+  doca_gpu_dev_verbs_atomic_max<uint64_t, SharingMode>(
+      &cq->cqe_ci, newConsumerIndex);
+  return 0;
+}
+
+template <
+    doca_gpu_dev_verbs_resource_sharing_mode SharingMode,
+    doca_gpu_dev_verbs_sync_scope AcquireScope>
+__device__ __forceinline__ int prims_ibgda_wait_collapsed_cq(
+    doca_gpu_dev_verbs_cq* cq,
+    uint64_t ticket) {
+  int status;
+  do {
+    status = prims_ibgda_poll_collapsed_cq_once<SharingMode, AcquireScope>(
+        cq, ticket);
+  } while (status == EBUSY);
+  return status;
+}
+#endif
 
 // `PIPES_DEVICE_TRAP()` is defined in `comms/prims/core/DeviceMacros.cuh` and
 // is intentionally available across all `comms/prims` device headers.
@@ -192,6 +274,7 @@ class P2pIbgdaTransportDevice {
    *                              slot-index counter API.
    * @param channelLayout         Optional pipelined send/recv channel layout.
    *                              When empty, send()/recv() are unavailable.
+   * @param collapsedCq           Whether device-visible QPs use collapsed CQs.
    */
   __host__ __device__ P2pIbgdaTransportDevice(
       DeviceSpan<NicDeviceIbgdaResources> nicDevices,
@@ -204,7 +287,8 @@ class P2pIbgdaTransportDevice {
       int qpsPerConnection = 1,
       int qpDirectionCount = kIbDirections,
       DeviceSpan<IbLocalChannel> localChannels = {},
-      IbChannelLayout channelLayout = {})
+      IbChannelLayout channelLayout = {},
+      bool collapsedCq = false)
       : nicDevices_(nicDevices),
         ownedRemoteSignalBuf_(ownedRemoteSignalBuf),
         ownedLocalSignalBuf_(ownedLocalSignalBuf),
@@ -215,7 +299,8 @@ class P2pIbgdaTransportDevice {
         qpsPerConnection_(qpsPerConnection),
         qpDirectionCount_(qpDirectionCount),
         localChannels_(localChannels),
-        channelLayout_(channelLayout) {}
+        channelLayout_(channelLayout),
+        collapsedCq_(collapsedCq) {}
 
   // IBGDA round-robins each send/recv chunk's RDMA_WRITE + DATA_READY atomic-FA
   // across per-lane single-writer DATA_READY slots (one per QP lane; see
@@ -596,6 +681,14 @@ class P2pIbgdaTransportDevice {
    * before signal(group, ...). A fused put(..., signal) remains self-ordered
    * because the put and signal are posted on the same QP.
    *
+   * `direction` selects more than a lane. Channel ids are not unique across
+   * concurrently running groups: `ThreadGroup::partition` renumbers each
+   * subgroup from 0, so two blocks in different partitions land on the same
+   * channel and are kept apart only by direction. Posting is `EXCLUSIVE`, so a
+   * recv-role group that takes the Send default shares a QP with the send-role
+   * group and both can reserve the same WQ slot. See "Partitioned groups alias
+   * channel ids" in comms/prims/docs/Channels.md.
+   *
    * @param group     Thread group; all threads must call. Leader posts WQE,
    *                  all sync.
    * @param signalBuf Pre-resolved remote signal slot (must point to the
@@ -616,7 +709,12 @@ class P2pIbgdaTransportDevice {
     group.sync();
   }
 
-  /** signal (thread-scope) - Single-thread variant. */
+  /**
+   * signal (thread-scope) - Single-thread variant.
+   *
+   * Posts Send unconditionally; a recv-role group sharing a channel id with a
+   * concurrent send-role group must use the direction-taking overload.
+   */
   __device__ void signal(
       const IbgdaRemoteBuffer& signalBuf,
       uint64_t signalVal = 1) {
@@ -672,6 +770,10 @@ class P2pIbgdaTransportDevice {
     wait_counter_impl(group, counterBuf, expected, abortDevice);
   }
 
+  // wait_local and is_local_completion_ready resolve their lane against Send
+  // unconditionally, so on a channel id shared with a concurrent recv-role
+  // group they poll the send-role group's CQ. See "Partitioned groups alias
+  // channel ids" in comms/prims/docs/Channels.md.
   __device__ void wait_local(
       ThreadGroup& group,
       const IbLocalCompletionTicket& ticket,
@@ -690,9 +792,8 @@ class P2pIbgdaTransportDevice {
       const AbortDevice& abortDevice = AbortDevice()) {
     IbgdaLane lane =
         lane_from_ordinal(channelId, IbDirection::Send, ticket.completionId);
-    const int status = doca_gpu_dev_verbs_poll_one_cq_at<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
-        doca_gpu_dev_verbs_qp_get_cq_sq(lane.qp), ticket.value);
+    const int status =
+        poll_cq_once(doca_gpu_dev_verbs_qp_get_cq_sq(lane.qp), ticket.value);
     if (status == 0) {
       return true;
     }
@@ -780,7 +881,15 @@ class P2pIbgdaTransportDevice {
     group.sync();
   }
 
-  /** flush (thread-scope) - Single-thread variant. */
+  /**
+   * flush (thread-scope) - Single-thread variant.
+   *
+   * Drains Send unconditionally. Two groups sharing a `(channel_id, direction)`
+   * share that direction's `IbQpState`, and the drain exchanges
+   * `pendingFlushLanesMask` to zero, so one group's flush consumes the other's
+   * pending lanes and can return with those WQEs still in flight. See
+   * "Partitioned groups alias channel ids" in comms/prims/docs/Channels.md.
+   */
   __device__ void flush(const AbortDevice& abortDevice = AbortDevice()) {
     ThreadGroup solo = make_thread_solo();
     flush(solo, IbDirection::Send, abortDevice);
@@ -801,7 +910,12 @@ class P2pIbgdaTransportDevice {
     flush(group, direction, abortDevice);
   }
 
-  /** fence (thread-scope) - Single-thread variant. */
+  /**
+   * fence (thread-scope) - Single-thread variant.
+   *
+   * Drains Send unconditionally; same shared-`IbQpState` caveat as the
+   * thread-scope flush() above.
+   */
   __device__ void fence(const AbortDevice& abortDevice = AbortDevice()) {
     flush(abortDevice);
   }
@@ -1103,17 +1217,23 @@ class P2pIbgdaTransportDevice {
   __device__ void wait_local_on_qp(
       doca_gpu_dev_verbs_qp* qp,
       doca_gpu_dev_verbs_ticket_t ticket,
-      AbortDevice abortDevice = AbortDevice()) {
+      // By reference: a copy resets the poll throttle, and `wait_lanes()` calls
+      // this once per QP lane.
+      const AbortDevice& abortDevice = AbortDevice()) {
     if (!abortDevice.isEnabled()) {
-      doca_gpu_dev_verbs_wait<
-          DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
-          DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO>(qp, ticket);
+      const int status = wait_cq(qp, ticket);
+      if (status != 0) {
+        printf(
+            "P2pIbgdaTransportDevice: wait_local_on_qp completion failed "
+            "(ticket=%llu status=%d)\n",
+            static_cast<unsigned long long>(ticket),
+            status);
+        PIPES_DEVICE_TRAP();
+      }
     } else {
       int status;
       do {
-        status = doca_gpu_dev_verbs_poll_one_cq_at<
-            DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
-            doca_gpu_dev_verbs_qp_get_cq_sq(qp), ticket);
+        status = poll_cq_once(doca_gpu_dev_verbs_qp_get_cq_sq(qp), ticket);
         if (status == EBUSY) {
           FT_ABORT_BREAK(
               abortDevice,
@@ -1128,10 +1248,9 @@ class P2pIbgdaTransportDevice {
           //
           // No `!isEnabled()` trap arm here, unlike `is_local_completion_ready`
           // below: this whole branch is inside the `else` of `isEnabled()`, so
-          // the handle is enabled by construction. With FT off the function
-          // takes the blocking `doca_gpu_dev_verbs_wait` above and never
-          // inspects a status at all, so there is no disabled-path error to
-          // preserve.
+          // the handle is enabled by construction. The disabled collapsed-CQ
+          // path above traps on a returned CQ error; the stock ring wait has a
+          // void interface and retains its existing behavior.
           // Gated on the CAS result so the diagnostic is one-shot. An error CQE
           // is sticky and this function is re-entered by its caller's spin
           // loop, so printing first meant one printf plus one system-scope CAS
@@ -1412,8 +1531,9 @@ class P2pIbgdaTransportDevice {
     // Leader reserves WQE slots for all threads
     uint64_t base_wqe_idx = 0;
     if (group.is_leader()) {
-      base_wqe_idx = doca_gpu_dev_verbs_reserve_wq_slots<
-          DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qp, group.group_size);
+      base_wqe_idx =
+          reserve_wqes_mode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+              qp, group.group_size);
     }
     base_wqe_idx = group.broadcast<uint64_t>(base_wqe_idx);
 
@@ -1469,7 +1589,6 @@ class P2pIbgdaTransportDevice {
       const IbgdaLocalBuffer& localBuf,
       const IbgdaRemoteBuffer& remoteBuf,
       std::size_t nbytes) {
-    doca_gpu_dev_verbs_ticket_t ticket;
     doca_gpu_dev_verbs_addr localAddr = {
         .addr = reinterpret_cast<uint64_t>(localBuf.ptr),
         .key = localBuf.lkey_per_device[lane.nic_id].value};
@@ -1477,12 +1596,234 @@ class P2pIbgdaTransportDevice {
         .addr = reinterpret_cast<uint64_t>(remoteBuf.ptr),
         .key = remoteBuf.rkey_per_device[lane.nic_id].value};
 
+#ifdef __HIP_PLATFORM_AMD__
+    doca_gpu_dev_verbs_ticket_t ticket;
     doca_gpu_dev_verbs_put<
         DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
         DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO,
         DOCA_GPUNETIO_VERBS_EXEC_SCOPE_THREAD>(
         lane.qp, remoteAddr, localAddr, nbytes, &ticket);
     return ticket;
+#else
+    return put_single_local(lane.qp, remoteAddr, localAddr, nbytes);
+#endif
+  }
+
+  // --- WQ slot lifecycle ---
+  //
+  // Every posting site funnels through these three, so the sharing mode and the
+  // fence rule are stated once instead of at each call.
+  //
+  // A QP has exactly one poster; see "QP posting ownership" in
+  // comms/prims/docs/Channels.md for why that is structural and what depends
+  // on it.
+
+  static constexpr auto kQpSharingMode =
+      DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE;
+
+  // Scope of the acquire fence DOCA runs after observing a completion. On
+  // Blackwell the SYS form is `CCTL.IVALL`, a whole-L1 invalidate, worth ~1.6us
+  // per op; CTA is a NOP.
+  //
+  // CTA is correct here only because no path in this transport reads
+  // NIC-written data through L1 after a completion: we issue no RDMA READ,
+  // atomic results go to a discard sink, staging and SQ-ring reuse are writes,
+  // and wait_signal_impl() reads the signal via a system-scope atomic load that
+  // carries its own invalidate. Adding an RDMA READ, or any post-completion
+  // load of remotely-written memory that is not a system-scope atomic, means
+  // this must go back to SYS. Nothing enforces that; see
+  // third-party/nvidia-doca/patches/README.md.
+  //
+  // Scoped here rather than via a macro on purpose: the DOCA headers are shared
+  // with ncclx GIN, which does issue RDMA READ.
+  static constexpr auto kCqAcquireScope = DOCA_GPUNETIO_VERBS_SYNC_SCOPE_CTA;
+
+  // The DOCA calls that opt into `acquire_scope` go through the three wrappers
+  // below, because the parameter is not always there. The counter and
+  // cooperative-put paths still call DOCA directly and keep SYS.
+  //
+  // ncclx bundles its own copy of the DOCA device headers at the SAME include
+  // path this file uses (`device/doca_gpunetio_dev_verbs_*.cuh`; see
+  // ncclx/v2_3x/src/transport/net_ib/gdaki/doca-gpunetio/include, exported
+  // publicly with `header_namespace = ""`). In a target that links both prims
+  // and ncclx -- the torchcomms integration tests, for instance -- `-I` order
+  // decides which copy we compile against, and it is not necessarily ours.
+  // Passing the extra template argument unconditionally fails there with
+  // "no instance of function template ... matches the argument list".
+  //
+  // So feature-detect on the macro our vendored header defines. Where our copy
+  // wins we get the CTA scope; where ncclx's wins we make the stock call and
+  // keep the SYS-scope fence -- slower, never wrong. The fallback is the
+  // *strong* fence, so a shadowed build is correct by construction.
+
+  __device__ __forceinline__ int poll_cq_once(
+      doca_gpu_dev_verbs_cq* cq,
+      doca_gpu_dev_verbs_ticket_t ticket) const {
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(PRIMS_IBGDA_DISABLE_COLLAPSED_CQ)
+    if (collapsedCq_) {
+      return prims_ibgda_poll_collapsed_cq_once<
+          DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
+          kCqAcquireScope>(cq, ticket);
+    }
+#endif
+#ifdef DOCA_GPUNETIO_VERBS_META_HAS_ACQUIRE_SCOPE
+    return doca_gpu_dev_verbs_poll_one_cq_at<
+        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
+        DOCA_GPUNETIO_VERBS_QP_SQ,
+        kCqAcquireScope>(cq, ticket);
+#else
+    return doca_gpu_dev_verbs_poll_one_cq_at<
+        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(cq, ticket);
+#endif
+  }
+
+  __device__ __forceinline__ int wait_cq(
+      doca_gpu_dev_verbs_qp* qp,
+      doca_gpu_dev_verbs_ticket_t ticket) const {
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(PRIMS_IBGDA_DISABLE_COLLAPSED_CQ)
+    if (collapsedCq_) {
+      return prims_ibgda_wait_collapsed_cq<
+          DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
+          kCqAcquireScope>(doca_gpu_dev_verbs_qp_get_cq_sq(qp), ticket);
+    }
+#endif
+#ifdef DOCA_GPUNETIO_VERBS_META_HAS_ACQUIRE_SCOPE
+    doca_gpu_dev_verbs_wait<
+        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
+        DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO,
+        kCqAcquireScope>(qp, ticket);
+#else
+    doca_gpu_dev_verbs_wait<
+        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
+        DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO>(qp, ticket);
+#endif
+    return 0;
+  }
+
+  template <doca_gpu_dev_verbs_resource_sharing_mode SharingMode>
+  __device__ __forceinline__ uint64_t
+  reserve_wqes_mode(doca_gpu_dev_verbs_qp* qp, uint32_t count) const {
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(PRIMS_IBGDA_DISABLE_COLLAPSED_CQ)
+    if (collapsedCq_) {
+      // The stock availability check uses the ring-CQ poller. Reserve first,
+      // then perform the same last-slot capacity check with the collapsed
+      // frontier poller. This transport never calls
+      // doca_gpu_verbs_reset_tracking_and_memory(), so cqe_rsvd remains zero;
+      // collapsed CQs always place their single visible CQE in slot zero.
+      const uint64_t firstWqe =
+          doca_gpu_dev_verbs_reserve_wq_slots<SharingMode>(
+              qp,
+              count,
+              DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_SKIP_AVAILABILITY_CHECK);
+      const uint64_t lastWqe = firstWqe + count - 1;
+      const uint16_t sqDepth = __ldg(&qp->sq_wqe_num);
+      if (lastWqe >= sqDepth) {
+        // A request error is terminal for this one-CQ-per-RC-QP design, and the
+        // poller leaves it sticky. Returning lets the caller reach its
+        // abort-aware completion drain; spinning here would hide the error
+        // forever, while trapping would defeat FT.
+        (void)prims_ibgda_wait_collapsed_cq<SharingMode, kCqAcquireScope>(
+            doca_gpu_dev_verbs_qp_get_cq_sq(qp), lastWqe - sqDepth);
+      }
+      return firstWqe;
+    }
+#endif
+#ifdef DOCA_GPUNETIO_VERBS_META_HAS_ACQUIRE_SCOPE
+    return doca_gpu_dev_verbs_reserve_wq_slots<
+        SharingMode,
+        DOCA_GPUNETIO_VERBS_QP_SQ,
+        kCqAcquireScope>(qp, count);
+#else
+    return doca_gpu_dev_verbs_reserve_wq_slots<SharingMode>(qp, count);
+#endif
+  }
+
+#ifndef __HIP_PLATFORM_AMD__
+  __device__ __forceinline__ uint64_t put_single_local(
+      doca_gpu_dev_verbs_qp* qp,
+      doca_gpu_dev_verbs_addr remoteAddr,
+      doca_gpu_dev_verbs_addr localAddr,
+      std::size_t nbytes) const {
+    uint32_t numChunks = doca_gpu_dev_verbs_div_ceil_aligned_pow2_32bits(
+        nbytes, DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE_SHIFT);
+    numChunks = numChunks > 1 ? numChunks : 1;
+    const uint64_t firstWqe =
+        reserve_wqes_mode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+            qp, numChunks);
+    uint64_t lastWqe = firstWqe;
+    std::size_t remainingBytes = nbytes;
+
+#pragma unroll 1
+    for (uint64_t chunk = 0; chunk < numChunks; ++chunk) {
+      lastWqe = firstWqe + chunk;
+      const std::size_t chunkBytes =
+          remainingBytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE
+          ? DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE
+          : remainingBytes;
+      auto* wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, lastWqe);
+      if (chunkBytes > 0) {
+        doca_gpu_dev_verbs_wqe_prepare_write(
+            qp,
+            wqe,
+            static_cast<uint16_t>(lastWqe),
+            DOCA_GPUNETIO_IB_MLX5_OPCODE_RDMA_WRITE,
+            DOCA_GPUNETIO_IB_MLX5_WQE_CTRL_CQ_UPDATE,
+            0,
+            remoteAddr.addr + chunk * DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE,
+            remoteAddr.key,
+            localAddr.addr + chunk * DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE,
+            localAddr.key,
+            static_cast<uint32_t>(chunkBytes));
+      } else {
+        doca_gpu_dev_verbs_wqe_prepare_nop(
+            qp,
+            wqe,
+            static_cast<uint16_t>(lastWqe),
+            DOCA_GPUNETIO_IB_MLX5_WQE_CTRL_CQ_UPDATE);
+      }
+      remainingBytes -= chunkBytes;
+    }
+
+    doca_gpu_dev_verbs_mark_wqes_ready<
+        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qp, firstWqe, lastWqe);
+    doca_gpu_dev_verbs_submit<
+        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
+        DOCA_GPUNETIO_VERBS_SYNC_SCOPE_THREAD,
+        DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO>(qp, lastWqe + 1);
+    return lastWqe;
+  }
+#endif
+
+  __device__ __forceinline__ uint64_t
+  reserve_wqes(doca_gpu_dev_verbs_qp* qp, uint32_t count) const {
+    // Same acquire scope as the completion path: the SQ-slot wait polls the
+    // same CQ, so without this it keeps the SYS-scope L1 invalidate once per
+    // posting operation. Only fires once the SQ has wrapped.
+    return reserve_wqes_mode<kQpSharingMode>(qp, count);
+  }
+
+  __device__ __forceinline__ void mark_wqes_ready_mode(
+      doca_gpu_dev_verbs_qp* qp,
+      uint64_t fromWqe,
+      uint64_t toWqe) const {
+    doca_gpu_dev_verbs_mark_wqes_ready<kQpSharingMode>(qp, fromWqe, toWqe);
+  }
+
+  /**
+   * Ring the doorbell for everything up to and including `toWqe`.
+   *
+   * The GPU sync scope is load-bearing, not a default: under EXCLUSIVE
+   * `mark_wqes_ready` is a bare store, so this is the only release ordering the
+   * WQE payload before the MMIO doorbell. THREAD here would let the NIC fetch a
+   * WQE it has not been shown.
+   */
+  __device__ __forceinline__ void submit_wqes(
+      doca_gpu_dev_verbs_qp* qp,
+      uint64_t toWqe) const {
+    doca_gpu_dev_verbs_submit<
+        kQpSharingMode,
+        DOCA_GPUNETIO_VERBS_SYNC_SCOPE_GPU,
+        DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO>(qp, toWqe + 1);
   }
 
   __device__ IbgdaPutSignalTickets put_signal_single_impl(
@@ -1523,8 +1864,7 @@ class P2pIbgdaTransportDevice {
     uint64_t numChunks = doca_gpu_dev_verbs_div_ceil_aligned_pow2(
         nbytes, DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE_SHIFT);
     numChunks = numChunks > 1 ? numChunks : 1;
-    uint64_t baseWqeIdx = doca_gpu_dev_verbs_reserve_wq_slots<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(lane.qp, numChunks + 1);
+    uint64_t baseWqeIdx = reserve_wqes(lane.qp, numChunks + 1);
     uint64_t wqeIdx = baseWqeIdx;
     std::size_t remainingSize = nbytes;
 
@@ -1569,13 +1909,8 @@ class P2pIbgdaTransportDevice {
         sizeof(uint64_t),
         signalVal,
         0);
-    doca_gpu_dev_verbs_mark_wqes_ready<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
-        lane.qp, baseWqeIdx, wqeIdx);
-    doca_gpu_dev_verbs_submit<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
-        DOCA_GPUNETIO_VERBS_SYNC_SCOPE_THREAD,
-        DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO>(lane.qp, wqeIdx + 1);
+    mark_wqes_ready_mode(lane.qp, baseWqeIdx, wqeIdx);
+    submit_wqes(lane.qp, wqeIdx);
     return IbgdaPutSignalTickets{lastPutWqeIdx, wqeIdx};
 #endif
   }
@@ -1630,8 +1965,9 @@ class P2pIbgdaTransportDevice {
     uint64_t numChunks = doca_gpu_dev_verbs_div_ceil_aligned_pow2(
         nbytes, DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE_SHIFT);
     numChunks = numChunks > 1 ? numChunks : 1;
-    uint64_t baseWqeIdx = doca_gpu_dev_verbs_reserve_wq_slots<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qp, numChunks);
+    uint64_t baseWqeIdx =
+        reserve_wqes_mode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+            qp, numChunks);
     uint64_t wqeIdx = baseWqeIdx;
     std::size_t remainingSize = nbytes;
 
@@ -1664,8 +2000,9 @@ class P2pIbgdaTransportDevice {
         DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
         qp, baseWqeIdx, lastPutWqeIdx);
 
-    uint64_t companionBaseWqeIdx = doca_gpu_dev_verbs_reserve_wq_slots<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(companionQp, 2);
+    uint64_t companionBaseWqeIdx =
+        reserve_wqes_mode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+            companionQp, 2);
     uint64_t companionWqeIdx = companionBaseWqeIdx;
     doca_gpu_dev_verbs_wqe* wqePtr =
         doca_gpu_dev_verbs_get_wqe_ptr(companionQp, companionWqeIdx);
@@ -1747,8 +2084,9 @@ class P2pIbgdaTransportDevice {
     uint64_t numChunks = doca_gpu_dev_verbs_div_ceil_aligned_pow2(
         nbytes, DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE_SHIFT);
     numChunks = numChunks > 1 ? numChunks : 1;
-    uint64_t baseWqeIdx = doca_gpu_dev_verbs_reserve_wq_slots<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qp, numChunks + 1);
+    uint64_t baseWqeIdx =
+        reserve_wqes_mode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+            qp, numChunks + 1);
     uint64_t wqeIdx = baseWqeIdx;
     std::size_t remainingSize = nbytes;
 
@@ -1797,8 +2135,9 @@ class P2pIbgdaTransportDevice {
         DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
         qp, baseWqeIdx, signalWqeIdx);
 
-    uint64_t companionBaseWqeIdx = doca_gpu_dev_verbs_reserve_wq_slots<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(companionQp, 2);
+    uint64_t companionBaseWqeIdx =
+        reserve_wqes_mode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+            companionQp, 2);
     uint64_t companionWqeIdx = companionBaseWqeIdx;
     wqePtr = doca_gpu_dev_verbs_get_wqe_ptr(companionQp, companionWqeIdx);
     doca_gpu_dev_verbs_wqe_prepare_wait(
@@ -1877,8 +2216,9 @@ class P2pIbgdaTransportDevice {
         counterSinkAddr,
         counterVal);
 #else
-    uint64_t baseWqeIdx = doca_gpu_dev_verbs_reserve_wq_slots<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(companionQp, 2);
+    uint64_t baseWqeIdx =
+        reserve_wqes_mode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+            companionQp, 2);
     uint64_t wqeIdx = baseWqeIdx;
     doca_gpu_dev_verbs_wqe* wqePtr =
         doca_gpu_dev_verbs_get_wqe_ptr(companionQp, wqeIdx);
@@ -1928,8 +2268,7 @@ class P2pIbgdaTransportDevice {
         .key = signalBuf.rkey_per_device[lane.nic_id].value};
     doca_gpu_dev_verbs_addr sinkAddr = {.addr = 0, .key = nic.sink_lkey.value};
 
-    uint64_t wqe_idx = doca_gpu_dev_verbs_reserve_wq_slots<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qp, 1);
+    uint64_t wqe_idx = reserve_wqes(qp, 1);
 
     doca_gpu_dev_verbs_wqe* wqe_ptr =
         doca_gpu_dev_verbs_get_wqe_ptr(qp, wqe_idx);
@@ -1950,13 +2289,8 @@ class P2pIbgdaTransportDevice {
         signalVal,
         0);
 
-    doca_gpu_dev_verbs_mark_wqes_ready<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(qp, wqe_idx, wqe_idx);
-
-    doca_gpu_dev_verbs_submit<
-        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
-        DOCA_GPUNETIO_VERBS_SYNC_SCOPE_THREAD,
-        DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO>(qp, wqe_idx + 1);
+    mark_wqes_ready_mode(qp, wqe_idx, wqe_idx);
+    submit_wqes(qp, wqe_idx);
     return wqe_idx;
   }
 
@@ -2089,26 +2423,26 @@ class P2pIbgdaTransportDevice {
    * reuse protocol bytes while an async operation is in flight.
    *
    * Usage starts by initializing the transport-owned mutable state for one
-   * logical transfer, then calling the matching progress method with the same
-   * static geometry until it returns `Done`:
+   * logical transfer, which fixes its geometry, then calling the matching
+   * progress method until it returns `Done`:
    *
-   *   transport->init_send_progress(group, nbytes, max_signal_bytes);
-   *   while (transport->progress_send_once(
-   *              group, src, nbytes, max_signal_bytes, abortDevice)
+   *   transport->init_send_progress(group, src, nbytes, max_signal_bytes);
+   *   while (transport->progress_send_once(group, abortDevice)
    *          != IbgdaSendRecvProgressStatus::Done) {
    *     // Try another independent lane or return to the scheduler.
    *   }
    *
    * Receivers use the symmetric `init_recv_progress()` and
-   * `progress_recv_once()` pair with the same `nbytes` and compatible
-   * `max_signal_bytes`. Zero-byte operations initialize directly to `Done`, so
-   * callers can use the same loop shape for empty and non-empty transfers.
+   * `progress_recv_once()` pair, initialized with the same `nbytes` and a
+   * compatible `max_signal_bytes`. Zero-byte operations initialize directly to
+   * `Done`, so callers can use the same loop shape for empty and non-empty
+   * transfers.
    *
    * The transport-owned state slot stores the shared persistent protocol byte
-   * cursor and only the active async stage, `activeNextByte`, and reserved
-   * stream base. Immutable geometry such as `nbytes` and chunk sizing is
-   * intentionally kept out of HBM-backed state and recomputed by each progress
-   * call from its arguments and the fixed channel layout.
+   * cursor, the active async stage, `activeNextByte`, the reserved stream base,
+   * and the `nbytes`/`max_signal_bytes` captured at init. Everything else,
+   * chunk sizing included, stays out of HBM-backed state and is recomputed by
+   * each progress call from those two values and the fixed channel layout.
    *
    * The progress state is a property of this transport, indexed by
    * `group.group_id` and direction. A caller may have one send and one recv in
@@ -2144,10 +2478,11 @@ class P2pIbgdaTransportDevice {
   template <typename Proto = protocol::Simple>
   __device__ __forceinline__ void init_send_progress(
       ThreadGroup& group,
+      const void* __restrict__ src,
       std::size_t nbytes,
       std::size_t max_signal_bytes = 0) {
     detail::init_send_progress<P2pIbgdaTransportDevice, Proto>(
-        *this, group, nbytes, max_signal_bytes);
+        *this, group, src, nbytes, max_signal_bytes);
   }
 
   /**
@@ -2157,10 +2492,11 @@ class P2pIbgdaTransportDevice {
   template <typename = void>
   __device__ __forceinline__ void init_registered_send_progress(
       ThreadGroup& group,
+      const IbgdaLocalBuffer& src,
       std::size_t nbytes,
       std::size_t max_signal_bytes = 0) {
     detail::init_registered_send_progress(
-        *this, group, nbytes, max_signal_bytes);
+        *this, group, src, nbytes, max_signal_bytes);
   }
 
   /**
@@ -2192,10 +2528,11 @@ class P2pIbgdaTransportDevice {
   template <typename Proto = protocol::Simple>
   __device__ __forceinline__ void init_recv_progress(
       ThreadGroup& group,
+      void* __restrict__ dst,
       std::size_t nbytes,
       std::size_t max_signal_bytes = 0) {
     detail::init_recv_progress<P2pIbgdaTransportDevice, Proto>(
-        *this, group, nbytes, max_signal_bytes);
+        *this, group, dst, nbytes, max_signal_bytes);
   }
 
   /**
@@ -2223,10 +2560,6 @@ class P2pIbgdaTransportDevice {
    * conversion context.
    *
    * @param group Thread group matching the one used during initialization.
-   * @param src Source user buffer. The range `[src, src + nbytes)` must remain
-   *            valid until `Done`.
-   * @param nbytes Number of user-buffer bytes from the matching init call.
-   * @param max_signal_bytes Maximum signaled sub-chunk size from init.
    * @param abortDevice Optional device abortDevice checked while dependencies
    * wait.
    * @param args Additional arguments forwarded to `CopyOp::send`.
@@ -2237,13 +2570,10 @@ class P2pIbgdaTransportDevice {
       typename... Args>
   __device__ __forceinline__ IbgdaSendRecvProgressStatus progress_send_once(
       ThreadGroup& group,
-      const void* __restrict__ src,
-      std::size_t nbytes,
-      std::size_t max_signal_bytes = 0,
       const AbortDevice& abortDevice = AbortDevice(),
       Args... args) {
     return detail::progress_send_once<P2pIbgdaTransportDevice, CopyOp, Proto>(
-        *this, group, src, nbytes, max_signal_bytes, abortDevice, args...);
+        *this, group, abortDevice, args...);
   }
 
   /**
@@ -2254,12 +2584,8 @@ class P2pIbgdaTransportDevice {
   __device__ __forceinline__ IbgdaRegisteredSendProgressStatus
   progress_registered_send_once(
       ThreadGroup& group,
-      const IbgdaLocalBuffer& src,
-      std::size_t nbytes,
-      std::size_t max_signal_bytes = 0,
       const AbortDevice& abortDevice = AbortDevice()) {
-    return detail::progress_registered_send_once(
-        *this, group, src, nbytes, max_signal_bytes, abortDevice);
+    return detail::progress_registered_send_once(*this, group, abortDevice);
   }
 
   /**
@@ -2279,24 +2605,13 @@ class P2pIbgdaTransportDevice {
   __device__ __forceinline__ IbgdaSendRecvProgressStatus
   progress_send_once_with_trace(
       ThreadGroup& group,
-      const void* __restrict__ src,
-      std::size_t nbytes,
-      std::size_t max_signal_bytes,
       const AbortDevice& abortDevice,
       const PipesTraceAllReduceContext& traceContext,
       PipesTraceProgressState& traceState,
       Args... args) {
     return detail::
         progress_send_once_with_trace<P2pIbgdaTransportDevice, CopyOp>(
-            *this,
-            group,
-            src,
-            nbytes,
-            max_signal_bytes,
-            abortDevice,
-            traceContext,
-            traceState,
-            args...);
+            *this, group, abortDevice, traceContext, traceState, args...);
   }
 
   /**
@@ -2321,10 +2636,6 @@ class P2pIbgdaTransportDevice {
    * conversion context.
    *
    * @param group Thread group matching the one used during initialization.
-   * @param dst Destination user buffer. The range `[dst, dst + nbytes)` must
-   *            remain valid until `Done`.
-   * @param nbytes Number of user-buffer bytes from the matching init call.
-   * @param max_signal_bytes Maximum signaled sub-chunk size from init.
    * @param abortDevice Optional device abortDevice checked while dependencies
    * wait.
    * @param args Additional arguments forwarded to `CopyOp::recv`.
@@ -2335,37 +2646,23 @@ class P2pIbgdaTransportDevice {
       typename... Args>
   __device__ __forceinline__ IbgdaSendRecvProgressStatus progress_recv_once(
       ThreadGroup& group,
-      void* __restrict__ dst,
-      std::size_t nbytes,
-      std::size_t max_signal_bytes = 0,
       const AbortDevice& abortDevice = AbortDevice(),
       Args... args) {
     return detail::progress_recv_once<P2pIbgdaTransportDevice, CopyOp, Proto>(
-        *this, group, dst, nbytes, max_signal_bytes, abortDevice, args...);
+        *this, group, abortDevice, args...);
   }
 
   template <typename CopyOp = Memcpy, typename... Args>
   __device__ __forceinline__ IbgdaSendRecvProgressStatus
   progress_recv_once_with_trace(
       ThreadGroup& group,
-      void* __restrict__ dst,
-      std::size_t nbytes,
-      std::size_t max_signal_bytes,
       const AbortDevice& abortDevice,
       const PipesTraceAllReduceContext& traceContext,
       PipesTraceProgressState& traceState,
       Args... args) {
     return detail::
         progress_recv_once_with_trace<P2pIbgdaTransportDevice, CopyOp>(
-            *this,
-            group,
-            dst,
-            nbytes,
-            max_signal_bytes,
-            abortDevice,
-            traceContext,
-            traceState,
-            args...);
+            *this, group, abortDevice, traceContext, traceState, args...);
   }
 
   // Templated for the same reason P2pIbTransportDevice templates its
@@ -2379,13 +2676,11 @@ class P2pIbgdaTransportDevice {
   __device__ __forceinline__ IbgdaSendRecvProgressStatus
   progress_recv_acquire_once(
       ThreadGroup& group,
-      std::size_t nbytes,
-      std::size_t max_signal_bytes,
       const AbortDevice& abortDevice,
       detail::RecvChunkAcquisition& out) {
     return detail::
         progress_recv_acquire_once<P2pIbgdaTransportDevice, protocol::Simple>(
-            *this, group, nbytes, max_signal_bytes, abortDevice, out);
+            *this, group, abortDevice, out);
   }
 
   template <typename = void>
@@ -2702,7 +2997,10 @@ class P2pIbgdaTransportDevice {
    * @param abortDevice         Optional abortDevice for wait operations.
    * @param args            Extra args forwarded to CopyOp::forward.
    */
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ void forward(
       ThreadGroup& group,
       void* __restrict__ dst,
@@ -2711,11 +3009,14 @@ class P2pIbgdaTransportDevice {
       std::size_t max_signal_bytes = 0,
       const AbortDevice& abortDevice = AbortDevice(),
       Args... args) {
-    forwardWithTrace<CopyOp>(
+    forwardWithTrace<CopyOp, Proto>(
         group, dst, fwd, nbytes, max_signal_bytes, abortDevice, {}, 0, args...);
   }
 
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ void forwardWithTrace(
       ThreadGroup& group,
       void* __restrict__ dst,
@@ -2738,7 +3039,7 @@ class P2pIbgdaTransportDevice {
           /*step=*/0,
           static_cast<uint16_t>(group.group_id));
     }
-    detail::forward<CopyOp>(
+    detail::forward<CopyOp, P2pIbgdaTransportDevice, Proto>(
         *this, group, dst, fwd, nbytes, max_signal_bytes, abortDevice, args...);
     if (group.is_leader()) {
       trace_ibgda_event(
@@ -2751,7 +3052,10 @@ class P2pIbgdaTransportDevice {
 #endif
   }
 
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ void forwardWithFineTrace(
       ThreadGroup& group,
       void* __restrict__ dst,
@@ -2762,7 +3066,7 @@ class P2pIbgdaTransportDevice {
       const PipesTraceAllReduceContext& recvTraceContext,
       const PipesTraceAllReduceContext& sendTraceContext,
       Args... args) {
-    detail::forward_with_fine_trace<CopyOp>(
+    detail::forward_with_fine_trace<CopyOp, P2pIbgdaTransportDevice, Proto>(
         *this,
         group,
         dst,
@@ -2860,6 +3164,7 @@ class P2pIbgdaTransportDevice {
   DeviceSpan<IbLocalChannel> localChannels_{};
 
   IbChannelLayout channelLayout_{};
+  bool collapsedCq_{false};
 };
 
 } // namespace comms::prims

@@ -5,20 +5,26 @@
 
 #include "comms/utils/logger/SpdlogLogger.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/sink.h>
 
 #include "comms/utils/logger/CommsLogFormatter.h"
 #include "comms/utils/logger/CudaLog.h"
@@ -29,14 +35,43 @@ namespace meta::comms::logger::testing {
 bool holdAsyncThreadPoolLeaseForTesting(const std::function<void()>& callback);
 void waitForAsyncThreadPoolShutdownForTesting();
 bool asyncThreadPoolLeaseAvailableForTesting();
+void addSinkForTesting(
+    CommsSpdlogLogger& logger,
+    std::shared_ptr<spdlog::sinks::sink> sink);
+void initGlobalThreadPoolForTesting();
+bool globalThreadPoolAliveForTesting();
+void shutdownAsyncThreadPoolForTesting();
 } // namespace meta::comms::logger::testing
 
+// Runs a callback from inside sink delivery, which is the only point at which
+// the thread-pool lease scoping in logFormatted() is observable.
+class CallbackSink final : public spdlog::sinks::sink {
+ public:
+  explicit CallbackSink(std::function<void()> onLog)
+      : onLog_{std::move(onLog)} {}
+
+  void log(const spdlog::details::log_msg& /* message */) override {
+    onLog_();
+  }
+  void flush() override {}
+  void set_pattern(const std::string& /* pattern */) override {}
+  void set_formatter(
+      std::unique_ptr<spdlog::formatter> /* formatter */) override {}
+
+ private:
+  std::function<void()> onLog_;
+};
+
+/*
+ * Each instance owns a private directory. Concurrent copies of this binary --
+ * how stress runs execute -- would otherwise share one path under TempDir() and
+ * unlink each other's log file while the sink still holds the old inode.
+ */
 class ScopedTestFile {
  public:
   explicit ScopedTestFile(std::string filename)
-      : path_{std::filesystem::path{testing::TempDir()} / std::move(filename)} {
-    std::filesystem::remove(path_);
-  }
+      : directory_{makeUniqueDirectory()},
+        path_{directory_ / std::move(filename)} {}
 
   ~ScopedTestFile() {
     removeNoexcept();
@@ -47,18 +82,69 @@ class ScopedTestFile {
   }
 
  private:
-  void removeNoexcept() noexcept {
-    std::error_code error;
-    std::filesystem::remove(path_, error);
+  static std::filesystem::path makeUniqueDirectory() {
+    const auto pattern =
+        (std::filesystem::path{testing::TempDir()} / "comms_spdlog_ut_XXXXXX")
+            .string();
+    std::vector<char> buffer{pattern.begin(), pattern.end()};
+    buffer.push_back('\0');
+    if (::mkdtemp(buffer.data()) == nullptr) {
+      throw std::runtime_error{
+          "Failed to create a temporary directory under " +
+          std::string{testing::TempDir()}};
+    }
+    return std::filesystem::path{buffer.data()};
   }
 
+  void removeNoexcept() noexcept {
+    std::error_code error;
+    std::filesystem::remove_all(directory_, error);
+  }
+
+  std::filesystem::path directory_;
   std::filesystem::path path_;
+};
+
+class ScopedEnvironmentVariable {
+ public:
+  ScopedEnvironmentVariable(std::string name, const std::string& value)
+      : name_{std::move(name)} {
+    if (const char* previousValue = std::getenv(name_.c_str())) {
+      previousValue_ = previousValue;
+    }
+    if (::setenv(name_.c_str(), value.c_str(), 1) != 0) {
+      throw std::runtime_error{"failed to set test environment variable"};
+    }
+  }
+
+  ScopedEnvironmentVariable(const ScopedEnvironmentVariable&) = delete;
+  ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) =
+      delete;
+  ScopedEnvironmentVariable(ScopedEnvironmentVariable&&) = delete;
+  ScopedEnvironmentVariable& operator=(ScopedEnvironmentVariable&&) = delete;
+
+  ~ScopedEnvironmentVariable() {
+    if (previousValue_.has_value()) {
+      ::setenv(name_.c_str(), previousValue_->c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> previousValue_;
 };
 
 std::string readFile(const std::filesystem::path& path) {
   std::ifstream file{path};
   return {
       std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+}
+
+[[noreturn]] meta::comms::logger::CommsSpdlogLogger&
+throwLoggerLookupFailure() {
+  throw std::runtime_error{"logger lookup failure"};
 }
 
 bool waitForFileToContain(
@@ -86,6 +172,8 @@ class LogLevelRestoringTest : public testing::Test {
     resetLogger(getSpdlogLogger(), "COMMS");
     resetLogger(getSpdlogLogger("comms.paired_test"), "PAIRED");
     resetLogger(getSpdlogLogger("comms.named_only_test"), "NAMED_ONLY");
+    resetLogger(getSpdlogLogger("comms.varying_macro_a"), "TEST");
+    resetLogger(getSpdlogLogger("comms.varying_macro_b"), "TEST");
   }
 };
 
@@ -99,6 +187,46 @@ TEST(SpdlogLoggerTest, ReturnsStableLoggerPerContext) {
   EXPECT_EQ(&ctranLogger, &getSpdlogLogger("comms.ctran"));
   EXPECT_NE(&ctranLogger, &getSpdlogLogger("comms.ncclx"));
   EXPECT_EQ(ctranLogger.name(), "comms.ctran");
+}
+
+TEST_F(LogLevelRestoringTest, NamedMacrosResolveVaryingNamesFromOneCallSite) {
+  constexpr std::array kNames{
+      std::string_view{"comms.varying_macro_a"},
+      std::string_view{"comms.varying_macro_b"}};
+  const auto messages =
+      std::make_shared<std::array<std::vector<std::string>, kNames.size()>>();
+
+  for (std::size_t index = 0; index < kNames.size(); ++index) {
+    auto& logger = getSpdlogLogger(kNames[index]);
+    logger.configure(
+        "TEST",
+        []() { return 0; },
+        [messages, index](std::string_view message) {
+          (*messages)[index].emplace_back(message);
+        },
+        false);
+    logger.set_level(spdlog::level::err);
+  }
+
+  const auto logFormatted = [](std::string_view name) {
+    COMMS_LOG_NAMED(name, ERR, "formatted {}", name);
+  };
+  const auto logStream = [](std::string_view name) {
+    COMMS_LOG_NAMED_STREAM(name, ERR) << "stream " << name;
+  };
+  for (const auto name : kNames) {
+    logFormatted(std::string{name});
+    logStream(std::string{name});
+  }
+
+  EXPECT_EQ(
+      (*messages)[0],
+      (std::vector<std::string>{
+          "formatted comms.varying_macro_a", "stream comms.varying_macro_a"}));
+  EXPECT_EQ(
+      (*messages)[1],
+      (std::vector<std::string>{
+          "formatted comms.varying_macro_b", "stream comms.varying_macro_b"}));
 }
 
 TEST(SpdlogLoggerTest, SupportsLoggerExpressionDbg5Stream) {
@@ -155,6 +283,18 @@ TEST_F(LogLevelRestoringTest, ConfiguresOnlyNamedLoggerWhenRequested) {
   EXPECT_EQ(namedErrors, (std::vector<std::string>{"named error"}));
 }
 
+TEST(SpdlogLoggerTest, NamedConfigurationPreservesExistingLevel) {
+  constexpr std::string_view kContext{"comms.preserve_level_test"};
+  auto& logger = getSpdlogLogger(kContext);
+  logger.set_level(spdlog::level::err);
+
+  meta::comms::logger::configureSpdlogLogger(
+      kContext, "TEST", "", []() { return 0; }, {}, false);
+
+  EXPECT_FALSE(logger.should_log(spdlog::level::info));
+  EXPECT_TRUE(logger.should_log(spdlog::level::err));
+}
+
 TEST(SpdlogLoggerTest, MatchesLegacyStderrRouting) {
   EXPECT_TRUE(meta::comms::logger::shouldWriteCommsLogToStderr("WARN message"));
   EXPECT_TRUE(
@@ -206,6 +346,235 @@ TEST(SpdlogLoggerTest, AsyncInfoReachesFileViaPeriodicFlush) {
       scopedLogFile.path(), "asynchronous periodic flush"));
 }
 
+TEST(SpdlogLoggerTest, AsyncReconfigurationPreservesQueuedDestination) {
+  struct BlockingSinkState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool workerBlocked{false};
+    bool releaseWorker{false};
+  };
+
+  constexpr std::string_view kBlockingContext{
+      "comms.reconfiguration_blocker_test"};
+  constexpr std::string_view kTargetContext{
+      "comms.reconfiguration_target_test"};
+  const ScopedTestFile oldLogFile{"comms_spdlog_reconfiguration_old.log"};
+  const ScopedTestFile newLogFile{"comms_spdlog_reconfiguration_new.log"};
+
+  auto& blockingLogger = getSpdlogLogger(kBlockingContext);
+  blockingLogger.configure("BLOCKER", []() { return 0; }, {}, true);
+  blockingLogger.set_level(spdlog::level::info);
+
+  const auto blockingSinkState = std::make_shared<BlockingSinkState>();
+  meta::comms::logger::testing::addSinkForTesting(
+      blockingLogger, std::make_shared<CallbackSink>([blockingSinkState]() {
+        std::unique_lock lock{blockingSinkState->mutex};
+        blockingSinkState->workerBlocked = true;
+        blockingSinkState->condition.notify_all();
+        blockingSinkState->condition.wait(
+            lock, [&]() { return blockingSinkState->releaseWorker; });
+      }));
+  COMMS_LOG_NAMED(kBlockingContext, INFO, "block async worker");
+
+  {
+    std::unique_lock lock{blockingSinkState->mutex};
+    if (!blockingSinkState->condition.wait_for(
+            lock, std::chrono::seconds{5}, [&]() {
+              return blockingSinkState->workerBlocked;
+            })) {
+      blockingSinkState->releaseWorker = true;
+      blockingSinkState->condition.notify_all();
+      FAIL() << "async worker did not enter the blocking sink";
+    }
+  }
+
+  meta::comms::logger::configureSpdlogLogger(
+      kTargetContext,
+      "OLD",
+      oldLogFile.path().string(),
+      []() { return 0; },
+      {},
+      true);
+  auto& targetLogger = getSpdlogLogger(kTargetContext);
+  targetLogger.set_level(spdlog::level::info);
+  COMMS_LOG_NAMED(kTargetContext, ERR, "record accepted before reset");
+
+  meta::comms::logger::configureSpdlogLogger(
+      kTargetContext,
+      "NEW",
+      newLogFile.path().string(),
+      []() { return 0; },
+      {},
+      true);
+  COMMS_LOG_NAMED(kTargetContext, ERR, "record accepted after reset");
+
+  {
+    std::lock_guard lock{blockingSinkState->mutex};
+    blockingSinkState->releaseWorker = true;
+  }
+  blockingSinkState->condition.notify_all();
+
+  ASSERT_TRUE(
+      waitForFileToContain(oldLogFile.path(), "record accepted before reset"));
+  ASSERT_TRUE(
+      waitForFileToContain(newLogFile.path(), "record accepted after reset"));
+  EXPECT_EQ(
+      readFile(oldLogFile.path()).find("record accepted after reset"),
+      std::string::npos);
+  EXPECT_EQ(
+      readFile(newLogFile.path()).find("record accepted before reset"),
+      std::string::npos);
+}
+
+TEST(SpdlogLoggerTest, AbortWritesErrorBeforeTermination) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  constexpr char kLogPathEnvironmentVariable[] =
+      "COMMS_SPDLOG_ABORT_TEST_LOG_PATH";
+  const bool isDeathTestChild =
+      !GTEST_FLAG_GET(internal_run_death_test).empty();
+  std::optional<ScopedTestFile> scopedLogFile;
+  std::optional<ScopedEnvironmentVariable> scopedLogPathEnvironment;
+  if (!isDeathTestChild) {
+    scopedLogFile.emplace("comms_spdlog_abort.log");
+    scopedLogPathEnvironment.emplace(
+        kLogPathEnvironmentVariable, scopedLogFile->path().string());
+  }
+  const char* logPathEnvironmentValue =
+      std::getenv(kLogPathEnvironmentVariable);
+  ASSERT_NE(logPathEnvironmentValue, nullptr);
+  const std::string logPath{logPathEnvironmentValue};
+
+  EXPECT_EXIT(
+      {
+        meta::comms::logger::configureSpdlogLogger(
+            meta::comms::logger::kCommsLoggerName,
+            "TEST",
+            logPath,
+            []() { return 0; },
+            {},
+            true);
+        getSpdlogLogger().set_level(spdlog::level::info);
+        COMMS_ABORT("synchronous error before abort");
+      },
+      ::testing::KilledBySignal(SIGABRT),
+      "");
+
+  EXPECT_NE(
+      readFile(logPath).find("synchronous error before abort"),
+      std::string::npos);
+}
+
+TEST(SpdlogLoggerTest, AbortDoesNotEvaluateDisabledArguments) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  const ScopedTestFile evaluationMarker{"comms_spdlog_abort_evaluated"};
+  const auto markerPath = evaluationMarker.path().string();
+
+  EXPECT_EXIT(
+      {
+        getSpdlogLogger().set_level(spdlog::level::off);
+        COMMS_ABORT("filtered synchronous error: {}", [&]() {
+          std::ofstream{markerPath} << "evaluated";
+          return 1;
+        }());
+      },
+      ::testing::KilledBySignal(SIGABRT),
+      "");
+
+  EXPECT_FALSE(std::filesystem::exists(evaluationMarker.path()));
+}
+
+TEST(SpdlogLoggerTest, FatalStreamAbortsWhenLoggerResolutionThrows) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_DEATH(
+      COMMS_LOGGER_STREAM(throwLoggerLookupFailure(), FATAL)
+          << "unreachable fatal record",
+      "FATAL: communications logging failed");
+}
+
+TEST(SpdlogLoggerTest, ShutdownDrainsEveryLoggerAndKeepsFallbackSynchronous) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  constexpr char kSharedLogPathEnvironmentVariable[] =
+      "COMMS_SPDLOG_SHUTDOWN_SHARED_LOG_PATH";
+  constexpr char kNamedLogPathEnvironmentVariable[] =
+      "COMMS_SPDLOG_SHUTDOWN_NAMED_LOG_PATH";
+  constexpr char kLateLogPathEnvironmentVariable[] =
+      "COMMS_SPDLOG_SHUTDOWN_LATE_LOG_PATH";
+  const bool isDeathTestChild =
+      !GTEST_FLAG_GET(internal_run_death_test).empty();
+  std::optional<ScopedTestFile> sharedLogFile;
+  std::optional<ScopedTestFile> namedLogFile;
+  std::optional<ScopedTestFile> lateLogFile;
+  std::optional<ScopedEnvironmentVariable> sharedLogPathEnvironment;
+  std::optional<ScopedEnvironmentVariable> namedLogPathEnvironment;
+  std::optional<ScopedEnvironmentVariable> lateLogPathEnvironment;
+  if (!isDeathTestChild) {
+    sharedLogFile.emplace("comms_spdlog_shutdown_shared.log");
+    namedLogFile.emplace("comms_spdlog_shutdown_named.log");
+    lateLogFile.emplace("comms_spdlog_shutdown_late.log");
+    sharedLogPathEnvironment.emplace(
+        kSharedLogPathEnvironmentVariable, sharedLogFile->path().string());
+    namedLogPathEnvironment.emplace(
+        kNamedLogPathEnvironmentVariable, namedLogFile->path().string());
+    lateLogPathEnvironment.emplace(
+        kLateLogPathEnvironmentVariable, lateLogFile->path().string());
+  }
+  const char* sharedLogPathValue =
+      std::getenv(kSharedLogPathEnvironmentVariable);
+  const char* namedLogPathValue = std::getenv(kNamedLogPathEnvironmentVariable);
+  const char* lateLogPathValue = std::getenv(kLateLogPathEnvironmentVariable);
+  ASSERT_NE(sharedLogPathValue, nullptr);
+  ASSERT_NE(namedLogPathValue, nullptr);
+  ASSERT_NE(lateLogPathValue, nullptr);
+  const std::string sharedLogPath{sharedLogPathValue};
+  const std::string namedLogPath{namedLogPathValue};
+  const std::string lateLogPath{lateLogPathValue};
+
+  EXPECT_EXIT(
+      {
+        constexpr std::string_view kNamedContext{"comms.shutdown_named_test"};
+        constexpr std::string_view kLateContext{"comms.shutdown_late_test"};
+        meta::comms::logger::configureSpdlogLogger(
+            meta::comms::logger::kCommsLoggerName,
+            "SHARED",
+            sharedLogPath,
+            []() { return 0; },
+            {},
+            true);
+        meta::comms::logger::configureSpdlogLogger(
+            kNamedContext, "NAMED", namedLogPath, []() { return 0; }, {}, true);
+        getSpdlogLogger().set_level(spdlog::level::info);
+        getSpdlogLogger(kNamedContext).set_level(spdlog::level::info);
+
+        COMMS_LOG(INFO, "shared record before shutdown");
+        COMMS_LOG_NAMED(kNamedContext, INFO, "named record before shutdown");
+        meta::comms::logger::shutdownCommsLogging();
+
+        if (readFile(sharedLogPath).find("shared record before shutdown") ==
+                std::string::npos ||
+            readFile(namedLogPath).find("named record before shutdown") ==
+                std::string::npos) {
+          std::_Exit(2);
+        }
+
+        COMMS_LOG(INFO, "shared record after shutdown");
+        meta::comms::logger::configureSpdlogLogger(
+            kLateContext, "LATE", lateLogPath, []() { return 0; }, {}, true);
+        getSpdlogLogger(kLateContext).set_level(spdlog::level::info);
+        COMMS_LOG_NAMED(kLateContext, INFO, "late record after shutdown");
+        if (readFile(sharedLogPath).find("shared record after shutdown") ==
+                std::string::npos ||
+            readFile(lateLogPath).find("late record after shutdown") ==
+                std::string::npos) {
+          std::_Exit(3);
+        }
+
+        meta::comms::logger::shutdownCommsLogging();
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "");
+}
+
 TEST(SpdlogLoggerTest, SynchronousFileDeliveryMatchesLegacyRouting) {
   constexpr std::string_view kContext = "comms.synchronous_file_test";
   const ScopedTestFile scopedLogFile{"comms_spdlog_sync.log"};
@@ -243,6 +612,17 @@ TEST(SpdlogLoggerTest, MapsFollyLevelNames) {
     COMMS_LOG(ERR, "error message: {}", 4);
     COMMS_LOG(CRITICAL, std::string{"critical message"});
   });
+}
+
+TEST(SpdlogLoggerTest, MapsLegacyTraceAndAbortLevels) {
+  EXPECT_EQ(
+      meta::comms::logger::loggerLevelToSpdlogLevel(
+          meta::comms::logger::LogLevel::TRACE),
+      spdlog::level::trace);
+  EXPECT_EQ(
+      meta::comms::logger::loggerLevelToSpdlogLevel(
+          meta::comms::logger::LogLevel::ABORT),
+      spdlog::level::debug);
 }
 
 TEST(SpdlogLoggerTest, FatalTerminatesProcess) {
@@ -496,6 +876,198 @@ TEST(SpdlogLoggerTest, ThreadNameIsTruncatedToStorageCapacity) {
   EXPECT_EQ(meta::comms::logger::getLogThreadName(), "main");
 }
 
+/*
+ * The thread-pool lease exists to keep the async pool alive across a post.
+ * acquire() takes a shared lock on leaseMutex_ that stop() takes exclusively,
+ * so holding the lease across synchronous delivery too would make
+ * async-pool shutdown -- and the exit-time stopper -- wait for the lease
+ * behind the sink write. Synchronous delivery no longer holds a pool lease.
+ * Deliver synchronously, run shutdown from another thread while still inside
+ * the sink, and require it to finish.
+ */
+TEST(SpdlogLoggerTest, AsyncPoolShutdownIsNotBlockedBySynchronousDelivery) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        auto& logger = getSpdlogLogger();
+        logger.configure(
+            "TEST", []() { return 0; }, {}, /*asyncLogging=*/false);
+        logger.set_level(spdlog::level::info);
+
+        std::atomic<bool> shutdownDone{false};
+        meta::comms::logger::testing::addSinkForTesting(
+            logger, std::make_shared<CallbackSink>([&]() {
+              std::thread shutdown{[&]() {
+                meta::comms::logger::testing::
+                    shutdownAsyncThreadPoolForTesting();
+                shutdownDone.store(true);
+              }};
+              const auto deadline =
+                  std::chrono::steady_clock::now() + std::chrono::seconds{10};
+              while (!shutdownDone.load() &&
+                     std::chrono::steady_clock::now() < deadline) {
+                /* sleep override */
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+              }
+              if (!shutdownDone.load()) {
+                // Joining a blocked shutdown would hang rather than report.
+                shutdown.detach();
+                std::_Exit(2);
+              }
+              shutdown.join();
+            }));
+
+        COMMS_LOG(WARN, "synchronous delivery must not block shutdown");
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "synchronous delivery must not block shutdown");
+}
+
+TEST(SpdlogLoggerTest, FatalDoesNotWaitForUnrelatedSynchronousDelivery) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        constexpr std::string_view kBlockedContext{
+            "comms.a_blocked_fatal_test"};
+        constexpr std::string_view kFatalContext{"comms.z_fatal_test"};
+        auto& blockedLogger = getSpdlogLogger(kBlockedContext);
+        blockedLogger.configure(
+            "BLOCKED", []() { return 0; }, {}, /*asyncLogging=*/false);
+        blockedLogger.set_level(spdlog::level::info);
+        auto& fatalLogger = getSpdlogLogger(kFatalContext);
+        fatalLogger.configure(
+            "FATAL", []() { return 0; }, {}, /*asyncLogging=*/false);
+        fatalLogger.set_level(spdlog::level::info);
+
+        std::atomic<bool> deliveryStarted{false};
+        meta::comms::logger::testing::addSinkForTesting(
+            blockedLogger, std::make_shared<CallbackSink>([&]() {
+              deliveryStarted.store(true, std::memory_order_release);
+              for (;;) {
+                /* sleep override */
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+              }
+            }));
+
+        std::thread blockedDelivery{[&]() {
+          COMMS_LOG_NAMED(
+              kBlockedContext, WARN, "unrelated synchronous delivery");
+        }};
+        blockedDelivery.detach();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        while (!deliveryStarted.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+          /* sleep override */
+          std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        if (!deliveryStarted.load(std::memory_order_acquire)) {
+          std::_Exit(2);
+        }
+
+        std::thread watchdog{[]() {
+          /* sleep override */
+          std::this_thread::sleep_for(std::chrono::seconds{10});
+          std::_Exit(3);
+        }};
+        watchdog.detach();
+        COMMS_LOG_NAMED(
+            kFatalContext, FATAL, "fatal must not wait for unrelated sink");
+      },
+      ::testing::KilledBySignal(SIGABRT),
+      "fatal must not wait for unrelated sink");
+}
+
+TEST(SpdlogLoggerTest, ShutdownWaitsForActiveSynchronousDelivery) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        auto& logger = getSpdlogLogger();
+        logger.configure(
+            "TEST", []() { return 0; }, {}, /*asyncLogging=*/false);
+        logger.set_level(spdlog::level::info);
+
+        std::atomic<bool> deliveryStarted{false};
+        std::atomic<bool> releaseDelivery{false};
+        meta::comms::logger::testing::addSinkForTesting(
+            logger, std::make_shared<CallbackSink>([&]() {
+              deliveryStarted.store(true);
+              while (!releaseDelivery.load()) {
+                /* sleep override */
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+              }
+            }));
+
+        std::thread logging{[]() {
+          COMMS_LOG(WARN, "synchronous delivery active during shutdown");
+        }};
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        while (!deliveryStarted.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+          /* sleep override */
+          std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        if (!deliveryStarted.load()) {
+          logging.detach();
+          std::_Exit(2);
+        }
+
+        std::atomic<bool> shutdownDone{false};
+        std::thread shutdown{[&]() {
+          meta::comms::logger::shutdownCommsLogging();
+          shutdownDone.store(true);
+        }};
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        if (shutdownDone.load()) {
+          std::_Exit(3);
+        }
+        releaseDelivery.store(true);
+        logging.join();
+        shutdown.join();
+        if (!shutdownDone.load()) {
+          std::_Exit(4);
+        }
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "synchronous delivery active during shutdown");
+}
+
+/*
+ * The fatal path must not reach spdlog's global registry. spdlog::shutdown()
+ * gets there via registry::instance(), a function-local static, so a
+ * COMMS_LOG_FATAL raised during static destruction could touch it after it has
+ * been destroyed. Leaving the registry pool running is the observable proof
+ * that this path answers only to the library-owned pool.
+ *
+ * The registry is probed through the library's own translation unit on
+ * purpose. Calling spdlog::thread_pool() from here instead fails under
+ * @mode/dev-asan, where the test binary holds a separate copy of the
+ * header-only registry -- the same duplication that made an earlier teardown
+ * test in this file vacuous.
+ */
+TEST(SpdlogLoggerTest, CommsShutdownLeavesGlobalRegistryPoolAlone) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        namespace logger_testing = meta::comms::logger::testing;
+        logger_testing::initGlobalThreadPoolForTesting();
+        if (!logger_testing::globalThreadPoolAliveForTesting()) {
+          std::_Exit(2);
+        }
+        meta::comms::logger::shutdownCommsLogging();
+        if (!logger_testing::globalThreadPoolAliveForTesting()) {
+          std::_Exit(3);
+        }
+        COMMS_LOG(WARN, "global registry pool untouched");
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "global registry pool untouched");
+}
+
 TEST(SpdlogLoggerTest, AsyncLoggingFallsBackWhenThreadPoolIsGone) {
   ::testing::FLAGS_gtest_death_test_style = "threadsafe";
   EXPECT_EXIT(
@@ -505,7 +1077,7 @@ TEST(SpdlogLoggerTest, AsyncLoggingFallsBackWhenThreadPoolIsGone) {
         logger.set_level(spdlog::level::info);
         // Run shutdown in the logger library's translation unit. Sanitizer
         // builds may link a separate spdlog registry into this test binary.
-        meta::comms::logger::shutdownSpdlogForFatal();
+        meta::comms::logger::shutdownCommsLogging();
 
         COMMS_LOG(WARN, "delivered after thread pool teardown");
         // flush() must also fall back rather than posting to the dead pool.
@@ -553,7 +1125,7 @@ TEST(SpdlogLoggerTest, ShutdownWaitsForActiveLeaseAndRejectsNewLeases) {
         }
 
         std::thread shutdown{[&]() {
-          meta::comms::logger::shutdownSpdlogForFatal();
+          meta::comms::logger::shutdownCommsLogging();
           shutdownDone.store(true);
         }};
         meta::comms::logger::testing::

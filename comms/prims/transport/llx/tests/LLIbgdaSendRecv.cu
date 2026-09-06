@@ -6,8 +6,8 @@
 #include <string>
 
 #include "comms/common/fault_tolerance/TestAbort.h"
+#include "comms/prims/core/AbortCheck.cuh"
 #include "comms/prims/core/ThreadGroup.cuh"
-#include "comms/prims/core/Timeout.cuh"
 #include "comms/prims/transport/P2pIbTransportDeviceDecl.cuh"
 #include "comms/prims/transport/ibgda/IbgdaBuffer.h"
 #include "comms/prims/transport/ibgda/P2pIbgdaTransportDevice.cuh"
@@ -62,7 +62,7 @@ __global__ void sendRecvKernel(
     int activeBlocks,
     std::size_t maxSignalBytes,
     bool send,
-    Timeout abortDevice) {
+    AbortDevice abortDevice) {
   (void)activeBlocks; // master's detail::send/recv has no active_blocks param
   auto group = make_block_group();
   abortDevice.start();

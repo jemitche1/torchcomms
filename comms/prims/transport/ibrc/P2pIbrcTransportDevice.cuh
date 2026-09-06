@@ -14,9 +14,9 @@
 #include <cstdio>
 #include <type_traits>
 
+#include "comms/prims/core/AbortCheck.cuh"
 #include "comms/prims/core/DeviceMacros.cuh"
 #include "comms/prims/core/ThreadGroup.cuh"
-#include "comms/prims/core/Timeout.cuh"
 #include "comms/prims/memory/DeviceSpan.cuh"
 #include "comms/prims/transport/P2pIbTransportDeviceDecl.cuh"
 #include "comms/prims/transport/P2pIbTransportDeviceImpl.cuh"
@@ -640,19 +640,21 @@ class P2pIbrcTransportDevice {
   template <typename Proto = protocol::Simple>
   __device__ __forceinline__ void init_send_progress(
       ThreadGroup& group,
+      const void* __restrict__ src,
       std::size_t nbytes,
       std::size_t max_signal_bytes = 0) {
     detail::init_send_progress<P2pIbrcTransportDevice, Proto>(
-        *this, group, nbytes, max_signal_bytes);
+        *this, group, src, nbytes, max_signal_bytes);
   }
 
   template <typename Proto = protocol::Simple>
   __device__ __forceinline__ void init_recv_progress(
       ThreadGroup& group,
+      void* __restrict__ dst,
       std::size_t nbytes,
       std::size_t max_signal_bytes = 0) {
     detail::init_recv_progress<P2pIbrcTransportDevice, Proto>(
-        *this, group, nbytes, max_signal_bytes);
+        *this, group, dst, nbytes, max_signal_bytes);
   }
 
   template <
@@ -661,13 +663,10 @@ class P2pIbrcTransportDevice {
       typename... Args>
   __device__ __forceinline__ IbgdaSendRecvProgressStatus progress_send_once(
       ThreadGroup& group,
-      const void* __restrict__ src,
-      std::size_t nbytes,
-      std::size_t max_signal_bytes = 0,
       const AbortDevice& abortDevice = AbortDevice(),
       Args... args) {
     return detail::progress_send_once<P2pIbrcTransportDevice, CopyOp, Proto>(
-        *this, group, src, nbytes, max_signal_bytes, abortDevice, args...);
+        *this, group, abortDevice, args...);
   }
 
   template <
@@ -676,13 +675,10 @@ class P2pIbrcTransportDevice {
       typename... Args>
   __device__ __forceinline__ IbgdaSendRecvProgressStatus progress_recv_once(
       ThreadGroup& group,
-      void* __restrict__ dst,
-      std::size_t nbytes,
-      std::size_t max_signal_bytes = 0,
       const AbortDevice& abortDevice = AbortDevice(),
       Args... args) {
     return detail::progress_recv_once<P2pIbrcTransportDevice, CopyOp, Proto>(
-        *this, group, dst, nbytes, max_signal_bytes, abortDevice, args...);
+        *this, group, abortDevice, args...);
   }
 
   // Templated for the same reason P2pIbTransportDevice templates its
@@ -696,13 +692,11 @@ class P2pIbrcTransportDevice {
   __device__ __forceinline__ IbgdaSendRecvProgressStatus
   progress_recv_acquire_once(
       ThreadGroup& group,
-      std::size_t nbytes,
-      std::size_t max_signal_bytes,
       const AbortDevice& abortDevice,
       detail::RecvChunkAcquisition& out) {
     return detail::
         progress_recv_acquire_once<P2pIbrcTransportDevice, protocol::Simple>(
-            *this, group, nbytes, max_signal_bytes, abortDevice, out);
+            *this, group, abortDevice, out);
   }
 
   template <typename = void>
@@ -739,7 +733,10 @@ class P2pIbrcTransportDevice {
         *this, group, dst, nbytes, max_signal_bytes, abortDevice, args...);
   }
 
-  template <typename CopyOp = Memcpy, typename... Args>
+  template <
+      typename CopyOp = Memcpy,
+      typename Proto = protocol::Simple,
+      typename... Args>
   __device__ __forceinline__ void forward(
       ThreadGroup& group,
       void* __restrict__ dst,
@@ -748,7 +745,7 @@ class P2pIbrcTransportDevice {
       std::size_t max_signal_bytes = 0,
       const AbortDevice& abortDevice = AbortDevice(),
       Args... args) {
-    detail::forward<CopyOp>(
+    detail::forward<CopyOp, P2pIbrcTransportDevice, Proto>(
         *this, group, dst, fwd, nbytes, max_signal_bytes, abortDevice, args...);
   }
 
@@ -1021,14 +1018,31 @@ class P2pIbrcTransportDevice {
     if (load_acquire_system_u32(&queue.status->error) == 0) {
       return;
     }
-    printf(
-        "P2pIbrcTransportDevice: queue error queue=%u code=%u\n",
-        load_acquire_system_u32(&queue.status->error_queue),
-        load_acquire_system_u32(&queue.status->error_code));
     if (!abort_.isEnabled()) {
+      printf(
+          "P2pIbrcTransportDevice: queue error queue=%u code=%u\n",
+          load_acquire_system_u32(&queue.status->error_queue),
+          load_acquire_system_u32(&queue.status->error_code));
       PIPES_DEVICE_TRAP();
     }
-    abort_.setAbort(comms::fault_tolerance::AbortReason::ABORTED);
+    // NETWORK_ERROR, not ABORTED: the proxy published a transport fault, which
+    // is what FAULT_TOLERANCE.md reserves NETWORK_ERROR for, while ABORTED
+    // means an explicit user or transport abort. The reason is
+    // first-writer-wins and drives host telemetry, so the old value permanently
+    // misfiled a proxy queue error as a user abort. Matches the IBGDA
+    // error-CQE sites.
+    //
+    // Diagnostic gated on the CAS result so it fires once. A queue error is
+    // sticky and this is called on every iteration of the `reserve()` and
+    // `drain_queue()` spins -- which deliberately do not read the abort flag --
+    // so printing first meant one printf plus one system-scope CAS attempt per
+    // iteration until the fixed watchdog fired, a large burst for one fault.
+    if (abort_.setAbort(comms::fault_tolerance::AbortReason::NETWORK_ERROR)) {
+      printf(
+          "P2pIbrcTransportDevice: queue error queue=%u code=%u\n",
+          load_acquire_system_u32(&queue.status->error_queue),
+          load_acquire_system_u32(&queue.status->error_code));
+    }
   }
 
   __device__ void wait_local(
